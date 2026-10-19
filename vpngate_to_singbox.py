@@ -22,6 +22,13 @@ DEFAULT_PASSWORD = "vpn"
 # so the old ciphers must be listed explicitly.
 DEFAULT_DATA_CIPHERS = ["AES-128-CBC", "AES-256-CBC", "BF-CBC"]
 DEFAULT_AUTH = "SHA1"
+# Rotating residential SOCKS5 (backconnect gateway) defaults. The gateway is
+# the only address we ever dial: rotating/sticky is a property of the
+# username the gateway sees, never of a real home IP we could reach.
+DEFAULT_RESI_PORT = 8084
+DEFAULT_RESI_PATH = "/ws-resi"
+RESI_IN_PORT = 40001
+RESI_TEMPLATE_PLACEHOLDERS = ("user", "session", "ttl")
 # Cap concurrent throwaway sing-box dials: refresh (dial_workers) +
 # full_probe + single_probe + verify can otherwise stack ~13 processes
 # on a 1GB box. Excess dialers queue on the gate instead of OOMing.
@@ -116,6 +123,35 @@ def primary_server(endpoint: dict) -> tuple[str, int]:
         return endpoint["server"], endpoint["server_port"]
     first = endpoint["servers"][0]
     return first["server"], first["server_port"]
+
+
+def render_resi_username(user: str, template: str | None, ttl: int,
+                         session_id: str = "") -> str:
+    """Render the gateway username for rotation or sticky mode.
+
+    Rotation (ttl <= 0) returns the plain user and never appends a session
+    parameter: the gateway then picks a fresh exit per TCP connection. Sticky
+    mode only renders when the template really carries {session}; otherwise we
+    stay in rotation instead of guessing a provider-specific format (a wrong
+    guess silently degrades to "no rotation and no stickiness either").
+
+    Placeholders are limited to {user} / {session} / {ttl}. Unknown ones raise
+    ValueError without echoing the rendered string, since it may contain the
+    account (and in some vendors' schemes the password-equivalent) material.
+    """
+    if ttl <= 0:
+        return user
+    text = (template or "").strip()
+    if "{session}" not in text:
+        return user
+    try:
+        return text.format(user=user, session=session_id, ttl=ttl)
+    except (KeyError, IndexError, ValueError) as exc:
+        name = exc.args[0] if isinstance(exc, KeyError) and exc.args else exc
+        raise ValueError(
+            f"RESI_USER_TEMPLATE uses an unsupported placeholder {{{name}}}; "
+            f"allowed: {', '.join('{' + p + '}' for p in RESI_TEMPLATE_PLACEHOLDERS)}"
+        ) from None
 
 
 def ovpn_to_endpoint(
@@ -594,6 +630,145 @@ def measure_exit_ip(endpoint: dict, singbox_bin: str = "sing-box",
         tmpdir.cleanup()
 
 
+def _resi_probe_config(resi: dict, port: int) -> dict:
+    """Throwaway config whose only exit is the residential socks outbound.
+
+    The gateway address comes from RESI_GATEWAY and is the only address we
+    ever dial; "which home IP" is decided by the gateway per TCP connection.
+    """
+    return {
+        "log": {"level": "warn"},
+        "inbounds": [{"type": "mixed", "tag": "resi-probe-in",
+                      "listen": "127.0.0.1", "listen_port": port}],
+        "outbounds": [
+            {"type": "socks", "tag": "resi-probe",
+             "server": resi["server"], "server_port": int(resi["server_port"]),
+             "version": "5", "username": resi["username"],
+             "password": resi["password"], "network": "tcp"},
+            {"type": "direct", "tag": "direct"},
+        ],
+        "route": {"final": "resi-probe"},
+    }
+
+
+def _resi_probe_run(resi: dict, count: int, singbox_bin: str, timeout: int,
+                    poll_interval: int, gate_timeout: float) -> dict | None:
+    """Start one throwaway sing-box and collect up to `count` exit IPs.
+
+    Every sample opens a fresh SOCKS5 connection through the local mixed
+    inbound -- exactly the unit a backconnect gateway rotates on. Reusing a
+    connection would measure our own pooling instead, and one process for N
+    samples keeps a 1 GB box from spawning N binaries.
+    """
+    count = max(1, int(count))
+    port = _free_port()
+    config = _resi_probe_config(resi, port)
+    tmpdir = tempfile.TemporaryDirectory()
+    if not _DIAL_GATE.acquire(timeout=gate_timeout):
+        tmpdir.cleanup()
+        return None
+    proc = None
+    err_handle = None
+    try:
+        cfg_path = str(Path(tmpdir.name) / "resi-probe.json")
+        Path(cfg_path).write_text(json.dumps(config), encoding="utf-8")
+        err_path = str(Path(tmpdir.name) / "resi-probe-stderr.log")
+        try:
+            err_handle = open(err_path, "ab")
+        except OSError:
+            err_handle = None
+        try:
+            proc = subprocess.Popen(
+                [singbox_bin, "run", "-c", cfg_path],
+                stdout=subprocess.DEVNULL,
+                stderr=err_handle or subprocess.DEVNULL)
+        except OSError:
+            print(f"resi probe failed: cannot start {singbox_bin}", flush=True)
+            return None
+        deadline = time.monotonic() + timeout
+        ips: list[str] = []
+        stamps: list[int] = []
+        errors: list[str] = []
+        while time.monotonic() < deadline and not ips:
+            remaining = deadline - time.monotonic()
+            fetched = _socks5_get_text(
+                "127.0.0.1", port, "api.ipify.org", 443, "/?format=text",
+                timeout=min(10, max(1, remaining)))
+            if (fetched is not None and fetched[0] == 200
+                    and _looks_like_ipv4(fetched[1])):
+                ips.append(fetched[1].decode("ascii").strip())
+                stamps.append(fetched[2])
+                break
+            if proc.poll() is not None:
+                errors.append("probe sing-box exited")
+                break
+            time.sleep(poll_interval)
+        total_deadline = deadline + (count - 1) * 15
+        while ips and len(ips) < count and time.monotonic() < total_deadline:
+            fetched = _socks5_get_text("127.0.0.1", port, "api.ipify.org", 443,
+                                       "/?format=text", timeout=15)
+            if (fetched is not None and fetched[0] == 200
+                    and _looks_like_ipv4(fetched[1])):
+                ips.append(fetched[1].decode("ascii").strip())
+                stamps.append(fetched[2])
+                continue
+            errors.append("no exit ip")
+            break
+        if not ips:
+            if err_handle is not None:
+                try:
+                    err_handle.close()
+                except OSError:
+                    pass
+            _log_dial_failure(resi, err_path)
+            return None
+        return {"ips": ips, "ms": list(stamps), "count": len(ips),
+                "distinct": len(set(ips)), "errors": errors,
+                "first_ms": stamps[0], "last_ms": stamps[-1]}
+    finally:
+        if proc is not None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+                try:
+                    proc.wait(timeout=5)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+        if err_handle is not None:
+            try:
+                err_handle.close()
+            except OSError:
+                pass
+        _DIAL_GATE.release()
+        tmpdir.cleanup()
+
+
+def measure_resi_exit_ip(resi: dict, singbox_bin: str = "sing-box",
+                         timeout: int = 20, poll_interval: int = 2) -> tuple:
+    """Exit IP through the residential gateway: (ip, ms) or (None, None)."""
+    result = _resi_probe_run(resi, 1, singbox_bin, timeout, poll_interval, 30.0)
+    if not result:
+        return (None, None)
+    return (result["ips"][0], result["first_ms"])
+
+
+def measure_resi_rotation(resi: dict, count: int = 3, singbox_bin: str = "sing-box",
+                          timeout: int = 20, poll_interval: int = 2) -> dict | None:
+    """Collect `count` sequential exit IPs through the gateway.
+
+    Returns {"ips", "ms", "count", "distinct", "errors", ...} or None when the
+    gateway never answered. `distinct` is the number of different IPs seen;
+    rotation is healthy when it is >= 2 (a residential pool may legitimately
+    hand out the same node twice in a row).
+    """
+    return _resi_probe_run(resi, count, singbox_bin, timeout, poll_interval, 30.0)
+
+
 def _safe_dial(dial_fn, node: dict) -> int | None:
     try:
         result = dial_fn(node)
@@ -807,6 +982,10 @@ def build_singbox_config(
     vless_direct_path: str = "/ws-node",
     vless_chain_port: int = 8082,
     vless_chain_path: str = "/ws-chain",
+    resi: dict | None = None,
+    resi_port: int = DEFAULT_RESI_PORT,
+    resi_path: str = DEFAULT_RESI_PATH,
+    resi_in_port: int = RESI_IN_PORT,
 ) -> dict:
     """Wrap endpoints in a minimal checkable sing-box config.
 
@@ -832,6 +1011,16 @@ def build_singbox_config(
     to a single endpoint. Pass backup (a second endpoint tag, distinct from
     preferred) to insert it between preferred and "auto": the chain then
     serves best first, second as the guaranteed backup, urltest last.
+
+    When resi ({"server","server_port","username","password"}) is given, a
+    third path is added: a "resi" socks outbound plus a "vless-resi" WS
+    inbound that routes into it. The gateway address is fixed; rotation or
+    stickiness is decided entirely by the username the gateway sees. resi is
+    deliberately kept OUT of the "auto" urltest group and the "proxy"
+    selector: urltest probes every 15s and residential traffic is metered,
+    so probing it would burn quota nonstop and a stray manual pick could
+    drain a whole plan. The loopback-only "resi-in" mixed inbound exists so
+    operators/CI can validate rotation through the exact serving stack.
     """
     tags = [ep["tag"] for ep in endpoints]
     if preferred is not None and preferred not in tags:
@@ -884,6 +1073,31 @@ def build_singbox_config(
             {"inbound": "vless-direct", "outbound": "direct"},
             {"inbound": "vless-chain", "outbound": chain_target},
         ]
+    if resi is not None:
+        if vless_uuid is None:
+            raise ValueError("resi outbound needs the vless inbound (set VLESS_UUID)")
+        config["outbounds"].append({
+            "type": "socks", "tag": "resi",
+            "server": resi["server"], "server_port": int(resi["server_port"]),
+            "version": "5", "username": resi["username"],
+            "password": resi["password"],
+            # Residential gateways rarely support UDP ASSOCIATE. Forcing tcp
+            # makes UDP fail fast at the outbound instead of hanging until the
+            # gateway times out.
+            "network": "tcp",
+        })
+        config.setdefault("inbounds", []).extend([
+            {"type": "vless", "tag": "vless-resi",
+             "listen": "0.0.0.0", "listen_port": resi_port,
+             "users": [{"uuid": vless_uuid}],
+             "transport": {"type": "ws", "path": resi_path}},
+            {"type": "mixed", "tag": "resi-in",
+             "listen": "127.0.0.1", "listen_port": resi_in_port},
+        ])
+        config["route"].setdefault("rules", []).extend([
+            {"inbound": "vless-resi", "outbound": "resi"},
+            {"inbound": "resi-in", "outbound": "resi"},
+        ])
     return config
 
 

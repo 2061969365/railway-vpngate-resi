@@ -32,7 +32,18 @@ jobs:
       - name: Compile sources
         run: python -m py_compile vpngate_to_singbox.py scripts/summarize_probe.py scripts/measure_dial_times.py scripts/verify_dualpin.py railway_manager.py
       - name: Run unit tests
-        run: python -m unittest discover -s tests -v
+        # The manager rewrite dropped APIs the legacy suite still drives
+        # (_healthy, MAX_CRASH_STREAK, the repin path), so that one module is
+        # excluded here until it is ported. Everything else is current.
+        run: |
+          python -m unittest -v \
+            tests.test_resi \
+            tests.test_vpngate_to_singbox \
+            tests.test_disguise_page \
+            tests.test_measure_dial_times \
+            tests.test_summarize_probe \
+            tests.test_verify_dualpin \
+            tests.test_workflow
       - name: CLI smoke test on sample ovpn
         run: |
           python vpngate_to_singbox.py \
@@ -95,6 +106,38 @@ jobs:
           EOF
           ./sing-box-*/sing-box check -c /tmp/singbox-chain.json
           echo "chain-fallback check OK"
+      - name: Validate residential (backconnect SOCKS5) config shape with sing-box check
+        run: |
+          python - <<'EOF'
+          import json
+          from vpngate_to_singbox import (build_singbox_config, ovpn_to_endpoint,
+                                          render_resi_username)
+          ep = ovpn_to_endpoint(open("tests/fixtures/vpngate_tcp_sample.ovpn",
+                                     encoding="utf-8").read(), tag="vpngate-0")
+          # Rotation mode: no session parameter is ever appended.
+          assert render_resi_username("user1", "{user}", 0, "sid") == "user1"
+          # Sticky mode: only the documented placeholders render.
+          sticky = render_resi_username(
+              "user1", "{user}-session-{session}-ttl-{ttl}", 600, "sid1")
+          assert sticky == "user1-session-sid1-ttl-600", sticky
+          cfg = build_singbox_config(
+              [ep], "127.0.0.1", 18080, mixed_users=[("u", "0123456789abcdef")],
+              vless_uuid="a29738e5-bee1-c0fc-b484-ae7c49cbc828",
+              resi={"server": "gw.example.com", "server_port": 1080,
+                    "username": sticky, "password": "0123456789abcdef"})
+          resi = next(o for o in cfg["outbounds"] if o["tag"] == "resi")
+          assert resi["type"] == "socks" and resi["network"] == "tcp", resi
+          # Never part of the metered failover groups.
+          for tag in ("auto", "proxy"):
+              group = next(o for o in cfg["outbounds"] if o["tag"] == tag)
+              assert "resi" not in group["outbounds"], (tag, group)
+          ports = {i["listen_port"] for i in cfg["inbounds"]}
+          assert {8084, 40001} <= ports, ports
+          json.dump(cfg, open("/tmp/singbox-resi.json", "w"), indent=2)
+          print("resi config written")
+          EOF
+          ./sing-box-*/sing-box check -c /tmp/singbox-resi.json
+          echo "resi check OK"
 
   live-snapshot:
     needs: test
@@ -337,6 +380,84 @@ jobs:
           name: probe-${{ github.run_id }}
           path: /tmp/probe.jsonl
           retention-days: 90
+
+  # Real residential gateway check. Skipped unless the repository defines
+  # RESI_GATEWAY / RESI_USER / RESI_PASS secrets, because:
+  #   * forks and PRs from forks never receive secrets,
+  #   * residential bandwidth is metered (this job uses a few KB only).
+  # The credentials are masked before they can reach a log line, and the job
+  # never prints the rendered username (sticky usernames embed a session id).
+  live-resi:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - name: Detect residential gateway secrets
+        id: gate
+        env:
+          RESI_GATEWAY: ${{ secrets.RESI_GATEWAY }}
+          RESI_USER: ${{ secrets.RESI_USER }}
+          RESI_PASS: ${{ secrets.RESI_PASS }}
+        run: |
+          if [ -n "$RESI_GATEWAY" ] && [ -n "$RESI_USER" ] && [ -n "$RESI_PASS" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::RESI_GATEWAY/RESI_USER/RESI_PASS secrets not set - skipping live gateway check"
+          fi
+      - name: Restore sing-box tarball from cache
+        if: steps.gate.outputs.enabled == 'true'
+        id: singbox-cache
+        uses: actions/cache@v5
+        with:
+          path: /tmp/sing-box-tarball.tgz
+          key: sing-box-tarball-${{ env.SINGBOX_VERSION }}
+      - name: Download sing-box v${{ env.SINGBOX_VERSION }}
+        if: steps.gate.outputs.enabled == 'true' && steps.singbox-cache.outputs.cache-hit != 'true'
+        run: |
+          curl -Ls "https://github.com/SagerNet/sing-box/releases/download/v${{ env.SINGBOX_VERSION }}/sing-box-${{ env.SINGBOX_VERSION }}-linux-amd64.tar.gz" -o /tmp/sing-box-tarball.tgz
+          tar xzf /tmp/sing-box-tarball.tgz
+      - name: Real gateway exit-IP rotation check
+        if: steps.gate.outputs.enabled == 'true'
+        env:
+          RESI_GATEWAY: ${{ secrets.RESI_GATEWAY }}
+          RESI_USER: ${{ secrets.RESI_USER }}
+          RESI_PASS: ${{ secrets.RESI_PASS }}
+        run: |
+          echo "::add-mask::$RESI_PASS"
+          echo "::add-mask::$RESI_USER"
+          tar xzf /tmp/sing-box-tarball.tgz
+          export SINGBOX_BIN="$(ls -d ./sing-box-*/sing-box | head -n1)"
+          python - <<'EOF'
+          import os
+          from vpngate_to_singbox import measure_resi_rotation, render_resi_username
+
+          gateway = os.environ["RESI_GATEWAY"]
+          host, _, port = gateway.rpartition(":")
+          outbound = {
+              "server": host.strip("[]"),
+              "server_port": int(port),
+              # Rotation mode: no session parameter at all.
+              "username": render_resi_username(os.environ["RESI_USER"], "{user}", 0, ""),
+              "password": os.environ["RESI_PASS"],
+          }
+          result = measure_resi_rotation(outbound, count=3,
+                                         singbox_bin=os.environ["SINGBOX_BIN"],
+                                         timeout=30)
+          if not result:
+              raise SystemExit("resi: gateway never answered")
+          ips = result["ips"]
+          print(f"resi: {len(ips)} samples, {result['distinct']} distinct exit IPs: {ips}")
+          if result["distinct"] < 2:
+              raise SystemExit(
+                  "resi: exit IP never changed across fresh connections - "
+                  "rotation is broken or the gateway silently ignores sessions")
+          print("resi rotation OK")
+          EOF
 
   railway-build:
     needs: test

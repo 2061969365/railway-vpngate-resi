@@ -17,12 +17,17 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from vpngate_to_singbox import (
+    DEFAULT_RESI_PATH,
+    DEFAULT_RESI_PORT,
     build_singbox_config,
     measure_exit_ip,
     measure_real_latency,
+    measure_resi_exit_ip,
+    measure_resi_rotation,
     nodes_to_endpoints,
     primary_server,
     probe_tcp_latency,
+    render_resi_username,
     snapshot_to_nodes,
 )
 DEFAULT_SNAPSHOT_URL = "https://www.vpngate.net/api/iphone/"
@@ -51,6 +56,9 @@ SETTINGS_SPEC: dict = {
     "probe_workers": {"type": "int", "min": 5, "max": 30},
     "auto_repin": {"type": "bool"},
     "auto_rescue": {"type": "bool"},
+    # Residential sticky window. Credentials stay env-only (settings.json is
+    # returned verbatim by /api/settings, so it must never hold them).
+    "resi_session_ttl": {"type": "int", "min": 0, "max": 86400},
 }
 def _int_env(env: dict, name: str, default: int, min_val: int | None = None, max_val: int | None = None) -> int:
     raw = env.get(name, default)
@@ -76,6 +84,46 @@ def _env_bool(env: dict, name: str, default: bool) -> bool:
     if text in ("0", "false", "no", "off"):
         return False
     return default
+def _build_resi_from_env(env: dict) -> dict | None:
+    """Parse the rotating-residential gateway env (None = path disabled).
+
+    Only the gateway address + credentials are accepted here; they never enter
+    settings.json because /api/settings returns that file verbatim. Rotation is
+    the default (no session parameter); sticky mode additionally needs a
+    template that actually carries {session}, otherwise we stay in rotation
+    rather than inventing a provider-specific username format.
+    """
+    gateway = (env.get("RESI_GATEWAY") or "").strip()
+    if not gateway:
+        return None
+    host, _, port_text = gateway.rpartition(":")
+    host = host.strip()
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    try:
+        gateway_port = int(port_text.strip())
+    except ValueError:
+        gateway_port = 0
+    if not host or not 0 < gateway_port < 65536:
+        print(f"refusing to start: RESI_GATEWAY must be host:port, got {gateway!r}", flush=True)
+        raise SystemExit(2)
+    user = (env.get("RESI_USER") or "").strip()
+    password = env.get("RESI_PASS") or ""
+    if not user or not password:
+        print("refusing to start: RESI_GATEWAY needs RESI_USER and RESI_PASS", flush=True)
+        raise SystemExit(2)
+    ttl = _int_env(env, "RESI_SESSION_TTL", 0, 0, 86400)
+    template = env.get("RESI_USER_TEMPLATE", "{user}")
+    if ttl > 0 and "{session}" not in template:
+        print("warning: RESI_SESSION_TTL>0 but RESI_USER_TEMPLATE has no {session}; staying in rotation mode", flush=True)
+    try:
+        render_resi_username(user, template, ttl, "probe")
+    except ValueError as exc:
+        print(f"refusing to start: {exc}", flush=True)
+        raise SystemExit(2)
+    return {"server": host, "server_port": gateway_port, "username": user,
+            "password": password, "template": template, "session_ttl": ttl,
+            "probe_interval": _int_env(env, "RESI_PROBE_INTERVAL", 300, 60, 86400)}
 CRASH_BACKOFFS = (5, 10, 20, 40, 300)
 
 UI_HTML = """\
@@ -347,8 +395,16 @@ html[data-theme="light"] :focus-visible{outline-color:#1a73e8}
 <div class="route-strip" id="route-strip" hidden>
 <div class="rt"><b>/ws-node → Railway 本机</b><code id="route-direct">—</code></div>
 <div class="rt"><b>/ws-chain → VPN 节点</b><code id="route-chain">—</code></div>
+<div class="rt" id="route-resi-wrap" hidden><b>/ws-resi → 住宅出口</b><code id="route-resi">—</code></div>
 </div>
 <div class="actions"><button id="btn-verify" onclick="verifyExit()">验证出口 IP</button></div>
+</div>
+<div class="glass-card" id="resi-card" hidden>
+<h2>住宅出口</h2>
+<p class="desc">固定 backconnect 网关：新连接换出口（旋转），粘性靠用户名里的 session。探测会消耗住宅流量，别频繁点。</p>
+<p id="resi-line">—</p>
+<p id="resi-ips" class="ip" aria-live="polite">—</p>
+<div class="actions"><button id="btn-resi-probe" class="btn" onclick="resiProbe()">探测出口 IP</button></div>
 </div>
 <div class="stats">
 <div class="stat"><div class="k">可用节点</div><div class="v" id="stat-nodes">—</div></div>
@@ -389,6 +445,7 @@ html[data-theme="light"] :focus-visible{outline-color:#1a73e8}
 <p class="desc">双路 VLESS，一键复制。域名取当前访问 host。</p>
 <div class="subrow"><span class="subtag">直连 /ws-node（VPN 故障时可用）</span><code id="sub-direct">—</code><button class="btn" onclick="copySub('direct',this)">复制</button></div>
 <div class="subrow"><span class="subtag">经 VPN /ws-chain（跟随当前出口）</span><code id="sub-chain">—</code><button class="btn" onclick="copySub('chain',this)">复制</button></div>
+<div class="subrow" id="sub-resi-row" hidden><span class="subtag">住宅 /ws-resi（旋转出口）</span><code id="sub-resi">—</code><button class="btn" onclick="copySub('resi',this)">复制</button></div>
 <p class="hostnote" id="sub-host"></p>
 <div class="actions" style="margin-top:4px"><button class="btn" id="btn-copy-all" style="padding:7px 18px;font-size:12.5px" onclick="copyAll(this)">复制全部</button></div>
 </div>
@@ -414,6 +471,7 @@ html[data-theme="light"] :focus-visible{outline-color:#1a73e8}
 <label>握手并发<input id="set-probew" type="number" aria-label="握手并发"></label>
 <label class="chk"><input type="checkbox" id="set-repin"> 每小时自动重 pin 最优</label>
 <label class="chk"><input type="checkbox" id="set-rescue"> 手动 pin 挂了自动救最优</label>
+<label>住宅粘性秒(0=旋转)<input id="set-resittl" type="number" aria-label="住宅粘性秒"></label>
 </div>
 <div class="actions"><button id="btn-settings-save" class="btn" onclick="saveSettings()">保存设置</button></div>
 <p id="settings-result" aria-live="polite"></p>
@@ -773,6 +831,51 @@ function renderRoutes(s) {
   document.getElementById("route-direct").textContent = location.hostname + " 本机";
   const exitIp = (s.verify && s.verify.exit_ip) || ((s.verify && s.verify.state === "running") ? "验证中…" : "未验证");
   document.getElementById("route-chain").textContent = exitIp;
+  const resi = s.resi || {};
+  const wrap = document.getElementById("route-resi-wrap");
+  if (wrap) wrap.hidden = !resi.enabled;
+  if (resi.enabled) {
+    const cell = document.getElementById("route-resi");
+    if (cell) cell.textContent = resi.exit_ip || "未探测";
+  }
+  renderResi(s);
+}
+function renderResi(s) {
+  const card = document.getElementById("resi-card");
+  if (!card) return;
+  const r = s.resi || {};
+  if (!r.enabled) { card.hidden = true; return; }
+  card.hidden = false;
+  const mode = r.mode === "sticky" ? ("粘性 · ttl " + r.sticky_ttl + "s") : "旋转";
+  const state = r.state === "up" ? "正常" : (r.state === "down" ? "不可用" : "未探测");
+  const el = document.getElementById("resi-line");
+  if (el) el.textContent = "网关 " + r.host + ":" + r.port + " · " + mode + " · " + state +
+    (r.exit_ip ? (" · 出口 " + r.exit_ip + (r.ms ? (" / " + r.ms + "ms") : "")) : "") +
+    (r.error ? (" · " + r.error) : "");
+  const p = r.last_probe || {};
+  const ips = p.ips || [];
+  const box = document.getElementById("resi-ips");
+  if (!box) return;
+  if (p.state === "running") { box.textContent = "探测中…"; return; }
+  if (!ips.length) { box.textContent = p.error ? ("探测失败：" + p.error) : "尚无探测结果"; return; }
+  let verdict = "";
+  if (p.rotating === true) verdict = " · 轮换正常";
+  else if (p.rotating === false) verdict = " · 未轮换（旋转模式请确认客户端已关闭 multiplex/mux）";
+  box.textContent = ips.join(" → ") + " · 不同 IP " + p.distinct + " 个" + verdict;
+}
+async function resiProbe() {
+  const btn = document.getElementById("btn-resi-probe");
+  if (btn && btn.disabled) return;
+  if (btn) { btn.disabled = true; btn.classList.add("busy"); }
+  try {
+    await api("/api/resi_probe", "POST", {count: 3});
+    if (lastStatus) renderAll(lastStatus);
+    refresh();
+  } catch (e) {
+    if (!isAbort(e)) toast("探测失败: " + e.message, true);
+  } finally {
+    if (btn) { btn.disabled = false; btn.classList.remove("busy"); }
+  }
 }
 function renderSub(s) {
   const sec = document.getElementById("sec-sub");
@@ -787,12 +890,21 @@ function renderSub(s) {
   sec.dataset.chain = mk(s.vless.chain_path, "vpngate");
   document.getElementById("sub-direct").textContent = sec.dataset.direct;
   document.getElementById("sub-chain").textContent = sec.dataset.chain;
+  const resi = s.resi || {};
+  const resiRow = document.getElementById("sub-resi-row");
+  if (resiRow) {
+    resiRow.hidden = !(resi.enabled && resi.path);
+    if (!resiRow.hidden) {
+      sec.dataset.resi = mk(resi.path, "resi");
+      document.getElementById("sub-resi").textContent = sec.dataset.resi;
+    }
+  }
   const hostNote = document.getElementById("sub-host");
   if (hostNote) hostNote.textContent = "当前 host=" + host + " · 换域名访问会改变链接";
 }
 async function copySub(which, btn) {
   const sec = document.getElementById("sec-sub");
-  const text = which === "direct" ? sec.dataset.direct : sec.dataset.chain;
+  const text = which === "direct" ? sec.dataset.direct : (which === "chain" ? sec.dataset.chain : sec.dataset.resi);
   if (!text) return;
   let ok = false;
   try {
@@ -813,7 +925,7 @@ async function copySub(which, btn) {
 }
 async function copyAll(btn) {
   const sec = document.getElementById("sec-sub");
-  const text = [sec.dataset.direct, sec.dataset.chain].filter(Boolean).join(String.fromCharCode(10));
+  const text = [sec.dataset.direct, sec.dataset.chain, sec.dataset.resi].filter(Boolean).join(String.fromCharCode(10));
   if (!text) return;
   let ok = false;
   try {
@@ -867,6 +979,7 @@ async function loadSettings() {
     setVal("set-probew", v.probe_workers);
     setVal("set-repin", v.auto_repin);
     setVal("set-rescue", v.auto_rescue);
+    setVal("set-resittl", v.resi_session_ttl);
   } catch (e) { if (!isAbort(e)) toast("设置拉取失败: " + e.message, true); }
 }
 async function saveSettings() {
@@ -881,7 +994,8 @@ async function saveSettings() {
     full_probe_workers: getVal("set-fpw"),
     probe_workers: getVal("set-probew"),
     auto_repin: getVal("set-repin"),
-    auto_rescue: getVal("set-rescue")
+    auto_rescue: getVal("set-rescue"),
+    resi_session_ttl: getVal("set-resittl")
   };
   if (btn) { btn.disabled = true; }
   try {
@@ -1330,13 +1444,24 @@ def build_config_from_env(env: dict) -> dict:
     port = _int_env(env, "PORT", 3000, 1, 65535)
     vless_direct_port = _int_env(env, "VLESS_DIRECT_PORT", 8080, 1, 65535)
     vless_chain_port = _int_env(env, "VLESS_CHAIN_PORT", 8082, 1, 65535)
+    resi_port = _int_env(env, "RESI_PORT", DEFAULT_RESI_PORT, 1, 65535)
+    resi = _build_resi_from_env(env)
     if vless_direct_port == vless_chain_port:
         print(f"refusing to start: VLESS ports collide ({vless_direct_port})", flush=True)
         raise SystemExit(2)
+    if resi is not None:
+        if not env.get("VLESS_UUID", ""):
+            print("refusing to start: RESI_GATEWAY needs VLESS_UUID (the resi path is a VLESS+WS inbound)", flush=True)
+            raise SystemExit(2)
+        if resi_port in {8080, 8081, 8082, 4096, mixed_port, vless_direct_port, vless_chain_port}:
+            print(f"refusing to start: RESI_PORT={resi_port} collides", flush=True)
+            raise SystemExit(2)
     if mixed_port in {8080, 8081, 8082, 4096, vless_direct_port, vless_chain_port}:
         print(f"refusing to start: MIXED_PORT={mixed_port} collides", flush=True)
         raise SystemExit(2)
     reserved = {8080, 8081, 8082, 4096, mixed_port, vless_direct_port, vless_chain_port}
+    if resi is not None:
+        reserved.add(resi_port)
     if port in reserved:
         print(f"refusing to start: PORT={port} collides {sorted(reserved)}; set PORT=3000", flush=True)
         raise SystemExit(2)
@@ -1360,6 +1485,8 @@ def build_config_from_env(env: dict) -> dict:
         "data_dir": env.get("DATA_DIR") or env.get("RAILWAY_VOLUME_MOUNT_PATH") or ".",
         "vless_uuid": env.get("VLESS_UUID", ""),
         "vless_direct_port": vless_direct_port, "vless_chain_port": vless_chain_port,
+        "resi": resi, "resi_port": resi_port,
+        "resi_path": env.get("RESI_PATH", DEFAULT_RESI_PATH),
         "tunnel_token": env.get("TUNNEL_TOKEN", ""),
         "cloudflared_bin": env.get("CLOUDFLARED_BIN", "cloudflared"),
         "disguise_path": env.get("DISGUISE_PATH", ""),
@@ -1450,6 +1577,13 @@ def _mem_pct(meminfo_path: str = "/proc/meminfo") -> float | None:
     return round((total - available) / total * 100.0, 1)
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+def _query_param(query: str, name: str) -> str:
+    """Value of one query parameter ("" when absent); no multi-value support."""
+    for part in (query or "").split("&"):
+        key, _, value = part.partition("=")
+        if key.strip() == name:
+            return urllib.parse.unquote(value.strip())
+    return ""
 def _http_response(status: str, content_type: str, body: bytes, extra_headers: dict | None = None) -> bytes:
     lines = [f"HTTP/1.1 {status}", f"Content-Type: {content_type}", f"Content-Length: {len(body)}"]
     if extra_headers:
@@ -1526,6 +1660,8 @@ class RailwayManager:
         full_probe_workers: int = 2, probe_workers: int = 15, dial_timeout: int = 15, auto_repin: bool = False,
         auto_rescue: bool = True, verify_fn=None, vless_uuid: str = "", vless_direct_port: int = 8080,
         vless_chain_port: int = 8082, vless_direct_path: str = "/ws-node", vless_chain_path: str = "/ws-chain",
+        resi: dict | None = None, resi_port: int = DEFAULT_RESI_PORT, resi_path: str = DEFAULT_RESI_PATH,
+        resi_session_ttl: int = 0,
         tunnel_token: str = "", cloudflared_bin: str = "cloudflared", disguise_path: str = "",
         config_path: str = "singbox-railway.json", nodes_path: str = "nodes.json", state_path: str = "state.json",
         settings_path: str | None = None, singbox_bin: str = "sing-box", start_singbox: bool = True,
@@ -1545,23 +1681,37 @@ class RailwayManager:
         self.retry_delays = retry_delays; self.fetcher = fetcher or default_fetch
         self.vless_uuid = vless_uuid; self.vless_direct_port = vless_direct_port; self.vless_chain_port = vless_chain_port
         self.vless_direct_path = vless_direct_path; self.vless_chain_path = vless_chain_path
+        self.resi = dict(resi) if resi else None; self.resi_port = resi_port; self.resi_path = resi_path
+        self.resi_session_ttl = int(resi_session_ttl or 0)
+        self._resi_session_id = ""; self._resi_session_started = 0.0; self._resi_lock = threading.Lock(); self._resi_probe_lock = threading.Lock()
         self.tunnel_token = tunnel_token; self.cloudflared_bin = cloudflared_bin; self.disguise_path = disguise_path
         self._cloudflared_proc = None; self.preferred_tag = None; self.backup_tag = None; self._auto_pinned = False
         self._nodes: list[dict] = []; self._first_seen: dict[str, str] = {}
         self._cpu_model = _cpu_model(); self._cpu_cores = os.cpu_count(); self._cpu_last = None
         self._fail_streak = 0; self._pinned_fail_streak = 0; self._rescue_round = 0; self._crash_streak = 0; self._retry_after = 0.0; self._mixed_fail_streak = 0; self._mixed_retry_after = 0.0; self._health_mixed_streak = 0; self._refresh_generation = 0
         self._lock = threading.RLock(); self._refresh_lock = threading.Lock(); self._config_lock = threading.Lock()
+        resi_status = ({"enabled": True, "host": resi["server"], "port": resi["server_port"],
+            "path": resi_path,
+            "mode": "sticky" if self.resi_session_ttl > 0 else "rotation",
+            "sticky_ttl": self.resi_session_ttl, "session_age": 0, "state": "unknown",
+            "exit_ip": None, "ms": None, "checked_at": None, "error": None,
+            "last_probe": {"state": "idle", "ips": [], "distinct": 0, "rotating": None, "checked_at": None}}
+            if resi else {"enabled": False})
         self.status: dict = {"endpoints": [], "countries": [], "preferred_tag": None, "backup_tag": None, "auto_pinned": False,
             "refresh_history": [], "refresh_ok": 0, "refresh_fail": 0, "last_refresh": None, "last_error": None, "started_at": None,
             "proxy": f"127.0.0.1:{mixed_port}", "traffic": {"connections": 0, "bytes_up": 0, "bytes_down": 0},
             "full_probe": {"state": "idle", "done": 0, "total": 0}, "refresh_job": {"state": "idle", "started_at": None, "ok": None, "error": None}, "probe": {"state": "idle", "tag": None, "ms": None, "error": None},
             "verify": {"state": "idle", "exit_ip": None, "ms": None, "via_tag": None, "error": None, "checked_at": None},
-            "tunnel": {"state": "off"}, "vless": ({"uuid": vless_uuid, "direct_path": vless_direct_path, "chain_path": vless_chain_path} if vless_uuid else None)}
+            "tunnel": {"state": "off"}, "vless": ({"uuid": vless_uuid, "direct_path": vless_direct_path, "chain_path": vless_chain_path} if vless_uuid else None),
+            "resi": resi_status}
         self._full_probe_thread = None; self._single_probe_thread = None; self._verify_thread = None; self._verify_generation = 0; self._refresh_thread = None
         self._stop_event = threading.Event(); self._mux_slots = threading.BoundedSemaphore(max_mux_connections); self._mux_inflight = 0
         self._post_slots = threading.BoundedSemaphore(MAX_POST_CONNECTIONS); self._health_check_interval = health_check_interval
         self._listener = None; self._singbox_proc = None; self._stderr_handle = None; self.bound_port = port
         self.load_settings()
+        if self.resi is not None:
+            # settings.json overrides env for the ttl, so re-sync the reported mode.
+            self._set_resi(mode=self._resi_mode(), sticky_ttl=self.resi_session_ttl)
     def start(self) -> int:
         self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -1575,6 +1725,8 @@ class RailwayManager:
             threading.Thread(target=self._refresh_loop, daemon=True, name="refresh-loop").start()
         threading.Thread(target=self._supervise_loop, daemon=True, name="supervise-loop").start()
         threading.Thread(target=self._health_monitor_loop, daemon=True, name="health-monitor").start()
+        if self.resi is not None:
+            threading.Thread(target=self._resi_probe_loop, daemon=True, name="resi-probe").start()
         if self.fetch_on_start:
             threading.Thread(target=self._initial_refresh, daemon=True, name="initial-refresh").start()
         self._start_cloudflared()
@@ -1772,7 +1924,7 @@ class RailwayManager:
                 client.sendall(_http_response("503 Service Unavailable", "text/plain", b"busy, retry later", {"Retry-After": "5"}))
                 return
             try:
-                self._route_post(client, path, headers, body)
+                self._route_post(client, path, headers, body, query)
             finally:
                 self._post_slots.release()
             return
@@ -1781,7 +1933,7 @@ class RailwayManager:
         else:
             client.sendall(_http_response("404 Not Found", "text/plain", b"not found"))
 
-    def _route_post(self, client: socket.socket, path: str, headers: dict, body: bytes) -> None:
+    def _route_post(self, client: socket.socket, path: str, headers: dict, body: bytes, query: str = "") -> None:
         if path == "/api/refresh":
             if not self._start_refresh_bg():
                 client.sendall(_http_response("409 Conflict", "application/json",
@@ -1812,6 +1964,18 @@ class RailwayManager:
                 return
             client.sendall(_http_response("202 Accepted", "application/json", json.dumps({"accepted": True, "tag": node["endpoint"]["tag"]}).encode()))
         elif path == "/api/verify":
+            if _query_param(query, "path") == "resi":
+                if not self.resi:
+                    client.sendall(_http_response("503 Service Unavailable", "application/json", json.dumps({"ok": False, "error": "resi disabled"}).encode()))
+                    return
+                with self._lock:
+                    running = (self.status["resi"].get("last_probe") or {}).get("state") == "running"
+                if running:
+                    client.sendall(_http_response("409 Conflict", "application/json", json.dumps({"accepted": False, "error": "already running"}).encode()))
+                    return
+                threading.Thread(target=self._run_resi_verify, daemon=True, name="resi-verify").start()
+                client.sendall(_http_response("202 Accepted", "application/json", json.dumps({"accepted": True, "path": "resi"}).encode()))
+                return
             node = self._verify_target_node()
             if node is None:
                 client.sendall(_http_response("503 Service Unavailable", "application/json", json.dumps({"ok": False, "error": "no nodes"}).encode()))
@@ -1843,6 +2007,38 @@ class RailwayManager:
             ok, detail = self.update_settings(payload)
             status = "200 OK" if ok else "400 Bad Request"
             client.sendall(_http_response(status, "application/json", json.dumps({"ok": ok, "detail": detail, "settings": self.settings_snapshot()["values"] if ok else None}).encode()))
+        elif path == "/api/resi_probe":
+            if not self.resi:
+                client.sendall(_http_response("503 Service Unavailable", "application/json", json.dumps({"ok": False, "error": "resi disabled"}).encode()))
+                return
+            try:
+                payload = json.loads((body or b"{}").decode("utf-8") or "{}")
+            except (ValueError, UnicodeDecodeError):
+                payload = None
+            if not isinstance(payload, dict):
+                client.sendall(_http_response("400 Bad Request", "text/plain", b"invalid json"))
+                return
+            try:
+                count = int(payload.get("count", 3))
+            except (TypeError, ValueError):
+                count = 3
+            count = max(1, min(5, count))
+            rotate = bool(payload.get("rotate_session"))
+            if not self._start_resi_probe(count, rotate_session=rotate):
+                client.sendall(_http_response("409 Conflict", "application/json", json.dumps({"accepted": False, "error": "already running"}).encode()))
+                return
+            if rotate and self.resi_session_ttl > 0:
+                self._apply_config_bg()
+            client.sendall(_http_response("202 Accepted", "application/json", json.dumps({"accepted": True, "count": count, "rotate_session": rotate}).encode()))
+        elif path == "/api/resi_session":
+            if not self.resi or self.resi_session_ttl <= 0:
+                client.sendall(_http_response("400 Bad Request", "application/json", json.dumps({"ok": False, "error": "sticky session disabled (RESI_SESSION_TTL=0)"}).encode()))
+                return
+            with self._resi_lock:
+                self._resi_session_id = ""
+            self._set_resi(mode=self._resi_mode(), sticky_ttl=self.resi_session_ttl, session_age=0)
+            self._apply_config_bg()
+            client.sendall(_http_response("202 Accepted", "application/json", json.dumps({"ok": True, "session": "rotated"}).encode()))
         elif path.startswith("/api/"):
             client.sendall(_http_response("405 Method Not Allowed", "text/plain", b"method not allowed"))
         else:
@@ -1992,6 +2188,13 @@ class RailwayManager:
         if self.settings_path:
             _write_private_json(self.settings_path, self.settings_snapshot()["values"])
         self._record_history("settings", ", ".join(f"{k}={v}" for k, v in clean.items()))
+        if self.resi is not None and "resi_session_ttl" in clean:
+            # A new ttl means a new sticky window: mint a fresh session id and
+            # rebuild the serving config off-thread (this may restart sing-box).
+            with self._resi_lock:
+                self._resi_session_id = ""
+            self._set_resi(mode=self._resi_mode(), sticky_ttl=int(self.resi_session_ttl or 0))
+            self._apply_config_bg()
         return True, "saved"
     def load_settings(self) -> None:
         if not self.settings_path:
@@ -2380,14 +2583,17 @@ class RailwayManager:
         return True
     def _apply_config(self, final: str = "auto", preferred: str | None = None, backup: str | None = None) -> bool:
         serving = self._serving_nodes()
+        resi_outbound = self._resi_outbound()
         with self._lock:
             endpoints = [n["endpoint"] for n in serving]
             username, password = self.username, self.password; mixed_port = self.mixed_port
             vless_uuid = self.vless_uuid or None; direct_port = self.vless_direct_port; chain_port = self.vless_chain_port
+            resi_port = self.resi_port; resi_path = self.resi_path
             config_path = self.config_path; last_good_path = self.last_good_path; want_singbox = self.want_singbox
         config = build_singbox_config(endpoints, "127.0.0.1", mixed_port, mixed_users=[(username, password)],
             final=final, preferred=preferred, backup=backup, vless_uuid=vless_uuid,
-            vless_direct_port=direct_port, vless_chain_port=chain_port)
+            vless_direct_port=direct_port, vless_chain_port=chain_port,
+            resi=resi_outbound, resi_port=resi_port, resi_path=resi_path)
         if want_singbox and self._serving_config_unchanged(config):
             with self._lock:
                 proc = self._singbox_proc
@@ -2726,6 +2932,116 @@ class RailwayManager:
             self._verify_generation += 1
             self.status["verify"] = {"state": "idle", "exit_ip": None, "ms": None, "via_tag": None, "error": None, "checked_at": None, "generation": self._verify_generation}
         self._record_history("verify-invalidated", reason)
+    # --- rotating residential SOCKS5 exit ---------------------------------
+    def _resi_mode(self) -> str:
+        return "sticky" if int(self.resi_session_ttl or 0) > 0 else "rotation"
+    def _resi_session(self) -> str:
+        """Sticky session id, stable for the process lifetime.
+
+        The gateway binds an exit to (username, session-id). Rotating the id
+        means rewriting the serving config and therefore restarting sing-box,
+        so it is an explicit action (POST /api/resi_session). A timer would
+        silently drop every VLESS connection mid-transfer every ttl seconds.
+        """
+        with self._resi_lock:
+            if not self._resi_session_id:
+                self._resi_session_id = secrets.token_hex(4)
+                self._resi_session_started = time.monotonic()
+            return self._resi_session_id
+    def _resi_outbound(self) -> dict | None:
+        """Rendered socks outbound, or None when disabled or template broken."""
+        if not self.resi:
+            return None
+        ttl = int(self.resi_session_ttl or 0)
+        sid = self._resi_session() if ttl > 0 else ""
+        try:
+            username = render_resi_username(self.resi["username"], self.resi.get("template"), ttl, sid)
+        except ValueError as exc:
+            print(f"resi template error: {exc}", flush=True)
+            return None
+        return {"server": self.resi["server"], "server_port": self.resi["server_port"],
+                "username": username, "password": self.resi["password"]}
+    def _set_resi(self, **fields) -> None:
+        with self._lock:
+            resi_status = self.status.get("resi")
+            if isinstance(resi_status, dict) and resi_status.get("enabled"):
+                resi_status.update(fields)
+                if self.resi_session_ttl > 0 and self._resi_session_started:
+                    resi_status["session_age"] = int(time.monotonic() - self._resi_session_started)
+    def _resi_probe_loop(self) -> None:
+        interval = int((self.resi or {}).get("probe_interval", 300) or 300)
+        while not self._stop_event.wait(interval):
+            self._start_resi_probe(1)
+    def _start_resi_probe(self, count: int = 3, rotate_session: bool = False) -> bool:
+        """Single-flight residential probe; False when disabled or running."""
+        if not self.resi:
+            return False
+        with self._lock:
+            current = self.status["resi"].get("last_probe") or {}
+            if current.get("state") == "running":
+                return False
+            if rotate_session:
+                with self._resi_lock:
+                    self._resi_session_id = ""
+            self.status["resi"]["last_probe"] = {"state": "running", "ips": [], "distinct": 0,
+                                                "rotating": None, "checked_at": None}
+        threading.Thread(target=self._run_resi_probe, args=(max(1, min(5, int(count))),),
+                         daemon=True, name="resi-probe").start()
+        return True
+    def _run_resi_probe(self, count: int) -> None:
+        outbound = self._resi_outbound()
+        result = None
+        error = None
+        if outbound is None:
+            error = "no residential outbound"
+        else:
+            try:
+                result = measure_resi_rotation(outbound, count=count, singbox_bin=self.singbox_bin,
+                                               timeout=self.dial_timeout)
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+        now = _now_iso()
+        if result is None:
+            reason = error or "no exit ip"
+            self._set_resi(state="down", error=reason, checked_at=now,
+                           last_probe={"state": "done", "ips": [], "distinct": 0,
+                                       "rotating": False, "checked_at": now, "error": reason})
+            self._record_history("resi-probe", f"failed: {reason}")
+            return
+        ips = result["ips"]
+        distinct = result["distinct"]
+        rotating = (distinct >= 2) if self._resi_mode() == "rotation" else (distinct == 1)
+        self._set_resi(state="up", exit_ip=ips[-1], ms=result["first_ms"], checked_at=now, error=None,
+                       last_probe={"state": "done", "ips": ips, "distinct": distinct,
+                                   "rotating": rotating, "checked_at": now})
+        self._record_history("resi-probe", f"{len(ips)}x ips={','.join(ips)} distinct={distinct}")
+    def _run_resi_verify(self) -> None:
+        """Verify target for POST /api/verify?path=resi: one exit IP."""
+        outbound = self._resi_outbound()
+        exit_ip, ms = (None, None)
+        error = None
+        if outbound is None:
+            error = "no residential outbound"
+        else:
+            try:
+                exit_ip, ms = measure_resi_exit_ip(outbound, self.singbox_bin, self.dial_timeout)
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+            if not exit_ip and error is None:
+                error = "no exit ip measured"
+        now = _now_iso()
+        self._set_resi(state=("up" if exit_ip else "down"), exit_ip=exit_ip, ms=ms,
+                       checked_at=now, error=error)
+        self._record_history("resi-verify", f"exit={exit_ip} ms={ms}")
+    def _apply_config_bg(self) -> None:
+        """Re-apply the serving config off-thread (used for ttl/session changes)."""
+        def _run() -> None:
+            with self._config_lock:
+                try:
+                    self._apply_config(final="auto", preferred=self.preferred_tag, backup=self.backup_tag)
+                except Exception as exc:
+                    print(f"config apply failed: {type(exc).__name__}: {exc}", flush=True)
+        threading.Thread(target=_run, daemon=True, name="apply-config").start()
     def _fetch_with_retry(self, fetch) -> str:
         last_exc: Exception | None = None
         delays = [0] + list(self.retry_delays)
@@ -2832,6 +3148,8 @@ def main() -> int:
         full_probe_workers=cfg["full_probe_workers"], probe_workers=cfg["probe_workers"], dial_timeout=cfg["dial_timeout"],
         auto_rescue=cfg["auto_rescue"], health_check_interval=cfg["health_check_interval"], max_mux_connections=cfg["max_mux_connections"],
         vless_uuid=cfg["vless_uuid"], vless_direct_port=cfg["vless_direct_port"], vless_chain_port=cfg["vless_chain_port"],
+        resi=cfg["resi"], resi_port=cfg["resi_port"], resi_path=cfg["resi_path"],
+        resi_session_ttl=(cfg["resi"]["session_ttl"] if cfg["resi"] else 0),
         tunnel_token=cfg["tunnel_token"], cloudflared_bin=cfg["cloudflared_bin"], disguise_path=cfg["disguise_path"],
         config_path=os.path.join(data_dir, "singbox-railway.json"), nodes_path=os.path.join(data_dir, "nodes.json"),
         state_path=os.path.join(data_dir, "state.json"), settings_path=os.path.join(data_dir, "settings.json"))

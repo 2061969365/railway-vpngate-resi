@@ -1044,6 +1044,13 @@ if(simPanel && !window.matchMedia('(prefers-reduced-motion: reduce)').matches &&
                 <button class="btn-copy-chain" onclick="copyText('nodeLinkChain', this)">📋 一键复制链式节点链接</button>
             </div>
 
+            <div class="card card-chain glass-card" id="resiCard" style="display:none;">
+                <div class="label" style="color:#a78bfa;">🏠 VLESS 住宅出口<span class="path-pill path-chain">/ws-resi</span></div>
+                <div class="route-hint">出口 = 旋转住宅 IP · 每次新连接换 IP（客户端须关闭 mux）</div>
+                <div class="value" id="nodeLinkResi" style="height:50px;">生成中...</div>
+                <button class="btn-copy-chain" onclick="copyText('nodeLinkResi', this)">📋 一键复制住宅节点链接</button>
+            </div>
+
             <button id="btn-copy-both" onclick="copyBoth(this)">📋 一键复制两个链接（直连 + 链式）</button>
 
             <div class="card glass-card">
@@ -1062,8 +1069,10 @@ if(simPanel && !window.matchMedia('(prefers-reduced-motion: reduce)').matches &&
         const uuid = "UUID_PLACEHOLDER";
         const wsPath = "/ws-node";
         const wsChainPath = "/ws-chain";
+        const wsResiPath = "RESI_PATH_PLACEHOLDER";
         const nodeRemark = "NODE_REMARK_PLACEHOLDER";
         const chainRemark = nodeRemark + "-chain";
+        const resiRemark = nodeRemark + "-resi";
         const currentHost = window.location.host;
 
         // mirror handling lives in the single IIFE at the end of body.
@@ -1073,7 +1082,17 @@ if(simPanel && !window.matchMedia('(prefers-reduced-motion: reduce)').matches &&
             const chainLink = `vless://${uuid}@${connectAddress}:443?encryption=none&security=tls&type=ws&host=${currentHost}&sni=${currentHost}&path=${encodeURIComponent(wsChainPath)}#${chainRemark}`;
             document.getElementById('nodeLink').innerText = vlessLink;
             document.getElementById('nodeLinkChain').innerText = chainLink;
-            document.getElementById('subContent').innerText = btoa(unescape(encodeURIComponent(vlessLink + "\n" + chainLink)));
+            // The residential path only exists when RESI_PATH_PLACEHOLDER was
+            // replaced at boot (start.sh); an unreplaced placeholder must not
+            // leave a dead link on the page.
+            let resiLink = "";
+            if (/^\/[\w\/-]+$/.test(wsResiPath) && wsResiPath.indexOf("PLACEHOLDER") === -1) {
+                resiLink = `vless://${uuid}@${connectAddress}:443?encryption=none&security=tls&type=ws&host=${currentHost}&sni=${currentHost}&path=${encodeURIComponent(wsResiPath)}#${resiRemark}`;
+                document.getElementById('nodeLinkResi').innerText = resiLink;
+                document.getElementById('resiCard').style.display = "";
+            }
+            const sub = [vlessLink, chainLink, resiLink].filter(Boolean).join(String.fromCharCode(10));
+            document.getElementById('subContent').innerText = btoa(unescape(encodeURIComponent(sub)));
         }
 
         function realToast(msg) {
@@ -1193,11 +1212,17 @@ if(simPanel && !window.matchMedia('(prefers-reduced-motion: reduce)').matches &&
                 realToast('链接还没生成好，请稍后再试');
                 return;
             }
-            navigator.clipboard.writeText(direct + "\n" + chain).then(() => {
-                flashButton(btn, '✓ 两个链接已复制');
-                realToast('直连 + 链式两个链接已复制！');
+            const resiCard = document.getElementById('resiCard');
+            const resiEl = document.getElementById('nodeLinkResi');
+            const resi = (resiCard && resiCard.style.display !== 'none' && resiEl)
+                ? resiEl.innerText.trim() : "";
+            const all = [direct, chain, resi].filter((l) => l && l.startsWith('vless://')).join(String.fromCharCode(10));
+            const label = resi ? '直连 + 链式 + 住宅三个链接已复制！' : '直连 + 链式两个链接已复制！';
+            navigator.clipboard.writeText(all).then(() => {
+                flashButton(btn, '✓ 已复制');
+                realToast(label);
             }).catch(() => {
-                if (fallbackCopy(direct + "\n" + chain)) { flashButton(btn, '✓ 两个链接已复制'); realToast('直连 + 链式两个链接已复制！'); }
+                if (fallbackCopy(all)) { flashButton(btn, '✓ 已复制'); realToast(label); }
                 else realToast('复制失败，请手动选择复制');
             });
         }

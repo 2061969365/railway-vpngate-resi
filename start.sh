@@ -25,6 +25,14 @@ if grep -q "UUID_PLACEHOLDER" /app/www/index.html 2>/dev/null; then
     esc_remark=$(printf '%s' "$NODE_REMARK" | sed 's/[&/\]/\\&/g')
     sed -i "s/UUID_PLACEHOLDER/$esc_uuid/g" /tmp/index.html
     sed -i "s/NODE_REMARK_PLACEHOLDER/$esc_remark/g" /tmp/index.html
+    # Residential path: injected only when the gateway is configured, so an
+    # unconfigured deployment never advertises a dead /ws-resi link.
+    if [ -n "${RESI_GATEWAY:-}" ]; then
+      resi_path="${RESI_PATH:-/ws-resi}"
+      esc_resi=$(printf '%s' "$resi_path" | sed 's/[&/\]/\\&/g')
+      sed -i "s#RESI_PATH_PLACEHOLDER#${esc_resi}#g" /tmp/index.html
+      echo "[init] residential path: $resi_path"
+    fi
     cp /tmp/index.html /app/www/index.html
   fi
 fi
