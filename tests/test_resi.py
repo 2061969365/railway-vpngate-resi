@@ -602,6 +602,95 @@ class RotateManagerTests(unittest.TestCase):
                 srv.close()
 
         self.assertEqual(["backend-0", "backend-1", "backend-0", "backend-1"], seen)
+    def _http(self, port: int, method: str, path: str,
+              body: bytes | None = None) -> bytes:
+        sock = socket.create_connection(("127.0.0.1", port), timeout=10)
+        with sock:
+            headers = (f"{method} {path} HTTP/1.1\r\nHost: x\r\n"
+                       f"Connection: close\r\n"
+                       f"Authorization: Bearer t0ken-0123456789abcdef\r\n")
+            if body is not None:
+                headers += f"Content-Length: {len(body)}\r\n"
+            sock.sendall(headers.encode() + b"\r\n" + (body or b""))
+            response = b""
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                response += chunk
+        return response
+
+    @staticmethod
+    def _cleanup(manager: RailwayManager) -> None:
+        for path in (manager.config_path, manager.nodes_path, manager.state_path,
+                     manager.config_path + ".last-good"):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+    def test_probe_api_accepts_rotate_mode(self) -> None:
+        # Regression: rotate mode has no residential gateway, so self.resi is
+        # None; the handler used to answer 503 "resi disabled" and the UI's
+        # probe button was dead on a default (zero-config) deployment.
+        sample = {"ips": ["1.1.1.1", "2.2.2.2"], "ms": [1, 2], "count": 2,
+                  "distinct": 2, "errors": [], "first_ms": 1, "last_ms": 2}
+        manager = self._manager(resi_port=_free_port())
+        with mock.patch("railway_manager.measure_resi_rotate", return_value=sample):
+            port = manager.start()
+            try:
+                response = self._http(port, "POST", "/api/resi_probe", b'{"count":2}')
+                for _ in range(80):
+                    if manager.status["resi"]["last_probe"]["state"] == "done":
+                        break
+                    time.sleep(0.05)
+                probe = dict(manager.status["resi"]["last_probe"])
+            finally:
+                manager.stop()
+                self._cleanup(manager)
+
+        self.assertIn(b"202", response)
+        self.assertIn(b'"accepted": true', response)
+        self.assertTrue(probe["rotating"])
+        self.assertEqual(2, probe["distinct"])
+
+    def test_verify_path_resi_accepts_rotate_mode(self) -> None:
+        sample = {"ips": ["9.9.9.9"], "ms": [42], "count": 1, "distinct": 1,
+                  "errors": [], "first_ms": 42, "last_ms": 42}
+        manager = self._manager(resi_port=_free_port())
+        with mock.patch("railway_manager.measure_resi_rotate", return_value=sample):
+            port = manager.start()
+            try:
+                response = self._http(port, "POST", "/api/verify?path=resi")
+                for _ in range(80):
+                    if manager.status["resi"]["exit_ip"] == "9.9.9.9":
+                        break
+                    time.sleep(0.05)
+                exit_ip = manager.status["resi"]["exit_ip"]
+                state = manager.status["resi"]["state"]
+            finally:
+                manager.stop()
+                self._cleanup(manager)
+
+        self.assertIn(b"202", response)
+        self.assertEqual("9.9.9.9", exit_ip)
+        self.assertEqual("up", state)
+
+    def test_resi_session_is_not_offered_in_rotate_mode(self) -> None:
+        # Sticky sessions are a gateway-provider feature; rotate mode must say
+        # so instead of pretending the third path is disabled.
+        manager = self._manager(resi_port=_free_port())
+        port = manager.start()
+        try:
+            response = self._http(port, "POST", "/api/resi_session")
+            mode = manager.status["resi"]["mode"]
+        finally:
+            manager.stop()
+            self._cleanup(manager)
+
+        self.assertIn(b"400", response)
+        self.assertIn(b"rotate mode has no session", response)
+        self.assertEqual("rotate", mode)
 
 
 if __name__ == "__main__":

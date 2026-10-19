@@ -1993,7 +1993,7 @@ class RailwayManager:
             client.sendall(_http_response("202 Accepted", "application/json", json.dumps({"accepted": True, "tag": node["endpoint"]["tag"]}).encode()))
         elif path == "/api/verify":
             if _query_param(query, "path") == "resi":
-                if not self.resi:
+                if not (self.resi or self.resi_rotate):
                     client.sendall(_http_response("503 Service Unavailable", "application/json", json.dumps({"ok": False, "error": "resi disabled"}).encode()))
                     return
                 with self._lock:
@@ -2036,7 +2036,9 @@ class RailwayManager:
             status = "200 OK" if ok else "400 Bad Request"
             client.sendall(_http_response(status, "application/json", json.dumps({"ok": ok, "detail": detail, "settings": self.settings_snapshot()["values"] if ok else None}).encode()))
         elif path == "/api/resi_probe":
-            if not self.resi:
+            # rotate mode has no self.resi (no gateway credentials), but the
+            # third path is very much live: gate on "third path enabled".
+            if not (self.resi or self.resi_rotate):
                 client.sendall(_http_response("503 Service Unavailable", "application/json", json.dumps({"ok": False, "error": "resi disabled"}).encode()))
                 return
             try:
@@ -2059,7 +2061,13 @@ class RailwayManager:
                 self._apply_config_bg()
             client.sendall(_http_response("202 Accepted", "application/json", json.dumps({"accepted": True, "count": count, "rotate_session": rotate}).encode()))
         elif path == "/api/resi_session":
-            if not self.resi or self.resi_session_ttl <= 0:
+            if not (self.resi or self.resi_rotate):
+                client.sendall(_http_response("503 Service Unavailable", "application/json", json.dumps({"ok": False, "error": "resi disabled"}).encode()))
+                return
+            if not self.resi:
+                client.sendall(_http_response("400 Bad Request", "application/json", json.dumps({"ok": False, "error": "sticky session needs the residential gateway; rotate mode has no session"}).encode()))
+                return
+            if self.resi_session_ttl <= 0:
                 client.sendall(_http_response("400 Bad Request", "application/json", json.dumps({"ok": False, "error": "sticky session disabled (RESI_SESSION_TTL=0)"}).encode()))
                 return
             with self._resi_lock:
