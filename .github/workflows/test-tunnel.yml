@@ -1,0 +1,251 @@
+name: Cloudflare quick-tunnel acceptance
+
+# Temporary cloud acceptance test for the real user path:
+# terminal client -> Cloudflare edge -> quick tunnel (trycloudflare.com)
+#   -> container :8084 (manager balancer) -> sing-box rotate inbound
+#   -> VPNGate node -> exit IP.
+# Proves the third path is usable from the public internet, not just
+# localhost. Delete this file once verified.
+
+on:
+  workflow_dispatch:
+  push:
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  LIMIT: "30"
+  REAL_TOPK: "5"
+  ADMIN_TOKEN: tunnel-admin-token-0123456789
+  TEST_UUID: a29738e5-bee1-c0fc-b484-ae7c49cbc828
+  SINGBOX_VERSION: 1.14.0
+
+jobs:
+  quick-tunnel:
+    name: Third path over a real Cloudflare tunnel
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build combined image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          tags: tunnel-railway:trial
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run container
+        run: |
+          docker run -d --name tunnel-trial \
+            -p 3000:3000 -p 8084:8084 \
+            -e PORT=3000 \
+            -e PROXY_USER=u -e PROXY_PASS=0123456789abcdef \
+            -e ADMIN_TOKEN="$ADMIN_TOKEN" \
+            -e VLESS_UUID="$TEST_UUID" \
+            -e LIMIT="$LIMIT" -e REAL_TOPK="$REAL_TOPK" \
+            -e DIAL_WORKERS=5 -e FULL_PROBE_WORKERS=5 -e PROBE_WORKERS=30 \
+            -e DIAL_TIMEOUT=12 \
+            tunnel-railway:trial
+          for i in $(seq 1 40); do
+            if curl -m 5 -s http://127.0.0.1:3000/healthz | grep -q "^ok$"; then
+              echo "healthz OK after ~$((i * 10))s"
+              break
+            fi
+            sleep 10
+          done
+          curl -m 10 -s http://127.0.0.1:3000/healthz | grep -q "^ok$" || {
+            echo "healthz never OK; container log tail:"
+            docker logs tunnel-trial 2>&1 | tail -n 40
+            exit 1
+          }
+
+      - name: Wait for the rotation pool to fill
+        run: |
+          AUTH="Authorization: Bearer $ADMIN_TOKEN"
+          for i in $(seq 1 150); do
+            curl -m 10 -s -H "$AUTH" http://127.0.0.1:3000/api/status -o /tmp/status.json
+            if python3 -c "import json;s=json.load(open('/tmp/status.json'));exit(0 if s['resi']['nodes']>=8 and s['full_probe']['state']=='done' else 1)"; then
+              echo "pool ready after ~$((i * 5))s"
+              break
+            fi
+            sleep 5
+          done
+          python3 - <<'EOF'
+          import json
+          s = json.load(open("/tmp/status.json"))
+          r = s["resi"]
+          print(f"pool={r['nodes']} serving={len(s['endpoints'])} mode={r['mode']} "
+                f"full_probe={s['full_probe']['state']}")
+          assert r["mode"] == "rotate", r
+          assert r["nodes"] >= 8, r
+          print(f"POOL OK: {r['nodes']} verified nodes rotating on :{r['port']}{r['path']}")
+          EOF
+
+      - name: Start Cloudflare quick tunnels (third path + UI)
+        run: |
+          # Use the exact cloudflared version baked into the image.
+          docker cp tunnel-trial:/usr/local/bin/cloudflared /tmp/cloudflared
+          chmod +x /tmp/cloudflared
+          /tmp/cloudflared --version
+
+          start_tunnel() {
+            local origin="$1" log="$2"
+            /tmp/cloudflared tunnel --url "$origin" --no-autoupdate --protocol http2 \
+              > "$log" 2>&1 &
+            echo $! > "${log}.pid"
+          }
+          start_tunnel "http://127.0.0.1:8084" /tmp/cf-resi.log
+          start_tunnel "http://127.0.0.1:3000" /tmp/cf-ui.log
+
+          wait_host() {
+            local log="$1" name="$2"
+            for i in $(seq 1 60); do
+              local host
+              host=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$log" | head -n1)
+              if [ -n "$host" ]; then
+                echo "$host" > "/tmp/host-${name}.txt"
+                echo "${name} tunnel: $host"
+                return 0
+              fi
+              sleep 2
+            done
+            echo "tunnel for ${name} never came up:"
+            cat "$log" | tail -n 40
+            return 1
+          }
+          wait_host /tmp/cf-resi.log resi
+          wait_host /tmp/cf-ui.log ui
+
+          # Both tunnel hostnames must finish their handshake before we dial.
+          sleep 10
+
+      - name: UI/disguise is reachable through Cloudflare
+        run: |
+          HOST=$(cat /tmp/host-ui.txt)
+          curl -m 30 -s "https://${HOST}/" -o /tmp/page.html -w "GET / -> %{http_code}\n"
+          grep -q "ws-node" /tmp/page.html && echo "disguise page OK (direct link present)"
+          grep -q "ws-resi" /tmp/page.html && echo "third path link present on the page"
+          code=$(curl -m 30 -s -o /dev/null -w "%{http_code}" "https://${HOST}/healthz")
+          echo "healthz via tunnel -> $code"
+          [ "$code" = "200" ] || { echo "healthz unreachable through the tunnel"; exit 1; }
+
+      - name: /ws-resi answers a WebSocket upgrade through Cloudflare
+        run: |
+          HOST=$(cat /tmp/host-resi.txt)
+          code=$(curl -m 30 -s -o /dev/null -w "%{http_code}" \
+            -H "Connection: Upgrade" -H "Upgrade: websocket" \
+            -H "Sec-WebSocket-Version: 13" \
+            -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+            "https://${HOST}/ws-resi" || true)
+          echo "https://${HOST}/ws-resi upgrade -> ${code}"
+          [ "$code" = "101" ] || { echo "no WS upgrade through the tunnel"; exit 1; }
+          echo "TUNNEL WS OK: Cloudflare edge reached the manager balancer"
+
+      - name: Restore sing-box tarball from cache
+        uses: actions/cache@v5
+        with:
+          path: /tmp/sing-box-tarball.tgz
+          key: sing-box-tarball-${{ env.SINGBOX_VERSION }}
+
+      - name: Real client through the tunnel (vless + ws + tls)
+        run: |
+          if [ ! -f /tmp/sing-box-tarball.tgz ]; then
+            curl -Ls "https://github.com/SagerNet/sing-box/releases/download/v${{ env.SINGBOX_VERSION }}/sing-box-${{ env.SINGBOX_VERSION }}-linux-amd64.tar.gz" -o /tmp/sing-box-tarball.tgz
+          fi
+          tar xzf /tmp/sing-box-tarball.tgz
+          SB=$(ls -d ./sing-box-*/sing-box | head -n1)
+          echo "sing-box client: $SB"
+          HOST=$(cat /tmp/host-resi.txt)
+          DIRECT_IP=$(curl -m 20 -s https://api.ipify.org)
+          echo "runner direct IP: $DIRECT_IP"
+          echo "$DIRECT_IP" > /tmp/direct_ip.txt
+
+          # Exactly what the panel hands the user: vless://uuid@host:443
+          # ?security=tls&type=ws&path=/ws-resi
+          python3 - "$HOST" "$TEST_UUID" <<'EOF'
+          import json, sys
+          host, uuid = sys.argv[1], sys.argv[2]
+          cfg = {
+              "log": {"level": "warn"},
+              "inbounds": [{"type": "socks", "tag": "s", "listen": "127.0.0.1",
+                            "listen_port": 18091}],
+              "outbounds": [{
+                  "type": "vless", "tag": "v",
+                  "server": host, "server_port": 443, "uuid": uuid,
+                  "tls": {"enabled": True, "server_name": host},
+                  "transport": {"type": "ws", "path": "/ws-resi",
+                                "headers": {"Host": host}},
+              }],
+              "route": {"final": "v", "auto_detect_interface": True},
+          }
+          json.dump(cfg, open("/tmp/vless-tunnel.json", "w"), indent=2)
+          print("client config written for", host)
+          EOF
+          "$SB" check -c /tmp/vless-tunnel.json
+          "$SB" run -c /tmp/vless-tunnel.json > /tmp/vless-tunnel.log 2>&1 &
+          sleep 6
+
+          : > /tmp/ips.txt
+          for i in $(seq 1 12); do
+            ip=$(curl -m 60 -s -x socks5h://127.0.0.1:18091 https://api.ipify.org || true)
+            echo "sample $i: ${ip:-<failed>}"
+            if [ -n "$ip" ]; then echo "$ip" >> /tmp/ips.txt; fi
+            samples=$(wc -l < /tmp/ips.txt)
+            distinct=$(sort -u /tmp/ips.txt | wc -l)
+            if [ "$samples" -ge 5 ] && [ "$distinct" -ge 3 ]; then break; fi
+            sleep 2
+          done
+          pkill -f vless-tunnel || true
+          python3 - <<'EOF'
+          import pathlib
+          direct = pathlib.Path("/tmp/direct_ip.txt").read_text().strip()
+          ips = [l.strip() for l in pathlib.Path("/tmp/ips.txt").read_text().splitlines() if l.strip()]
+          distinct = sorted(set(ips))
+          print(f"samples={len(ips)} distinct={len(distinct)} ips={distinct}")
+          if not ips:
+              raise SystemExit("tunnel: every request through Cloudflare failed")
+          if any(ip == direct for ip in ips):
+              raise SystemExit(f"tunnel: exit was the runner's own IP ({direct})")
+          if len(distinct) < 2:
+              raise SystemExit(f"tunnel: single exit {distinct[0]} - rotation did not happen")
+          print(f"TUNNEL ROTATION OK: {len(distinct)} distinct VPNGate exits over "
+                f"{len(ips)} connections through Cloudflare")
+          EOF
+
+      - name: Failure diagnostics
+        if: failure()
+        run: |
+          echo "=== container log tail ==="
+          docker logs --tail 120 tunnel-trial 2>&1 || true
+          echo "=== cloudflared logs ==="
+          tail -n 40 /tmp/cf-resi.log 2>/dev/null || true
+          tail -n 40 /tmp/cf-ui.log 2>/dev/null || true
+          echo "=== vless client log ==="
+          tail -n 40 /tmp/vless-tunnel.log 2>/dev/null || true
+          echo "=== samples ==="
+          cat /tmp/ips.txt 2>/dev/null || true
+          echo "=== status ==="
+          curl -m 10 -s -H "Authorization: Bearer $ADMIN_TOKEN" \
+            http://127.0.0.1:3000/api/status -o /tmp/status-fail.json || true
+          python3 -m json.tool /tmp/status-fail.json 2>/dev/null | head -n 80 || true
+
+      - name: Cleanup
+        if: always()
+        run: |
+          pkill -f "cloudflared tunnel" || true
+          pkill -f vless-tunnel || true
+          docker rm -f tunnel-trial || true
