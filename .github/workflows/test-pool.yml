@@ -108,11 +108,12 @@ jobs:
           print("full_probe:", json.dumps({k: fp.get(k) for k in ("state", "done", "total")}))
           start = int(pathlib.Path("/tmp/pool-start.txt").read_text())
           print(f"pool at startup: {start}")
-          events = [h.get("event") for h in (s.get("refresh_history") or [])][-8:]
-          print("history tail:", events)
+          # History is informational only: state flips to done before the
+          # auto-pin/republish tail finishes, so asserting on its entries here
+          # would race. Pool growth is asserted by the next step.
+          print("history tail:", [h.get("event") for h in (s.get("refresh_history") or [])][-8:])
           assert fp["state"] == "done", f"auto full probe never finished: {fp}"
           assert fp["done"] == fp["total"] and fp["total"] > 0, fp
-          assert any("full-probe" in str(e) for e in events), events
           EOF
 
       - name: Pool grew to every verified node
