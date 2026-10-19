@@ -58,7 +58,7 @@ jobs:
             -e PROXY_USER=u -e PROXY_PASS=0123456789abcdef \
             -e ADMIN_TOKEN="$ADMIN_TOKEN" \
             -e VLESS_UUID="$TEST_UUID" \
-            -e LIMIT=12 -e REAL_TOPK=2 \
+            -e LIMIT=12 -e REAL_TOPK=6 -e DIAL_WORKERS=5 \
             rotate-railway:trial
           for i in $(seq 1 40); do
             if curl -m 5 -s http://127.0.0.1:3000/healthz | grep -q "^ok$"; then
@@ -76,20 +76,50 @@ jobs:
       - name: Third path reports rotate mode (zero config)
         run: |
           AUTH="Authorization: Bearer $ADMIN_TOKEN"
-          curl -m 10 -s -H "$AUTH" http://127.0.0.1:3000/api/status -o /tmp/status.json
+          # The pool is the *verified* node set (design §1/§2), and nodes are
+          # verified by the auto full probe that runs right after boot. Wait
+          # for it to finish instead of racing it: a growing pool rewrites the
+          # serving config and restarts sing-box, which would drop the client
+          # connections the later steps measure.
+          for i in $(seq 1 150); do
+            curl -m 10 -s -H "$AUTH" http://127.0.0.1:3000/api/status -o /tmp/status.json
+            if python3 -c "import json;exit(0 if json.load(open('/tmp/status.json'))['resi']['nodes']>=3 and json.load(open('/tmp/status.json'))['full_probe']['state']!='running' else 1)"; then
+              echo "rotate pool ready after ~$((i * 5))s"
+              break
+            fi
+            sleep 5
+          done
+          # Auto-pin (best + backup) also rewrites the serving config right
+          # after the probe, so give it its own bounded window too.
+          for i in $(seq 1 60); do
+            curl -m 10 -s -H "$AUTH" http://127.0.0.1:3000/api/status -o /tmp/status.json
+            if python3 -c "import json;exit(0 if json.load(open('/tmp/status.json')).get('preferred_tag') else 1)"; then
+              echo "auto-pin landed after ~$((i * 5))s"
+              break
+            fi
+            sleep 5
+          done
+          sleep 5
           python3 - <<'EOF'
           import json
           s = json.load(open("/tmp/status.json"))
           r = s["resi"]
+          fp = s["full_probe"]
           print("resi:", json.dumps(r, ensure_ascii=False))
+          print("full_probe:", json.dumps({k: fp.get(k) for k in ("state", "done", "total")}))
+          print("preferred_tag:", s.get("preferred_tag"))
           assert r["enabled"] is True, r
           assert r["mode"] == "rotate", r
           assert r["port"] == 8084, r
           assert r["path"] == "/ws-resi", r
-          assert r["nodes"] >= 3, r
-          assert len(s["endpoints"]) >= 3, len(s["endpoints"])
-          print(f"rotate mode OK: {r['nodes']} nodes -> :{r['port']}{r['path']}, "
-                f"{len(s['endpoints'])} serving endpoints")
+          # Pool = nodes that passed a real dial; REAL_TOPK=6 was requested.
+          assert r["nodes"] >= 3, f"rotate pool never filled: {r}"
+          assert r["nodes"] <= len(s["endpoints"]), (r["nodes"], len(s["endpoints"]))
+          verified = [e for e in s["endpoints"] if e.get("real_latency_ms") is not None]
+          assert len(verified) >= 3, f"only {len(verified)} verified nodes"
+          assert r["nodes"] == len(verified), (r["nodes"], len(verified))
+          print(f"rotate mode OK: pool {r['nodes']} verified nodes "
+                f"(of {len(s['endpoints'])} serving) -> :{r['port']}{r['path']}")
           EOF
 
       - name: Generated serving config is valid and loopback-only
