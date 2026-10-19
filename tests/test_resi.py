@@ -776,6 +776,38 @@ class RotateManagerTests(unittest.TestCase):
         rot = [i["tag"] for i in cfg["inbounds"] if i["tag"].startswith("resi-rot-")]
         self.assertEqual(["resi-rot-0", "resi-rot-1"], rot)
 
+    def test_full_probe_grows_the_rotation_pool(self) -> None:
+        # Regression: the post-refresh full pass is what verifies the nodes
+        # REAL_TOPK skipped. Without it the pool stays at REAL_TOPK while
+        # 60-70% of a 100-node snapshot is actually usable.
+        manager = self._manager()
+        try:
+            manager._nodes = [
+                {"server": f"198.51.100.{i + 1}", "server_port": 443,
+                 "latency_ms": 100 + i,
+                 "real_latency_ms": (20 + i if i < 2 else None),
+                 "endpoint": _endpoint(f"vpngate-{i}")} for i in range(4)]
+            with mock.patch.object(RailwayManager, "_check_config", return_value=True):
+                manager._apply_config()
+                before = list(manager._resi_ports)
+                # Every node really dials this time: the pool must grow to all 4.
+                manager.dial_fn = lambda node: 30
+                manager.verify_fn = lambda endpoint: ("198.51.100.9", 5)
+                manager._run_full_probe_inner()
+            after = list(manager._resi_ports)
+            nodes = manager.status["resi"]["nodes"]
+            with open(manager.config_path, encoding="utf-8") as handle:
+                cfg = json.load(handle)
+        finally:
+            manager.stop()
+            self._cleanup(manager)
+
+        self.assertEqual(2, len(before))
+        self.assertEqual([RESI_ROTATE_BASE + i for i in range(4)], after)
+        self.assertEqual(4, nodes)
+        rot = [i["tag"] for i in cfg["inbounds"] if i["tag"].startswith("resi-rot-")]
+        self.assertEqual(["resi-rot-0", "resi-rot-1", "resi-rot-2", "resi-rot-3"], rot)
+
     def test_backend_dial_failure_steps_to_the_next_node(self) -> None:
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

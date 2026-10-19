@@ -425,7 +425,7 @@ html[data-theme="light"] :focus-visible{outline-color:#1a73e8}
 <section id="sec-nodes" aria-label="节点">
 <div class="glass-card">
 <h2>可用节点</h2>
-<p class="desc">全部节点握手发现，真拨只测 TopK（REAL_TOPK）。Speed 排名不等于可拨通，首选由 urltest 实测决定，多 endpoint 兜底；要测全部点「全量真测」。点击表头可排序，未测通节点不可切换。</p>
+<p class="desc">全部节点握手发现，真拨先测 TopK（REAL_TOPK）让服务先起来，启动/刷新后会自动在后台补齐全量真测；Speed 排名不等于可拨通，首选由 urltest 实测决定，多 endpoint 兜底。点击表头可排序，未测通节点不可切换。</p>
 <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap"><input id="node-search" aria-label="搜索节点（IP 或国家）" placeholder="搜索 IP / 国家…" oninput="debouncedRefresh()"><select id="sortsel" aria-label="排序"><option value="real">按实测延迟</option><option value="hand">按握手延迟</option><option value="country">按国家</option><option value="alive">按存活时间</option><option value="server">按出口 IP</option></select><button id="btn-refresh" class="btn" onclick="refreshNow()">刷新节点</button><button id="btn-fullprobe" class="btn" onclick="fullProbeNow()">全量真测</button><button id="btn-fullprobe-cancel" class="btn" style="display:none" onclick="cancelFullProbe()">取消真测</button><span class="node-count" id="node-count"></span></div>
 <select id="scope" aria-label="范围"><option value="">全部国家</option></select>
 <div id="thinbar" aria-hidden="true"><i></i></div><div id="probe-progress"><div class="bar"><div class="fill" id="probe-fill" role="progressbar" aria-label="全量真测进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></div></div><div class="txt" id="probe-txt"></div></div>
@@ -1487,7 +1487,7 @@ def build_config_from_env(env: dict) -> dict:
         "limit": _int_env(env, "LIMIT", 100, 0, 100),
         "real_topk": _int_env(env, "REAL_TOPK", 30, 0, 100),
         "dial_workers": _int_env(env, "DIAL_WORKERS", 2, 1, 5),
-        "full_probe_workers": _int_env(env, "FULL_PROBE_WORKERS", 2, 1, 5),
+        "full_probe_workers": _int_env(env, "FULL_PROBE_WORKERS", 3, 1, 5),
         "probe_workers": _int_env(env, "PROBE_WORKERS", 15, 1, 30),
         "dial_timeout": _int_env(env, "DIAL_TIMEOUT", 15, 5, 60),
         "auto_rescue": _env_bool(env, "AUTO_RESCUE", True),
@@ -2784,6 +2784,11 @@ class RailwayManager:
         effective = "chain" if preferred else "auto"
         self._record_history("refresh-ok", f"{len(endpoints)} endpoints, final={effective}")
         print(f"refreshed {len(endpoints)} endpoints, final={effective}", flush=True)
+        # Startup/refresh only real-dials REAL_TOPK nodes so the first serving
+        # config lands fast. Kick the full pass in the background: it is what
+        # turns the handshake-ranked snapshot into a verified node set (the
+        # third path may only rotate over verified nodes).
+        self._start_full_probe()
         return True
     def _refresh_failed(self, reason: str) -> bool:
         with self._lock:
@@ -2833,7 +2838,23 @@ class RailwayManager:
             self.status["full_probe"]["state"] = "done"
             self._sync_probe_results(nodes)
         self._auto_pin_best(nodes, start_preferred)
+        # The pin may not have changed, but the verified set did: republish so
+        # the third path's rotation pool picks up the freshly dialed nodes.
+        self._republish_config()
         self._record_history("full-probe-done", f"{len(nodes)} nodes dialed")
+
+    def _republish_config(self) -> None:
+        """Re-apply the serving config from the current node set.
+
+        Needed after every probe pass: the verified set (and therefore the
+        third path's rotation pool) changes even when the auto-pin does not.
+        """
+        with self._config_lock:
+            with self._lock:
+                preferred = self.preferred_tag
+                backup = self.backup_tag
+            self._apply_config(final="auto", preferred=preferred, backup=backup)
+
     def _auto_pin_best(self, nodes: list[dict], start_preferred: str | None) -> None:
         measured = sorted((n for n in nodes if n.get("real_latency_ms") is not None and (n.get("endpoint") or {}).get("tag")),
             key=lambda n: (n["real_latency_ms"], (n.get("endpoint") or {}).get("tag") or ""))

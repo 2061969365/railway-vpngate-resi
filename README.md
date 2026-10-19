@@ -33,7 +33,7 @@ CC Switch / 伪装页 / 哪吒探针从 `railway-proxy-combined` 全量搬运
      - 可选：`VLESS_UUID`（默认与 combined 一致；`VLESS_UUID` 为空则不注册 VLESS 入站，
        直接 `python railway_manager.py` 会无 VLESS）、`NEZHA_SERVER`/`NEZHA_KEY`、
        `LIMIT`（默认 100，0=全量、上限 100）、`REAL_TOPK`（默认 30，真拨 TopK）、
-       `DIAL_WORKERS`（默认 2，真测并发；1GB 内存够用，OOM 就往小调）、`FULL_PROBE_WORKERS`（默认 2，
+       `DIAL_WORKERS`（默认 2，真测并发；1GB 内存够用，OOM 就往小调）、`FULL_PROBE_WORKERS`（默认 3，
        全量真测并发；和 DIAL_WORKERS 叠加受全局 dial gate 上限 10 约束）、`REFRESH_SECONDS`（默认 3600，每小时拉新快照并自动全量真测）、`PROBE_WORKERS`（默认 15，握手并发）、`DIAL_TIMEOUT`（默认 15，真拨超时秒）、`AUTO_REPIN`（默认开，每小时自动重 pin 最优）、`AUTO_RESCUE`（默认开，手动 pin 挂了自动救最优）、`HEALTH_CHECK_INTERVAL`（默认 20s）、`MAX_MUX_CONNECTIONS`（默认 100）、`NEZHA_URL`（可选）、`SNAPSHOT_URLS`（可选，逗号分隔的快照镜像，主源失败自动顺延）
      - 第三出口（默认开启、节点轮换、零配置；只有要接外部住宅网关才需要下面这些）：
        `RESI_GATEWAY`（`host:port`，固定 backconnect 网关，**永远只连这个地址**；填了就切到住宅模式）、
@@ -88,10 +88,13 @@ vless://<UUID>@node.example.com:443?security=tls&sni=node.example.com&type=ws&pa
 第③路有两种后端，**优先住宅网关，未配置就是 VPNGate 节点轮换**：
 
 - **轮换模式（默认，零配置）**：没填 `RESI_GATEWAY` 时，出口从当前所有**实测有效节点**
-  （真拨通过；池子大小由 `REAL_TOPK` 决定）里
+  （真拨通过）里
   按连接环形轮换——第 1 条连接走节点 1、第 2 条走节点 2……用完一圈回到第 1 个。
   出口 IP 就是该节点的 VPNGate IP（机房 IP，不是家宽）。
-  实测节点不足 2 个时（冷启动 / 探活未跑完 / `REAL_TOPK=0`）先用全部握手可达节点兜底；
+  首启只用 `REAL_TOPK`（默认 30）真拨一批好让服务先起来，**服务起来后自动在后台把剩余节点
+  全部真拨一遍**，池子随之涨到全部可用节点（100 个快照通常 60~70 个）；之后每次刷新（默认
+  每小时）同样自动全量真拨。
+  实测节点不足 2 个时（冷启动 / 全量真拨未跑完 / `REAL_TOPK=0`）先用全部握手可达节点兜底；
   池中某节点随后失效时，那一条连接会失败，客户端重试即换到下一个节点。
 - **住宅模式**：填了 `RESI_GATEWAY` + 账号密码时，改为连固定的 backconnect 网关，
   真实家宽 IP 由网关按连接分配，本服务永远不知道也不需要知道它。
