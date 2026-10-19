@@ -145,3 +145,35 @@
   面板/伪装页文案改为「第三出口（轮换）」。
 - 测试：`tests/test_resi.py` 47 条（新增 rotate 配置形状、轮换游标、端口表、真实 balancer
   连接级轮转、rotate 探活），`tests/test_vpngate_to_singbox.py` 全过。
+
+### 11.1 云端验收发现与修正（GitHub Actions 真容器，2026-10-19）
+
+`.github/workflows/test-rotate.yml` 在 runner 上真构建、真跑容器、真拨 VPNGate，并用本地
+sing-box 当终端客户端经 `/ws-resi` 每条新连接采样。四个问题当场暴露并已修：
+
+1. **`/api/resi_probe` 与 `/api/verify?path=resi` 误报 503 `resi disabled`。**
+   rotate 模式没有网关凭据（`self.resi is None`），处理函数却只按 `self.resi` 判定，
+   默认零配置部署下控制台的「探测 / 验证」按钮全挂。改为按「第三路是否启用」
+   （`resi or resi_rotate`）判定；`/api/resi_session` 在 rotate 模式改回 400 并说明
+   粘性会话属于住宅网关，轮换模式没有会话概念。
+2. **探活被单个死节点打断，误报「未轮换」。** 节点池来自 VPNGate 快照，必然混有死节点；
+   旧实现在第 2 条样本失败时直接 `break`，于是 `distinct=1`、`rotating=false`，面板显示
+   「未轮换（请确认客户端已关闭 mux）」——把死节点说成了客户端配置问题。抽出
+   `_collect_rotate_samples()`：每条样本一条新连接，失败只记录并继续走下一个节点
+   （`count * 4` 次尝试或时间预算封顶），全部失败才返回 None。
+3. **轮换池没有按 §1/§2 过滤「实测有效节点」。** `_apply_config` 之前把全部 serving 节点
+   都塞进池子（含从未真拨过的），与 §2 的 `S` 定义不符，也让第三路首次连接有较大概率
+   落到未验证的死节点上。新增 `RailwayManager._rotate_nodes()`：只取
+   `real_latency_ms is not None` 的节点（按排名顺序），并把选中的 tag 顺序传给
+   `build_singbox_config(..., resi_rotate_tags=[...])`，保证 `端口 41000+i ↔ 轮换顺序 i`
+   一一对应；**实测节点不足 2 个时兜底用全部 serving 节点**（冷启动、探活未跑完、
+   或 `REAL_TOPK=0` 时第三路不会因为没数据而变死）。
+4. **§4.1 的「后端连接失败顺延下一个节点」没实现。** 补齐：loopback 入站连不上时取下一个
+   下标重试一次，仍失败才放弃该客户端连接。
+
+测试：`tests/test_resi.py` 59 条（新增：rotate 探针容错 5 条、tag 选择与顺序 2 条、
+轮换池过滤与兜底 2 条、`_apply_config` 池子落盘 1 条、后端顺延 1 条、API 回归 3 条）。
+
+仍然已知的取舍：轮换池按 `REAL_TOPK`（默认 30）决定大小，未验证节点不入池；池中节点随后
+死掉时，那一条连接会失败（客户端重试即换下一个节点），不做实时健康剔除——与 §4.1
+「不等待、不排空」一致。

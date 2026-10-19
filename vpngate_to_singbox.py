@@ -795,6 +795,33 @@ def _resi_rotate_probe_config(vless_uuid: str, port: int, path: str,
     }
 
 
+def _collect_rotate_samples(fetch, count: int, deadline: float
+                            ) -> tuple[list[str], list[int], list[str]]:
+    """Collect up to `count` exit IPs, tolerating dead nodes in the pool.
+
+    Every fetch opens a new connection, so rotation means a dead node is
+    simply skipped: the next connection lands on the next node. Aborting the
+    whole measurement on one failure would report "not rotating" for a
+    perfectly healthy rotating pool (the pool is a VPNGate snapshot, it
+    always contains some dead nodes), so walk on instead.
+    """
+    ips: list[str] = []
+    stamps: list[int] = []
+    errors: list[str] = []
+    attempts = 0
+    max_attempts = max(count, 1) * 4
+    while len(ips) < count and attempts < max_attempts and time.monotonic() < deadline:
+        attempts += 1
+        fetched = fetch()
+        if (fetched is not None and fetched[0] == 200
+                and _looks_like_ipv4(fetched[1])):
+            ips.append(fetched[1].decode("ascii").strip())
+            stamps.append(fetched[2])
+            continue
+        errors.append("no exit ip")
+    return ips, stamps, errors
+
+
 def measure_resi_rotate(vless_uuid: str, port: int, path: str, count: int = 3,
                         singbox_bin: str = "sing-box", timeout: int = 20,
                         poll_interval: int = 2) -> dict | None:
@@ -847,17 +874,19 @@ def measure_resi_rotate(vless_uuid: str, port: int, path: str, count: int = 3,
                 errors.append("probe sing-box exited")
                 break
             time.sleep(poll_interval)
-        total_deadline = deadline + (count - 1) * 15
-        while ips and len(ips) < count and time.monotonic() < total_deadline:
-            fetched = _socks5_get_text("127.0.0.1", listen_port, "api.ipify.org",
-                                       443, "/?format=text", timeout=15)
-            if (fetched is not None and fetched[0] == 200
-                    and _looks_like_ipv4(fetched[1])):
-                ips.append(fetched[1].decode("ascii").strip())
-                stamps.append(fetched[2])
-                continue
-            errors.append("no exit ip")
-            break
+        # Give the remaining samples a budget of one dial each: failures are
+        # expected (dead nodes in the pool) and are walked past, not fatal.
+        total_deadline = deadline + count * 15
+        def _fetch():
+            remaining = total_deadline - time.monotonic()
+            return _socks5_get_text("127.0.0.1", listen_port, "api.ipify.org",
+                                    443, "/?format=text",
+                                    timeout=int(min(15, max(1, remaining))))
+        more_ips, more_stamps, more_errors = _collect_rotate_samples(
+            _fetch, count - 1, total_deadline)
+        ips += more_ips
+        stamps += more_stamps
+        errors += more_errors
         if not ips:
             if err_handle is not None:
                 try:
@@ -1110,6 +1139,7 @@ def build_singbox_config(
     resi_path: str = DEFAULT_RESI_PATH,
     resi_in_port: int = RESI_IN_PORT,
     resi_rotate: bool = False,
+    resi_rotate_tags: list[str] | None = None,
 ) -> dict:
     """Wrap endpoints in a minimal checkable sing-box config.
 
@@ -1151,6 +1181,8 @@ def build_singbox_config(
     RESI_ROTATE_BASE + i), each routed to that endpoint. The manager listens
     on resi_port itself and picks the next loopback port for every new
     connection, so successive connections leave through different nodes.
+    resi_rotate_tags narrows that set (and fixes its order) to the nodes the
+    manager decided to rotate over; None means all endpoints in given order.
     """
     tags = [ep["tag"] for ep in endpoints]
     if preferred is not None and preferred not in tags:
@@ -1233,8 +1265,15 @@ def build_singbox_config(
     if resi_rotate:
         if vless_uuid is None:
             raise ValueError("resi_rotate needs VLESS_UUID (its inbounds are VLESS+WS)")
+        rotate_eps = endpoints
+        if resi_rotate_tags is not None:
+            # The manager rotates over the verified nodes only (design §2), so
+            # the inbound set is chosen by tag and keeps the caller's order:
+            # port RESI_ROTATE_BASE + i must map to rotate order i.
+            by_tag = {ep["tag"]: ep for ep in endpoints}
+            rotate_eps = [by_tag[t] for t in resi_rotate_tags if t in by_tag]
         config.setdefault("inbounds", [])
-        for i, ep in enumerate(endpoints):
+        for i, ep in enumerate(rotate_eps):
             config["inbounds"].append({
                 "type": "vless", "tag": f"resi-rot-{i}",
                 "listen": "127.0.0.1", "listen_port": RESI_ROTATE_BASE + i,

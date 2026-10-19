@@ -15,8 +15,8 @@ from unittest import mock
 
 from railway_manager import RailwayManager, build_config_from_env
 from vpngate_to_singbox import (DEFAULT_RESI_PORT, RESI_IN_PORT,
-                                RESI_ROTATE_BASE, build_singbox_config,
-                                render_resi_username)
+                                RESI_ROTATE_BASE, _collect_rotate_samples,
+                                build_singbox_config, render_resi_username)
 
 RESI = {"server": "gw.example.com", "server_port": 1080,
         "username": "user1", "password": "pass1"}
@@ -279,6 +279,31 @@ def _manager(**kwargs) -> RailwayManager:
                   settings_path=f"{tmpdir}/settings.json")
     params.update(kwargs)
     return RailwayManager(**params)
+
+
+    def test_rotate_tags_pick_and_order_the_inbounds(self) -> None:
+        # The manager rotates over verified nodes only; the port order must
+        # follow that tag order (port i <-> rotate order i).
+        eps = [_endpoint(f"vpngate-{i}") for i in range(3)]
+        cfg = build_singbox_config(eps, "127.0.0.1", 18080, vless_uuid=VLESS,
+                                   resi_rotate=True,
+                                   resi_rotate_tags=["vpngate-2", "vpngate-0"])
+        rot = [i["tag"] for i in cfg["inbounds"] if i["tag"].startswith("resi-rot-")]
+        routes = [(r["inbound"], r["outbound"]) for r in cfg["route"]["rules"]
+                  if str(r.get("inbound", "")).startswith("resi-rot-")]
+
+        self.assertEqual(["resi-rot-0", "resi-rot-1"], rot)
+        self.assertEqual([("resi-rot-0", "vpngate-2"), ("resi-rot-1", "vpngate-0")],
+                         routes)
+
+    def test_unknown_rotate_tag_is_dropped(self) -> None:
+        eps = [_endpoint("vpngate-0"), _endpoint("vpngate-1")]
+        cfg = build_singbox_config(eps, "127.0.0.1", 18080, vless_uuid=VLESS,
+                                   resi_rotate=True,
+                                   resi_rotate_tags=["vpngate-1", "gone"])
+        rot = [i["tag"] for i in cfg["inbounds"] if i["tag"].startswith("resi-rot-")]
+
+        self.assertEqual(["resi-rot-0"], rot)
 
 
 class ResiManagerTests(unittest.TestCase):
@@ -691,6 +716,162 @@ class RotateManagerTests(unittest.TestCase):
         self.assertIn(b"400", response)
         self.assertIn(b"rotate mode has no session", response)
         self.assertEqual("rotate", mode)
+
+
+    def test_rotate_pool_keeps_verified_nodes_only(self) -> None:
+        manager = self._manager(resi_port=_free_port())
+        try:
+            serving = [
+                {"real_latency_ms": 30, "endpoint": _endpoint("vpngate-a")},
+                {"real_latency_ms": None, "endpoint": _endpoint("vpngate-b")},
+                {"real_latency_ms": 10, "endpoint": _endpoint("vpngate-c")},
+            ]
+            pool = [n["endpoint"]["tag"] for n in manager._rotate_nodes(serving)]
+        finally:
+            manager.stop()
+            self._cleanup(manager)
+
+        self.assertEqual(["vpngate-a", "vpngate-c"], pool)
+
+    def test_rotate_pool_falls_back_until_two_nodes_are_verified(self) -> None:
+        manager = self._manager(resi_port=_free_port())
+        try:
+            serving = [
+                {"real_latency_ms": 30, "endpoint": _endpoint("vpngate-a")},
+                {"real_latency_ms": None, "endpoint": _endpoint("vpngate-b")},
+            ]
+            pool = [n["endpoint"]["tag"] for n in manager._rotate_nodes(serving)]
+            empty = manager._rotate_nodes([])
+        finally:
+            manager.stop()
+            self._cleanup(manager)
+
+        self.assertEqual(["vpngate-a", "vpngate-b"], pool)
+        self.assertEqual([], empty)
+
+    def test_apply_config_rotates_over_verified_nodes_only(self) -> None:
+        manager = self._manager()
+        try:
+            manager._nodes = [
+                {"server": "198.51.100.1", "server_port": 443, "latency_ms": 100,
+                 "real_latency_ms": 20, "endpoint": _endpoint("vpngate-0")},
+                {"server": "198.51.100.2", "server_port": 443, "latency_ms": 110,
+                 "real_latency_ms": 30, "endpoint": _endpoint("vpngate-1")},
+                {"server": "198.51.100.3", "server_port": 443, "latency_ms": 120,
+                 "endpoint": _endpoint("vpngate-2")},
+            ]
+            with mock.patch.object(RailwayManager, "_check_config", return_value=True):
+                manager._apply_config()
+            ports = list(manager._resi_ports)
+            nodes = manager.status["resi"]["nodes"]
+            with open(manager.config_path, encoding="utf-8") as handle:
+                cfg = json.load(handle)
+        finally:
+            manager.stop()
+            self._cleanup(manager)
+
+        self.assertEqual([RESI_ROTATE_BASE, RESI_ROTATE_BASE + 1], ports)
+        self.assertEqual(2, nodes)
+        self.assertEqual(3, len(cfg["endpoints"]))
+        rot = [i["tag"] for i in cfg["inbounds"] if i["tag"].startswith("resi-rot-")]
+        self.assertEqual(["resi-rot-0", "resi-rot-1"], rot)
+
+    def test_backend_dial_failure_steps_to_the_next_node(self) -> None:
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        dead = _free_port()
+        manager = self._manager(resi_port=_free_port())
+        manager._set_resi_ports([dead, srv.getsockname()[1]])
+
+        def serve() -> None:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            try:
+                conn.sendall(b"node-1")
+            except OSError:
+                pass
+            finally:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+
+        threading.Thread(target=serve, daemon=True).start()
+        client, peer = socket.socketpair()
+        worker = threading.Thread(target=manager._handle_resi_client,
+                                  args=(client,), daemon=True)
+        worker.start()
+        try:
+            peer.settimeout(5)
+            received = peer.recv(64)
+            peer.shutdown(socket.SHUT_WR)
+            worker.join(timeout=10)
+        finally:
+            peer.close()
+            srv.close()
+            manager.stop()
+            self._cleanup(manager)
+
+        self.assertEqual(b"node-1", received)
+        self.assertFalse(worker.is_alive())
+
+
+class RotateSampleTests(unittest.TestCase):
+    """A dead node in the pool must never truncate the rotation measurement."""
+
+    def _fetch_seq(self, results):
+        seq = list(results)
+
+        def fetch():
+            return seq.pop(0) if seq else None
+
+        return fetch
+
+    def test_walks_past_dead_nodes(self) -> None:
+        fetch = self._fetch_seq([None, (200, b"1.1.1.1", 5),
+                                 None, (200, b"2.2.2.2", 6)])
+        ips, stamps, errors = _collect_rotate_samples(fetch, 2, time.monotonic() + 30)
+
+        self.assertEqual(["1.1.1.1", "2.2.2.2"], ips)
+        self.assertEqual([5, 6], stamps)
+        self.assertEqual(["no exit ip", "no exit ip"], errors)
+
+    def test_stops_after_enough_samples(self) -> None:
+        fetch = self._fetch_seq([(200, b"1.1.1.1", 1), (200, b"2.2.2.2", 2),
+                                 RuntimeError("must not be called")])
+        ips, _, errors = _collect_rotate_samples(fetch, 2, time.monotonic() + 30)
+
+        self.assertEqual(["1.1.1.1", "2.2.2.2"], ips)
+        self.assertEqual([], errors)
+
+    def test_all_dead_returns_nothing_instead_of_looping(self) -> None:
+        ips, stamps, errors = _collect_rotate_samples(lambda: None, 3,
+                                                      time.monotonic() + 30)
+
+        self.assertEqual([], ips)
+        self.assertEqual([], stamps)
+        self.assertEqual(12, len(errors))  # count * 4 attempts, then give up
+
+    def test_ignores_non_ip_and_non_200(self) -> None:
+        fetch = self._fetch_seq([(200, b"not-an-ip", 1), (502, b"1.1.1.1", 2),
+                                 (200, b"3.3.3.3", 3)])
+        ips, _, errors = _collect_rotate_samples(fetch, 1, time.monotonic() + 30)
+
+        self.assertEqual(["3.3.3.3"], ips)
+        self.assertEqual(2, len(errors))
+
+    def test_deadline_stops_the_walk(self) -> None:
+        fetch = lambda: (time.sleep(0.05), None)[1]  # noqa: E731
+        started = time.monotonic()
+        ips, _, errors = _collect_rotate_samples(fetch, 3, started + 0.12)
+
+        self.assertEqual([], ips)
+        self.assertLess(time.monotonic() - started, 2.0)
+        self.assertLess(len(errors), 12)
 
 
 if __name__ == "__main__":

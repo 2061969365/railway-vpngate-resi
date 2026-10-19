@@ -2607,6 +2607,20 @@ class RailwayManager:
                 if hit is not None:
                     top.append(hit); tags.add(t)
         return top
+
+    def _rotate_nodes(self, serving: list[dict]) -> list[dict]:
+        """Nodes the third path rotates over (design §2: verified nodes).
+
+        Only nodes that passed a real dial (`real_latency_ms` measured) go
+        into the pool, ranked best first. While fewer than two are verified
+        (cold boot, probing still running, or REAL_TOPK=0) fall back to the
+        whole serving set so the third path is never dead for lack of data.
+        """
+        if not self.resi_rotate:
+            return []
+        verified = [n for n in serving if n.get("real_latency_ms") is not None]
+        return verified if len(verified) >= 2 else serving
+
     def _serving_config_unchanged(self, config: dict) -> bool:
         try:
             with open(self.config_path, encoding="utf-8") as handle:
@@ -2620,10 +2634,10 @@ class RailwayManager:
     def _apply_config(self, final: str = "auto", preferred: str | None = None, backup: str | None = None) -> bool:
         serving = self._serving_nodes()
         resi_outbound = self._resi_outbound()
+        rotate_tags = [n["endpoint"]["tag"] for n in self._rotate_nodes(serving)] if self.resi_rotate else []
         with self._lock:
             endpoints = [n["endpoint"] for n in serving]
-            rotate_ports = ([RESI_ROTATE_BASE + i for i in range(len(endpoints))]
-                            if self.resi_rotate else [])
+            rotate_ports = [RESI_ROTATE_BASE + i for i in range(len(rotate_tags))]
             username, password = self.username, self.password; mixed_port = self.mixed_port
             vless_uuid = self.vless_uuid or None; direct_port = self.vless_direct_port; chain_port = self.vless_chain_port
             resi_port = self.resi_port; resi_path = self.resi_path
@@ -2632,7 +2646,7 @@ class RailwayManager:
             final=final, preferred=preferred, backup=backup, vless_uuid=vless_uuid,
             vless_direct_port=direct_port, vless_chain_port=chain_port,
             resi=resi_outbound, resi_port=resi_port, resi_path=resi_path,
-            resi_rotate=self.resi_rotate)
+            resi_rotate=self.resi_rotate, resi_rotate_tags=rotate_tags)
         if self.resi_rotate:
             self._set_resi_ports(rotate_ports)
         if want_singbox and self._serving_config_unchanged(config):
@@ -3038,9 +3052,19 @@ class RailwayManager:
             if port is None:
                 self._set_resi(state="down", error="no serving endpoints")
                 return
-            try:
-                backend = socket.create_connection(("127.0.0.1", port), timeout=10)
-            except OSError:
+            backend = None
+            # Design §4.1: a failed backend dial steps to the next node once
+            # instead of failing the client outright.
+            for _ in range(2):
+                try:
+                    backend = socket.create_connection(("127.0.0.1", port), timeout=10)
+                    break
+                except OSError:
+                    nxt = self._resi_next_port()
+                    if nxt is None:
+                        break
+                    port = nxt
+            if backend is None:
                 self._set_resi(error=f"backend :{port} unavailable")
                 return
             client.settimeout(PIPE_IDLE_TIMEOUT)
