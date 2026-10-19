@@ -46,6 +46,6 @@ COPY start.sh ./start.sh
 RUN sed -i 's/\r$//' /app/start.sh \
  && chmod +x /app/start.sh /usr/local/bin/cc-switch-server
 
-EXPOSE 3000 4096 8080 8081 8082
+EXPOSE 3000 4096 8080 8081 8082 8084
 
 ENTRYPOINT ["/app/start.sh"]

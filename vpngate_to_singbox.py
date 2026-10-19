@@ -28,6 +28,9 @@ DEFAULT_AUTH = "SHA1"
 DEFAULT_RESI_PORT = 8084
 DEFAULT_RESI_PATH = "/ws-resi"
 RESI_IN_PORT = 40001
+# Rotating third path: one loopback VLESS+WS inbound per serving endpoint,
+# so the manager can pick the next node for every new connection.
+RESI_ROTATE_BASE = 41000
 RESI_TEMPLATE_PLACEHOLDERS = ("user", "session", "ttl")
 # Cap concurrent throwaway sing-box dials: refresh (dial_workers) +
 # full_probe + single_probe + verify can otherwise stack ~13 processes
@@ -769,6 +772,126 @@ def measure_resi_rotation(resi: dict, count: int = 3, singbox_bin: str = "sing-b
     return _resi_probe_run(resi, count, singbox_bin, timeout, poll_interval, 30.0)
 
 
+def _resi_rotate_probe_config(vless_uuid: str, port: int, path: str,
+                              listen_port: int) -> dict:
+    """Throwaway client that speaks VLESS+WS to our own third-path listener.
+
+    Probing through the real listener (instead of an outbound) is what makes
+    the measurement meaningful: each SOCKS5 CONNECT opens one new TCP
+    connection, and every new connection must pick the next node.
+    """
+    return {
+        "log": {"level": "warn"},
+        "inbounds": [{"type": "mixed", "tag": "resi-rot-probe-in",
+                      "listen": "127.0.0.1", "listen_port": listen_port}],
+        "outbounds": [
+            {"type": "vless", "tag": "resi-rot-probe",
+             "server": "127.0.0.1", "server_port": int(port),
+             "uuid": vless_uuid,
+             "transport": {"type": "ws", "path": path}},
+            {"type": "direct", "tag": "direct"},
+        ],
+        "route": {"final": "resi-rot-probe"},
+    }
+
+
+def measure_resi_rotate(vless_uuid: str, port: int, path: str, count: int = 3,
+                        singbox_bin: str = "sing-box", timeout: int = 20,
+                        poll_interval: int = 2) -> dict | None:
+    """Sample `count` exit IPs through the rotating third path.
+
+    Returns {"ips", "ms", "count", "distinct", "errors", ...} or None when the
+    listener never answered. A residential-side rotation can legitimately hand
+    out the same node twice, so health is judged by the caller (distinct >= 2).
+    """
+    count = max(1, int(count))
+    listen_port = _free_port()
+    config = _resi_rotate_probe_config(vless_uuid, port, path, listen_port)
+    tmpdir = tempfile.TemporaryDirectory()
+    if not _DIAL_GATE.acquire(timeout=30.0):
+        tmpdir.cleanup()
+        return None
+    proc = None
+    err_handle = None
+    try:
+        cfg_path = str(Path(tmpdir.name) / "resi-rot-probe.json")
+        Path(cfg_path).write_text(json.dumps(config), encoding="utf-8")
+        err_path = str(Path(tmpdir.name) / "resi-rot-probe-stderr.log")
+        try:
+            err_handle = open(err_path, "ab")
+        except OSError:
+            err_handle = None
+        try:
+            proc = subprocess.Popen(
+                [singbox_bin, "run", "-c", cfg_path],
+                stdout=subprocess.DEVNULL,
+                stderr=err_handle or subprocess.DEVNULL)
+        except OSError:
+            print(f"resi rotate probe failed: cannot start {singbox_bin}", flush=True)
+            return None
+        deadline = time.monotonic() + timeout
+        ips: list[str] = []
+        stamps: list[int] = []
+        errors: list[str] = []
+        while time.monotonic() < deadline and not ips:
+            remaining = deadline - time.monotonic()
+            fetched = _socks5_get_text(
+                "127.0.0.1", listen_port, "api.ipify.org", 443, "/?format=text",
+                timeout=min(10, max(1, remaining)))
+            if (fetched is not None and fetched[0] == 200
+                    and _looks_like_ipv4(fetched[1])):
+                ips.append(fetched[1].decode("ascii").strip())
+                stamps.append(fetched[2])
+                break
+            if proc.poll() is not None:
+                errors.append("probe sing-box exited")
+                break
+            time.sleep(poll_interval)
+        total_deadline = deadline + (count - 1) * 15
+        while ips and len(ips) < count and time.monotonic() < total_deadline:
+            fetched = _socks5_get_text("127.0.0.1", listen_port, "api.ipify.org",
+                                       443, "/?format=text", timeout=15)
+            if (fetched is not None and fetched[0] == 200
+                    and _looks_like_ipv4(fetched[1])):
+                ips.append(fetched[1].decode("ascii").strip())
+                stamps.append(fetched[2])
+                continue
+            errors.append("no exit ip")
+            break
+        if not ips:
+            if err_handle is not None:
+                try:
+                    err_handle.close()
+                except OSError:
+                    pass
+            _log_dial_failure({"server": "127.0.0.1", "server_port": int(port)},
+                              err_path)
+            return None
+        return {"ips": ips, "ms": list(stamps), "count": len(ips),
+                "distinct": len(set(ips)), "errors": errors,
+                "first_ms": stamps[0], "last_ms": stamps[-1]}
+    finally:
+        if proc is not None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+                try:
+                    proc.wait(timeout=5)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+        if err_handle is not None:
+            try:
+                err_handle.close()
+            except OSError:
+                pass
+        _DIAL_GATE.release()
+        tmpdir.cleanup()
+
 def _safe_dial(dial_fn, node: dict) -> int | None:
     try:
         result = dial_fn(node)
@@ -986,6 +1109,7 @@ def build_singbox_config(
     resi_port: int = DEFAULT_RESI_PORT,
     resi_path: str = DEFAULT_RESI_PATH,
     resi_in_port: int = RESI_IN_PORT,
+    resi_rotate: bool = False,
 ) -> dict:
     """Wrap endpoints in a minimal checkable sing-box config.
 
@@ -1021,6 +1145,12 @@ def build_singbox_config(
     so probing it would burn quota nonstop and a stray manual pick could
     drain a whole plan. The loopback-only "resi-in" mixed inbound exists so
     operators/CI can validate rotation through the exact serving stack.
+
+    When resi_rotate is set the third path fans out over the serving
+    endpoints instead: one loopback VLESS+WS inbound per endpoint (ports
+    RESI_ROTATE_BASE + i), each routed to that endpoint. The manager listens
+    on resi_port itself and picks the next loopback port for every new
+    connection, so successive connections leave through different nodes.
     """
     tags = [ep["tag"] for ep in endpoints]
     if preferred is not None and preferred not in tags:
@@ -1073,6 +1203,8 @@ def build_singbox_config(
             {"inbound": "vless-direct", "outbound": "direct"},
             {"inbound": "vless-chain", "outbound": chain_target},
         ]
+    if resi_rotate and resi is not None:
+        raise ValueError("resi and resi_rotate are mutually exclusive")
     if resi is not None:
         if vless_uuid is None:
             raise ValueError("resi outbound needs the vless inbound (set VLESS_UUID)")
@@ -1098,6 +1230,19 @@ def build_singbox_config(
             {"inbound": "vless-resi", "outbound": "resi"},
             {"inbound": "resi-in", "outbound": "resi"},
         ])
+    if resi_rotate:
+        if vless_uuid is None:
+            raise ValueError("resi_rotate needs VLESS_UUID (its inbounds are VLESS+WS)")
+        config.setdefault("inbounds", [])
+        for i, ep in enumerate(endpoints):
+            config["inbounds"].append({
+                "type": "vless", "tag": f"resi-rot-{i}",
+                "listen": "127.0.0.1", "listen_port": RESI_ROTATE_BASE + i,
+                "users": [{"uuid": vless_uuid}],
+                "transport": {"type": "ws", "path": resi_path},
+            })
+            config["route"].setdefault("rules", []).append(
+                {"inbound": f"resi-rot-{i}", "outbound": ep["tag"]})
     return config
 
 

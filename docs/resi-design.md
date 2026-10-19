@@ -1,5 +1,8 @@
 # 旋转型住宅 SOCKS5 出口改造设计（草案 v1）
 
+> 注：第③路现在**默认是「VPNGate 节点轮换」**（零配置），本文描述的是显式配置住宅网关后的 gateway 模式；rotate 模式见 `docs/rotate-design.md`。
+
+
 > 状态：**待确认**，未落地任何代码。
 > 目标仓库：`2061969365/railway-vpngate-combined` @ `c389fba`
 > 基线：现有两条出口 `/ws-node`（Railway 本机）与 `/ws-chain`（VPNGate）。

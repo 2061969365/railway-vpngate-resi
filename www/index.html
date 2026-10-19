@@ -1045,10 +1045,10 @@ if(simPanel && !window.matchMedia('(prefers-reduced-motion: reduce)').matches &&
             </div>
 
             <div class="card card-chain glass-card" id="resiCard" style="display:none;">
-                <div class="label" style="color:#a78bfa;">🏠 VLESS 住宅出口<span class="path-pill path-chain">/ws-resi</span></div>
-                <div class="route-hint">出口 = 旋转住宅 IP · 每次新连接换 IP（客户端须关闭 mux）</div>
+                <div class="label" style="color:#a78bfa;">🏠 VLESS 轮换出口<span class="path-pill path-chain">/ws-resi</span></div>
+                <div class="route-hint">出口 = VPNGate 节点 IP · 每条新连接换一个（客户端须关闭 mux）</div>
                 <div class="value" id="nodeLinkResi" style="height:50px;">生成中...</div>
-                <button class="btn-copy-chain" onclick="copyText('nodeLinkResi', this)">📋 一键复制住宅节点链接</button>
+                <button class="btn-copy-chain" onclick="copyText('nodeLinkResi', this)">📋 一键复制第三出口链接</button>
             </div>
 
             <button id="btn-copy-both" onclick="copyBoth(this)">📋 一键复制两个链接（直连 + 链式）</button>

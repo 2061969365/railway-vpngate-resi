@@ -19,10 +19,12 @@ from datetime import datetime, timezone
 from vpngate_to_singbox import (
     DEFAULT_RESI_PATH,
     DEFAULT_RESI_PORT,
+    RESI_ROTATE_BASE,
     build_singbox_config,
     measure_exit_ip,
     measure_real_latency,
     measure_resi_exit_ip,
+    measure_resi_rotate,
     measure_resi_rotation,
     nodes_to_endpoints,
     primary_server,
@@ -395,13 +397,13 @@ html[data-theme="light"] :focus-visible{outline-color:#1a73e8}
 <div class="route-strip" id="route-strip" hidden>
 <div class="rt"><b>/ws-node → Railway 本机</b><code id="route-direct">—</code></div>
 <div class="rt"><b>/ws-chain → VPN 节点</b><code id="route-chain">—</code></div>
-<div class="rt" id="route-resi-wrap" hidden><b>/ws-resi → 住宅出口</b><code id="route-resi">—</code></div>
+<div class="rt" id="route-resi-wrap" hidden><b>/ws-resi → <span id="route-resi-kind">出口</span></b><code id="route-resi">—</code></div>
 </div>
 <div class="actions"><button id="btn-verify" onclick="verifyExit()">验证出口 IP</button></div>
 </div>
 <div class="glass-card" id="resi-card" hidden>
-<h2>住宅出口</h2>
-<p class="desc">固定 backconnect 网关：新连接换出口（旋转），粘性靠用户名里的 session。探测会消耗住宅流量，别频繁点。</p>
+<h2>第三出口（轮换）</h2>
+<p class="desc">默认从所有实测有效节点里按连接环形轮换：第 1 条走节点 1、第 2 条走节点 2，用完一圈回到第 1 个。配置了住宅网关时改为连固定 backconnect 网关。</p>
 <p id="resi-line">—</p>
 <p id="resi-ips" class="ip" aria-live="polite">—</p>
 <div class="actions"><button id="btn-resi-probe" class="btn" onclick="resiProbe()">探测出口 IP</button></div>
@@ -445,7 +447,7 @@ html[data-theme="light"] :focus-visible{outline-color:#1a73e8}
 <p class="desc">双路 VLESS，一键复制。域名取当前访问 host。</p>
 <div class="subrow"><span class="subtag">直连 /ws-node（VPN 故障时可用）</span><code id="sub-direct">—</code><button class="btn" onclick="copySub('direct',this)">复制</button></div>
 <div class="subrow"><span class="subtag">经 VPN /ws-chain（跟随当前出口）</span><code id="sub-chain">—</code><button class="btn" onclick="copySub('chain',this)">复制</button></div>
-<div class="subrow" id="sub-resi-row" hidden><span class="subtag">住宅 /ws-resi（旋转出口）</span><code id="sub-resi">—</code><button class="btn" onclick="copySub('resi',this)">复制</button></div>
+<div class="subrow" id="sub-resi-row" hidden><span class="subtag">第三出口 /ws-resi（轮换）</span><code id="sub-resi">—</code><button class="btn" onclick="copySub('resi',this)">复制</button></div>
 <p class="hostnote" id="sub-host"></p>
 <div class="actions" style="margin-top:4px"><button class="btn" id="btn-copy-all" style="padding:7px 18px;font-size:12.5px" onclick="copyAll(this)">复制全部</button></div>
 </div>
@@ -835,8 +837,11 @@ function renderRoutes(s) {
   const wrap = document.getElementById("route-resi-wrap");
   if (wrap) wrap.hidden = !resi.enabled;
   if (resi.enabled) {
+    const rotate = resi.mode === "rotate";
+    const kind = document.getElementById("route-resi-kind");
+    if (kind) kind.textContent = rotate ? "节点轮换" : "住宅出口";
     const cell = document.getElementById("route-resi");
-    if (cell) cell.textContent = resi.exit_ip || "未探测";
+    if (cell) cell.textContent = rotate ? ((resi.nodes || 0) + " 个节点") : (resi.exit_ip || "未探测");
   }
   renderResi(s);
 }
@@ -846,10 +851,13 @@ function renderResi(s) {
   const r = s.resi || {};
   if (!r.enabled) { card.hidden = true; return; }
   card.hidden = false;
-  const mode = r.mode === "sticky" ? ("粘性 · ttl " + r.sticky_ttl + "s") : "旋转";
+  const rotate = r.mode === "rotate";
+  const mode = rotate ? ("节点池 " + (r.nodes || 0) + " 个 · 每连接轮换")
+    : (r.mode === "sticky" ? ("粘性 · ttl " + r.sticky_ttl + "s") : "旋转");
+  const where = rotate ? ("入口 :" + r.port + r.path) : ("网关 " + r.host + ":" + r.port);
   const state = r.state === "up" ? "正常" : (r.state === "down" ? "不可用" : "未探测");
   const el = document.getElementById("resi-line");
-  if (el) el.textContent = "网关 " + r.host + ":" + r.port + " · " + mode + " · " + state +
+  if (el) el.textContent = where + " · " + mode + " · " + state +
     (r.exit_ip ? (" · 出口 " + r.exit_ip + (r.ms ? (" / " + r.ms + "ms") : "")) : "") +
     (r.error ? (" · " + r.error) : "");
   const p = r.last_probe || {};
@@ -1446,13 +1454,16 @@ def build_config_from_env(env: dict) -> dict:
     vless_chain_port = _int_env(env, "VLESS_CHAIN_PORT", 8082, 1, 65535)
     resi_port = _int_env(env, "RESI_PORT", DEFAULT_RESI_PORT, 1, 65535)
     resi = _build_resi_from_env(env)
+    # Third path, rotating mode: no external gateway, so rotate over the
+    # serving endpoints. Needs VLESS_UUID because its inbounds are VLESS+WS.
+    resi_rotate = resi is None and bool(env.get("VLESS_UUID", ""))
     if vless_direct_port == vless_chain_port:
         print(f"refusing to start: VLESS ports collide ({vless_direct_port})", flush=True)
         raise SystemExit(2)
-    if resi is not None:
-        if not env.get("VLESS_UUID", ""):
-            print("refusing to start: RESI_GATEWAY needs VLESS_UUID (the resi path is a VLESS+WS inbound)", flush=True)
-            raise SystemExit(2)
+    if resi is not None and not env.get("VLESS_UUID", ""):
+        print("refusing to start: RESI_GATEWAY needs VLESS_UUID (the resi path is a VLESS+WS inbound)", flush=True)
+        raise SystemExit(2)
+    if resi is not None or resi_rotate:
         if resi_port in {8080, 8081, 8082, 4096, mixed_port, vless_direct_port, vless_chain_port}:
             print(f"refusing to start: RESI_PORT={resi_port} collides", flush=True)
             raise SystemExit(2)
@@ -1460,7 +1471,7 @@ def build_config_from_env(env: dict) -> dict:
         print(f"refusing to start: MIXED_PORT={mixed_port} collides", flush=True)
         raise SystemExit(2)
     reserved = {8080, 8081, 8082, 4096, mixed_port, vless_direct_port, vless_chain_port}
-    if resi is not None:
+    if resi is not None or resi_rotate:
         reserved.add(resi_port)
     if port in reserved:
         print(f"refusing to start: PORT={port} collides {sorted(reserved)}; set PORT=3000", flush=True)
@@ -1485,7 +1496,7 @@ def build_config_from_env(env: dict) -> dict:
         "data_dir": env.get("DATA_DIR") or env.get("RAILWAY_VOLUME_MOUNT_PATH") or ".",
         "vless_uuid": env.get("VLESS_UUID", ""),
         "vless_direct_port": vless_direct_port, "vless_chain_port": vless_chain_port,
-        "resi": resi, "resi_port": resi_port,
+        "resi": resi, "resi_port": resi_port, "resi_rotate": resi_rotate,
         "resi_path": env.get("RESI_PATH", DEFAULT_RESI_PATH),
         "tunnel_token": env.get("TUNNEL_TOKEN", ""),
         "cloudflared_bin": env.get("CLOUDFLARED_BIN", "cloudflared"),
@@ -1661,7 +1672,7 @@ class RailwayManager:
         auto_rescue: bool = True, verify_fn=None, vless_uuid: str = "", vless_direct_port: int = 8080,
         vless_chain_port: int = 8082, vless_direct_path: str = "/ws-node", vless_chain_path: str = "/ws-chain",
         resi: dict | None = None, resi_port: int = DEFAULT_RESI_PORT, resi_path: str = DEFAULT_RESI_PATH,
-        resi_session_ttl: int = 0,
+        resi_rotate: bool = False, resi_session_ttl: int = 0,
         tunnel_token: str = "", cloudflared_bin: str = "cloudflared", disguise_path: str = "",
         config_path: str = "singbox-railway.json", nodes_path: str = "nodes.json", state_path: str = "state.json",
         settings_path: str | None = None, singbox_bin: str = "sing-box", start_singbox: bool = True,
@@ -1683,6 +1694,8 @@ class RailwayManager:
         self.vless_direct_path = vless_direct_path; self.vless_chain_path = vless_chain_path
         self.resi = dict(resi) if resi else None; self.resi_port = resi_port; self.resi_path = resi_path
         self.resi_session_ttl = int(resi_session_ttl or 0)
+        self.resi_rotate = bool(resi_rotate)
+        self._resi_ports: list[int] = []; self._resi_cursor = 0; self._resi_listener = None
         self._resi_session_id = ""; self._resi_session_started = 0.0; self._resi_lock = threading.Lock(); self._resi_probe_lock = threading.Lock()
         self.tunnel_token = tunnel_token; self.cloudflared_bin = cloudflared_bin; self.disguise_path = disguise_path
         self._cloudflared_proc = None; self.preferred_tag = None; self.backup_tag = None; self._auto_pinned = False
@@ -1690,13 +1703,19 @@ class RailwayManager:
         self._cpu_model = _cpu_model(); self._cpu_cores = os.cpu_count(); self._cpu_last = None
         self._fail_streak = 0; self._pinned_fail_streak = 0; self._rescue_round = 0; self._crash_streak = 0; self._retry_after = 0.0; self._mixed_fail_streak = 0; self._mixed_retry_after = 0.0; self._health_mixed_streak = 0; self._refresh_generation = 0
         self._lock = threading.RLock(); self._refresh_lock = threading.Lock(); self._config_lock = threading.Lock()
-        resi_status = ({"enabled": True, "host": resi["server"], "port": resi["server_port"],
-            "path": resi_path,
-            "mode": "sticky" if self.resi_session_ttl > 0 else "rotation",
-            "sticky_ttl": self.resi_session_ttl, "session_age": 0, "state": "unknown",
-            "exit_ip": None, "ms": None, "checked_at": None, "error": None,
-            "last_probe": {"state": "idle", "ips": [], "distinct": 0, "rotating": None, "checked_at": None}}
-            if resi else {"enabled": False})
+        if resi:
+            resi_status = {"enabled": True, "mode": ("sticky" if self.resi_session_ttl > 0 else "rotation"),
+                "host": resi["server"], "port": resi["server_port"], "path": resi_path,
+                "sticky_ttl": self.resi_session_ttl, "session_age": 0, "state": "unknown",
+                "exit_ip": None, "ms": None, "checked_at": None, "error": None,
+                "last_probe": {"state": "idle", "ips": [], "distinct": 0, "rotating": None, "checked_at": None}}
+        elif self.resi_rotate:
+            resi_status = {"enabled": True, "mode": "rotate", "listen": "0.0.0.0",
+                "port": resi_port, "path": resi_path, "nodes": 0, "cursor": 0,
+                "state": "unknown", "exit_ip": None, "ms": None, "checked_at": None, "error": None,
+                "last_probe": {"state": "idle", "ips": [], "distinct": 0, "rotating": None, "checked_at": None}}
+        else:
+            resi_status = {"enabled": False}
         self.status: dict = {"endpoints": [], "countries": [], "preferred_tag": None, "backup_tag": None, "auto_pinned": False,
             "refresh_history": [], "refresh_ok": 0, "refresh_fail": 0, "last_refresh": None, "last_error": None, "started_at": None,
             "proxy": f"127.0.0.1:{mixed_port}", "traffic": {"connections": 0, "bytes_up": 0, "bytes_down": 0},
@@ -1725,8 +1744,10 @@ class RailwayManager:
             threading.Thread(target=self._refresh_loop, daemon=True, name="refresh-loop").start()
         threading.Thread(target=self._supervise_loop, daemon=True, name="supervise-loop").start()
         threading.Thread(target=self._health_monitor_loop, daemon=True, name="health-monitor").start()
-        if self.resi is not None:
+        if self.resi is not None or self.resi_rotate:
             threading.Thread(target=self._resi_probe_loop, daemon=True, name="resi-probe").start()
+        if self.resi_rotate:
+            threading.Thread(target=self._resi_accept_loop, daemon=True, name="resi-balancer").start()
         if self.fetch_on_start:
             threading.Thread(target=self._initial_refresh, daemon=True, name="initial-refresh").start()
         self._start_cloudflared()
@@ -1759,6 +1780,13 @@ class RailwayManager:
             return self._mux_inflight <= 0
     def stop(self) -> None:
         self._stop_event.set()
+        balancer = self._resi_listener
+        if balancer is not None:
+            try:
+                balancer.close()
+            except OSError:
+                pass
+            self._resi_listener = None
         if self._listener is not None:
             try:
                 self._listener.close()
@@ -2586,6 +2614,8 @@ class RailwayManager:
         resi_outbound = self._resi_outbound()
         with self._lock:
             endpoints = [n["endpoint"] for n in serving]
+            rotate_ports = ([RESI_ROTATE_BASE + i for i in range(len(endpoints))]
+                            if self.resi_rotate else [])
             username, password = self.username, self.password; mixed_port = self.mixed_port
             vless_uuid = self.vless_uuid or None; direct_port = self.vless_direct_port; chain_port = self.vless_chain_port
             resi_port = self.resi_port; resi_path = self.resi_path
@@ -2593,7 +2623,10 @@ class RailwayManager:
         config = build_singbox_config(endpoints, "127.0.0.1", mixed_port, mixed_users=[(username, password)],
             final=final, preferred=preferred, backup=backup, vless_uuid=vless_uuid,
             vless_direct_port=direct_port, vless_chain_port=chain_port,
-            resi=resi_outbound, resi_port=resi_port, resi_path=resi_path)
+            resi=resi_outbound, resi_port=resi_port, resi_path=resi_path,
+            resi_rotate=self.resi_rotate)
+        if self.resi_rotate:
+            self._set_resi_ports(rotate_ports)
         if want_singbox and self._serving_config_unchanged(config):
             with self._lock:
                 proc = self._singbox_proc
@@ -2933,7 +2966,120 @@ class RailwayManager:
             self.status["verify"] = {"state": "idle", "exit_ip": None, "ms": None, "via_tag": None, "error": None, "checked_at": None, "generation": self._verify_generation}
         self._record_history("verify-invalidated", reason)
     # --- rotating residential SOCKS5 exit ---------------------------------
+    def _resi_accept_loop(self) -> None:
+        """Listen on the third-path port and hand each connection a node.
+
+        The port belongs to the manager (not sing-box) precisely so the pick
+        can happen per connection: sing-box inbounds route by inbound tag, so
+        "one inbound per node" plus this balancer is what makes the rotation
+        observable from a single client entrypoint.
+        """
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            listener.bind(("0.0.0.0", self.resi_port))
+            listener.listen(128)
+            listener.settimeout(1.0)
+        except OSError as exc:
+            print(f"resi balancer bind failed on :{self.resi_port}: {exc}", flush=True)
+            self._set_resi(state="down", error=f"bind failed: {exc}")
+            try:
+                listener.close()
+            except OSError:
+                pass
+            return
+        self._resi_listener = listener
+        while not self._stop_event.is_set():
+            try:
+                client, _ = listener.accept()
+            except (OSError, socket.timeout):
+                continue
+            threading.Thread(target=self._handle_resi_client, args=(client,),
+                             daemon=True).start()
+    def _resi_next_port(self) -> int | None:
+        """Round-robin the loopback inbound ports; None when nothing to serve."""
+        with self._lock:
+            ports = list(self._resi_ports)
+            if not ports:
+                return None
+            port = ports[self._resi_cursor % len(ports)]
+            self._resi_cursor = (self._resi_cursor + 1) % len(ports)
+            resi_status = self.status.get("resi")
+            if isinstance(resi_status, dict) and resi_status.get("enabled"):
+                resi_status["cursor"] = self._resi_cursor
+            return port
+    def _set_resi_ports(self, ports: list[int]) -> None:
+        """Publish the current node -> loopback port table (order = serving order)."""
+        with self._lock:
+            changed = list(ports) != self._resi_ports
+            self._resi_ports = list(ports)
+            if changed:
+                self._resi_cursor = 0
+            resi_status = self.status.get("resi")
+            if isinstance(resi_status, dict) and resi_status.get("enabled"):
+                resi_status["nodes"] = len(ports)
+                if changed:
+                    resi_status["cursor"] = 0
+    def _handle_resi_client(self, client: socket.socket) -> None:
+        held = False
+        try:
+            if not self._mux_slots.acquire(blocking=False):
+                return
+            held = True
+            port = self._resi_next_port()
+            if port is None:
+                self._set_resi(state="down", error="no serving endpoints")
+                return
+            try:
+                backend = socket.create_connection(("127.0.0.1", port), timeout=10)
+            except OSError:
+                self._set_resi(error=f"backend :{port} unavailable")
+                return
+            client.settimeout(PIPE_IDLE_TIMEOUT)
+            backend.settimeout(PIPE_IDLE_TIMEOUT)
+            with self._lock:
+                self._mux_inflight += 1
+                self.status["traffic"]["connections"] += 1
+            try:
+                up = [0]; down = [0]
+                first = threading.Thread(
+                    target=lambda: up.__setitem__(0, _forward(client, backend)),
+                    daemon=True)
+                second = threading.Thread(
+                    target=lambda: down.__setitem__(0, _forward(backend, client)),
+                    daemon=True)
+                first.start(); second.start(); first.join()
+                for sock in (client, backend):
+                    try:
+                        sock.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                second.join(timeout=10)
+                with self._lock:
+                    self.status["traffic"]["bytes_up"] += up[0]
+                    self.status["traffic"]["bytes_down"] += down[0]
+            finally:
+                try:
+                    backend.close()
+                except OSError:
+                    pass
+                with self._lock:
+                    self._mux_inflight -= 1
+        except OSError:
+            pass
+        finally:
+            if held:
+                try:
+                    self._mux_slots.release()
+                except Exception:
+                    pass
+            try:
+                client.close()
+            except OSError:
+                pass
     def _resi_mode(self) -> str:
+        if self.resi_rotate:
+            return "rotate"
         return "sticky" if int(self.resi_session_ttl or 0) > 0 else "rotation"
     def _resi_session(self) -> str:
         """Sticky session id, stable for the process lifetime.
@@ -2973,8 +3119,8 @@ class RailwayManager:
         while not self._stop_event.wait(interval):
             self._start_resi_probe(1)
     def _start_resi_probe(self, count: int = 3, rotate_session: bool = False) -> bool:
-        """Single-flight residential probe; False when disabled or running."""
-        if not self.resi:
+        """Single-flight third-path probe; False when disabled or running."""
+        if not self.resi and not self.resi_rotate:
             return False
         with self._lock:
             current = self.status["resi"].get("last_probe") or {}
@@ -2989,17 +3135,27 @@ class RailwayManager:
                          daemon=True, name="resi-probe").start()
         return True
     def _run_resi_probe(self, count: int) -> None:
-        outbound = self._resi_outbound()
         result = None
         error = None
-        if outbound is None:
-            error = "no residential outbound"
-        else:
+        if self.resi_rotate:
             try:
-                result = measure_resi_rotation(outbound, count=count, singbox_bin=self.singbox_bin,
-                                               timeout=self.dial_timeout)
+                result = measure_resi_rotate(self.vless_uuid, self.resi_port, self.resi_path,
+                                             count=count, singbox_bin=self.singbox_bin,
+                                             timeout=self.dial_timeout)
             except Exception as exc:
                 error = f"{type(exc).__name__}: {exc}"
+            if result is None:
+                error = error or "no serving endpoint answered"
+        else:
+            outbound = self._resi_outbound()
+            if outbound is None:
+                error = "no residential outbound"
+            else:
+                try:
+                    result = measure_resi_rotation(outbound, count=count, singbox_bin=self.singbox_bin,
+                                                   timeout=self.dial_timeout)
+                except Exception as exc:
+                    error = f"{type(exc).__name__}: {exc}"
         now = _now_iso()
         if result is None:
             reason = error or "no exit ip"
@@ -3010,25 +3166,37 @@ class RailwayManager:
             return
         ips = result["ips"]
         distinct = result["distinct"]
-        rotating = (distinct >= 2) if self._resi_mode() == "rotation" else (distinct == 1)
+        rotating = (distinct == 1) if self._resi_mode() == "sticky" else (distinct >= 2)
         self._set_resi(state="up", exit_ip=ips[-1], ms=result["first_ms"], checked_at=now, error=None,
                        last_probe={"state": "done", "ips": ips, "distinct": distinct,
                                    "rotating": rotating, "checked_at": now})
         self._record_history("resi-probe", f"{len(ips)}x ips={','.join(ips)} distinct={distinct}")
     def _run_resi_verify(self) -> None:
         """Verify target for POST /api/verify?path=resi: one exit IP."""
-        outbound = self._resi_outbound()
         exit_ip, ms = (None, None)
         error = None
-        if outbound is None:
-            error = "no residential outbound"
-        else:
+        if self.resi_rotate:
             try:
-                exit_ip, ms = measure_resi_exit_ip(outbound, self.singbox_bin, self.dial_timeout)
+                sampled = measure_resi_rotate(self.vless_uuid, self.resi_port, self.resi_path,
+                                              count=1, singbox_bin=self.singbox_bin,
+                                              timeout=self.dial_timeout)
             except Exception as exc:
-                error = f"{type(exc).__name__}: {exc}"
-            if not exit_ip and error is None:
-                error = "no exit ip measured"
+                sampled, error = None, f"{type(exc).__name__}: {exc}"
+            if sampled:
+                exit_ip, ms = sampled["ips"][0], sampled["first_ms"]
+            elif error is None:
+                error = "no serving endpoint answered"
+        else:
+            outbound = self._resi_outbound()
+            if outbound is None:
+                error = "no residential outbound"
+            else:
+                try:
+                    exit_ip, ms = measure_resi_exit_ip(outbound, self.singbox_bin, self.dial_timeout)
+                except Exception as exc:
+                    error = f"{type(exc).__name__}: {exc}"
+                if not exit_ip and error is None:
+                    error = "no exit ip measured"
         now = _now_iso()
         self._set_resi(state=("up" if exit_ip else "down"), exit_ip=exit_ip, ms=ms,
                        checked_at=now, error=error)
@@ -3149,6 +3317,7 @@ def main() -> int:
         auto_rescue=cfg["auto_rescue"], health_check_interval=cfg["health_check_interval"], max_mux_connections=cfg["max_mux_connections"],
         vless_uuid=cfg["vless_uuid"], vless_direct_port=cfg["vless_direct_port"], vless_chain_port=cfg["vless_chain_port"],
         resi=cfg["resi"], resi_port=cfg["resi_port"], resi_path=cfg["resi_path"],
+        resi_rotate=cfg["resi_rotate"],
         resi_session_ttl=(cfg["resi"]["session_ttl"] if cfg["resi"] else 0),
         tunnel_token=cfg["tunnel_token"], cloudflared_bin=cfg["cloudflared_bin"], disguise_path=cfg["disguise_path"],
         config_path=os.path.join(data_dir, "singbox-railway.json"), nodes_path=os.path.join(data_dir, "nodes.json"),

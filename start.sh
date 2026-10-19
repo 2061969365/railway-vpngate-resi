@@ -27,7 +27,9 @@ if grep -q "UUID_PLACEHOLDER" /app/www/index.html 2>/dev/null; then
     sed -i "s/NODE_REMARK_PLACEHOLDER/$esc_remark/g" /tmp/index.html
     # Residential path: injected only when the gateway is configured, so an
     # unconfigured deployment never advertises a dead /ws-resi link.
-    if [ -n "${RESI_GATEWAY:-}" ]; then
+    # Third path is on by default (VPNGate node rotation) whenever a VLESS
+# UUID exists; only a VLESS-less deployment hides it.
+if [ -n "${VLESS_UUID:-}" ]; then
       resi_path="${RESI_PATH:-/ws-resi}"
       esc_resi=$(printf '%s' "$resi_path" | sed 's/[&/\]/\\&/g')
       sed -i "s#RESI_PATH_PLACEHOLDER#${esc_resi}#g" /tmp/index.html

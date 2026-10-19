@@ -5,15 +5,18 @@ env validation, and the manager surface (status / probe API / verify path).
 No real gateway is contacted: the probe functions are patched.
 """
 import json
+import os
 import socket
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
 
 from railway_manager import RailwayManager, build_config_from_env
 from vpngate_to_singbox import (DEFAULT_RESI_PORT, RESI_IN_PORT,
-                                build_singbox_config, render_resi_username)
+                                RESI_ROTATE_BASE, build_singbox_config,
+                                render_resi_username)
 
 RESI = {"server": "gw.example.com", "server_port": 1080,
         "username": "user1", "password": "pass1"}
@@ -23,6 +26,14 @@ VLESS = "a29738e5-bee1-c0fc-b484-ae7c49cbc828"
 def _endpoint(tag: str = "vpngate-0") -> dict:
     return {"type": "openvpn-client", "tag": tag, "server": "203.0.113.9",
             "server_port": 443, "network": "tcp"}
+
+
+def _free_port() -> int:
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    return port
 
 
 def _base_env(tmpdir: str) -> dict:
@@ -121,6 +132,25 @@ class EnvTests(unittest.TestCase):
         self.assertIsNone(config["resi"])
         self.assertEqual(DEFAULT_RESI_PORT, config["resi_port"])
 
+    def test_rotate_is_the_default_without_a_gateway(self) -> None:
+        config = build_config_from_env(self._env())
+
+        self.assertIsNone(config["resi"])
+        self.assertTrue(config["resi_rotate"])
+
+    def test_rotate_needs_a_vless_uuid(self) -> None:
+        env = self._env()
+        env.pop("VLESS_UUID")
+        config = build_config_from_env(env)
+
+        self.assertFalse(config["resi_rotate"])
+
+    def test_gateway_configuration_disables_rotate(self) -> None:
+        config = build_config_from_env(self._env(
+            RESI_GATEWAY="gw.example.com:1080", RESI_USER="u", RESI_PASS="p"))
+
+        self.assertFalse(config["resi_rotate"])
+
     def test_parsed_when_gateway_and_credentials_present(self) -> None:
         config = build_config_from_env(self._env(
             RESI_GATEWAY="gw.example.com:1080", RESI_USER="user1", RESI_PASS="pass1"))
@@ -173,6 +203,69 @@ class EnvTests(unittest.TestCase):
                         RESI_USER_TEMPLATE="{user}-{session}-{country}")
         with self.assertRaises(SystemExit):
             build_config_from_env(env)
+
+
+
+class RotateConfigTests(unittest.TestCase):
+    """Third path in rotating mode: one loopback inbound per serving node."""
+
+    def _cfg(self, count: int = 3, **kwargs) -> dict:
+        endpoints = [_endpoint(f"vpngate-{i}") for i in range(count)]
+        params = dict(endpoints=endpoints, mixed_listen="127.0.0.1",
+                      mixed_port=40000, vless_uuid=VLESS, resi_rotate=True)
+        params.update(kwargs)
+        return build_singbox_config(**params)
+
+    def test_one_loopback_inbound_per_endpoint(self) -> None:
+        cfg = self._cfg(3)
+        rots = [i for i in cfg["inbounds"] if i["tag"].startswith("resi-rot-")]
+
+        self.assertEqual(["resi-rot-0", "resi-rot-1", "resi-rot-2"],
+                         [i["tag"] for i in rots])
+        self.assertEqual([RESI_ROTATE_BASE, RESI_ROTATE_BASE + 1, RESI_ROTATE_BASE + 2],
+                         [i["listen_port"] for i in rots])
+        self.assertTrue(all(i["type"] == "vless" for i in rots))
+        self.assertTrue(all(i["listen"] == "127.0.0.1" for i in rots))
+
+    def test_each_inbound_routes_to_its_node(self) -> None:
+        rules = self._cfg(2)["route"]["rules"]
+
+        self.assertIn({"inbound": "resi-rot-0", "outbound": "vpngate-0"}, rules)
+        self.assertIn({"inbound": "resi-rot-1", "outbound": "vpngate-1"}, rules)
+
+    def test_manager_owns_the_port_so_singbox_does_not_bind_it(self) -> None:
+        cfg = self._cfg(2)
+        ports = {i["listen_port"] for i in cfg["inbounds"]}
+
+        self.assertNotIn(DEFAULT_RESI_PORT, ports)
+        self.assertNotIn("resi", [o["tag"] for o in cfg["outbounds"]])
+
+    def test_rotate_stays_out_of_failover_groups(self) -> None:
+        cfg = self._cfg(2)
+        auto = next(o for o in cfg["outbounds"] if o["tag"] == "auto")
+
+        self.assertNotIn("resi-rot-0", auto["outbounds"])
+
+    def test_rotate_path_is_configurable(self) -> None:
+        cfg = self._cfg(1, resi_path="/ws-home")
+        inbound = next(i for i in cfg["inbounds"] if i["tag"] == "resi-rot-0")
+
+        self.assertEqual("/ws-home", inbound["transport"]["path"])
+
+    def test_rotate_without_vless_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            build_singbox_config([_endpoint()], vless_uuid=None, resi_rotate=True)
+
+    def test_gateway_and_rotate_are_mutually_exclusive(self) -> None:
+        with self.assertRaises(ValueError):
+            build_singbox_config([_endpoint()], "127.0.0.1", 40000, vless_uuid=VLESS,
+                                 resi=dict(RESI), resi_rotate=True)
+
+    def test_no_endpoints_means_no_rotate_inbounds(self) -> None:
+        cfg = self._cfg(0)
+
+        self.assertEqual([], [i for i in cfg["inbounds"]
+                              if i["tag"].startswith("resi-rot-")])
 
 
 def _manager(**kwargs) -> RailwayManager:
@@ -353,6 +446,162 @@ class ResiManagerTests(unittest.TestCase):
 
         self.assertIn(b"400", response)
         self.assertEqual(0, self.manager.resi_session_ttl)
+
+
+
+class RotateManagerTests(unittest.TestCase):
+    """Balancer behaviour: per-connection round-robin over the serving nodes."""
+
+    def _manager(self, **kwargs) -> RailwayManager:
+        # Write next to the source tree: mkdtemp dirs and /tmp are not
+        # writable in every sandbox, and _apply_config must really write.
+        stem = os.path.join(os.getcwd(), f".resi-rot-{id(self)}")
+        params = dict(port=0, mixed_port=0, start_singbox=False, auto_refresh=False,
+                      fetch_on_start=False, admin_token="t0ken-0123456789abcdef",
+                      vless_uuid=VLESS, resi=None, resi_rotate=True,
+                      config_path=f"{stem}.json", nodes_path=f"{stem}-nodes.json",
+                      state_path=f"{stem}-state.json", settings_path=None)
+        params.update(kwargs)
+        return RailwayManager(**params)
+
+    def test_status_reports_rotate_mode(self) -> None:
+        manager = self._manager()
+        try:
+            resi = dict(manager.status["resi"])
+        finally:
+            manager.stop()
+
+        self.assertTrue(resi["enabled"])
+        self.assertEqual("rotate", resi["mode"])
+        self.assertEqual(DEFAULT_RESI_PORT, resi["port"])
+        self.assertEqual(0, resi["nodes"])
+
+    def test_cursor_cycles_and_wraps(self) -> None:
+        manager = self._manager()
+        try:
+            manager._set_resi_ports([RESI_ROTATE_BASE, RESI_ROTATE_BASE + 1])
+            seen = [manager._resi_next_port() for _ in range(3)]
+            nodes = manager.status["resi"]["nodes"]
+        finally:
+            manager.stop()
+
+        self.assertEqual([RESI_ROTATE_BASE, RESI_ROTATE_BASE + 1, RESI_ROTATE_BASE],
+                         seen)
+        self.assertEqual(2, nodes)
+
+    def test_no_nodes_means_no_backend(self) -> None:
+        manager = self._manager()
+        try:
+            manager._set_resi_ports([])
+            port = manager._resi_next_port()
+        finally:
+            manager.stop()
+
+        self.assertIsNone(port)
+
+    def test_rebuilding_the_table_resets_the_cursor(self) -> None:
+        manager = self._manager()
+        try:
+            manager._set_resi_ports([RESI_ROTATE_BASE, RESI_ROTATE_BASE + 1])
+            manager._resi_next_port()
+            manager._set_resi_ports([RESI_ROTATE_BASE, RESI_ROTATE_BASE + 1,
+                                     RESI_ROTATE_BASE + 2])
+            first = manager._resi_next_port()
+        finally:
+            manager.stop()
+
+        self.assertEqual(RESI_ROTATE_BASE, first)
+
+    def test_apply_config_publishes_the_port_table(self) -> None:
+        manager = self._manager()
+        try:
+            manager._nodes = [
+                {"server": f"198.51.100.{i + 1}", "server_port": 443,
+                 "country": "Japan", "country_short": "JP", "latency_ms": 100,
+                 "real_latency_ms": 10 + i, "speed": 1000,
+                 "endpoint": _endpoint(f"vpngate-{i}")} for i in range(3)]
+            with mock.patch.object(RailwayManager, "_check_config", return_value=True):
+                manager._apply_config()
+            ports = list(manager._resi_ports)
+            nodes = manager.status["resi"]["nodes"]
+        finally:
+            manager.stop()
+            for path in (manager.config_path, manager.nodes_path,
+                         manager.state_path, manager.config_path + ".last-good"):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+
+        self.assertEqual([RESI_ROTATE_BASE, RESI_ROTATE_BASE + 1, RESI_ROTATE_BASE + 2],
+                         ports)
+        self.assertEqual(3, nodes)
+
+    def test_probe_goes_through_the_listener(self) -> None:
+        manager = self._manager()
+        sample = {"ips": ["1.1.1.1", "2.2.2.2"], "ms": [1, 2], "count": 2,
+                  "distinct": 2, "errors": [], "first_ms": 1, "last_ms": 2}
+        try:
+            with mock.patch("railway_manager.measure_resi_rotate",
+                            return_value=sample) as probe:
+                manager._run_resi_probe(2)
+            args = probe.call_args[0]
+            probe_state = dict(manager.status["resi"]["last_probe"])
+            state = manager.status["resi"]["state"]
+        finally:
+            manager.stop()
+
+        self.assertEqual((VLESS, DEFAULT_RESI_PORT, "/ws-resi"), args[:3])
+        self.assertTrue(probe_state["rotating"])
+        self.assertEqual("up", state)
+
+    def test_balancer_round_robins_real_connections(self) -> None:
+        servers = []
+        backend_ports = []
+        for _ in range(2):
+            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv.bind(("127.0.0.1", 0))
+            srv.listen(4)
+            servers.append(srv)
+            backend_ports.append(srv.getsockname()[1])
+
+        def serve(srv: socket.socket, tag: str) -> None:
+            while True:
+                try:
+                    conn, _ = srv.accept()
+                except OSError:
+                    return
+                try:
+                    conn.sendall(tag.encode("ascii"))
+                except OSError:
+                    pass
+                finally:
+                    try:
+                        conn.close()
+                    except OSError:
+                        pass
+
+        for index, srv in enumerate(servers):
+            threading.Thread(target=serve, args=(srv, f"backend-{index}"),
+                             daemon=True).start()
+
+        resi_port = _free_port()
+        manager = self._manager(resi_port=resi_port)
+        manager._set_resi_ports(backend_ports)
+        manager.start()
+        try:
+            seen = []
+            for _ in range(4):
+                sock = socket.create_connection(("127.0.0.1", resi_port), timeout=5)
+                with sock:
+                    seen.append(sock.recv(64).decode("ascii"))
+        finally:
+            manager.stop()
+            for srv in servers:
+                srv.close()
+
+        self.assertEqual(["backend-0", "backend-1", "backend-0", "backend-1"], seen)
 
 
 if __name__ == "__main__":

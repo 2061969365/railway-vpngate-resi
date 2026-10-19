@@ -11,12 +11,12 @@ CC Switch / 伪装页 / 哪吒探针从 `railway-proxy-combined` 全量搬运
 |---|---|---|
 | `:8080` `/ws-node` | `vless-direct` → `direct` | Railway 本机出口（复刻 combined 行为） |
 | `:8082` `/ws-chain` | `vless-chain` → `chain`/`auto` → openvpn endpoint | VPNGate 节点出口 |
-| `:8084` `/ws-resi` | `vless-resi` → `resi`（socks5）→ 固定 backconnect 网关 | 旋转住宅出口（可选，需 `RESI_GATEWAY`） |
+| `:8084` `/ws-resi` | 管理器轮换监听 → 每个有效节点一条 loopback `resi-rot-i` 入站 | **轮换出口**：每条新连接换一个有效 VPNGate 节点（默认开启；配了 `RESI_GATEWAY` 则改为住宅网关） |
 
 三个入站共用同一个 `UUID`（`VLESS_UUID`，默认与 combined 一致：
 `a29738e5-bee1-c0fc-b484-ae7c49cbc828`）。`route.rules` 按 inbound tag 分流，
-三条路互不串扰。`/ws-resi` 未配置 `RESI_GATEWAY` 时整条路径（入站 + 出站 + 订阅）
-都不会生成。
+三条路互不串扰。`VLESS_UUID` 为空时第③路不生成；有 `VLESS_UUID` 就默认开启
+「节点轮换」（面板第三张卡显示节点数与当前游标）。
 
 ## Railway 部署
 
@@ -35,8 +35,9 @@ CC Switch / 伪装页 / 哪吒探针从 `railway-proxy-combined` 全量搬运
        `LIMIT`（默认 100，0=全量、上限 100）、`REAL_TOPK`（默认 30，真拨 TopK）、
        `DIAL_WORKERS`（默认 2，真测并发；1GB 内存够用，OOM 就往小调）、`FULL_PROBE_WORKERS`（默认 2，
        全量真测并发；和 DIAL_WORKERS 叠加受全局 dial gate 上限 10 约束）、`REFRESH_SECONDS`（默认 3600，每小时拉新快照并自动全量真测）、`PROBE_WORKERS`（默认 15，握手并发）、`DIAL_TIMEOUT`（默认 15，真拨超时秒）、`AUTO_REPIN`（默认开，每小时自动重 pin 最优）、`AUTO_RESCUE`（默认开，手动 pin 挂了自动救最优）、`HEALTH_CHECK_INTERVAL`（默认 20s）、`MAX_MUX_CONNECTIONS`（默认 100）、`NEZHA_URL`（可选）、`SNAPSHOT_URLS`（可选，逗号分隔的快照镜像，主源失败自动顺延）
-     - 旋转住宅（可选，不填则整条路径关闭）：`RESI_GATEWAY`（`host:port`，固定
-       backconnect 网关，**永远只连这个地址**）、`RESI_USER`、`RESI_PASS`、
+     - 第三出口（默认开启、节点轮换、零配置；只有要接外部住宅网关才需要下面这些）：
+       `RESI_GATEWAY`（`host:port`，固定 backconnect 网关，**永远只连这个地址**；填了就切到住宅模式）、
+       `RESI_USER`、`RESI_PASS`、
        `RESI_SESSION_TTL`（默认 0 = 每次连接换 IP；>0 = 粘性窗口秒数）、
        `RESI_USER_TEMPLATE`（粘性模式必填，见下节）、`RESI_PORT`（默认 8084）、
        `RESI_PATH`（默认 `/ws-resi`）、`RESI_PROBE_INTERVAL`（默认 300 秒）
@@ -82,10 +83,17 @@ vless://<UUID>@node.example.com:443?security=tls&sni=node.example.com&type=ws&pa
 `/ws-chain` 出口 IP == VPNGate 节点 IP（两者不同即分流正常）；
 `/ws-resi` 出口 IP 属于住宅池，且连续新连接会变化（见下节）。
 
-## 旋转住宅 SOCKS5 出口（可选）
+## 第三出口：节点轮换 / 住宅（默认开启）
 
-只连**固定的 backconnect 网关**（`RESI_GATEWAY`），真实家宽 IP 由网关按连接分配，
-本服务永远不知道也不需要知道它。默认**旋转**：每次新 TCP 连接换一个出口。
+第③路有两种后端，**优先住宅网关，未配置就是 VPNGate 节点轮换**：
+
+- **轮换模式（默认，零配置）**：没填 `RESI_GATEWAY` 时，出口从当前所有**实测有效节点**里
+  按连接环形轮换——第 1 条连接走节点 1、第 2 条走节点 2……用完一圈回到第 1 个。
+  出口 IP 就是该节点的 VPNGate IP（机房 IP，不是家宽）。
+- **住宅模式**：填了 `RESI_GATEWAY` + 账号密码时，改为连固定的 backconnect 网关，
+  真实家宽 IP 由网关按连接分配，本服务永远不知道也不需要知道它。
+
+两种模式的「旋转」都指**每次新 TCP 连接换一个出口**；住宅模式下粘性靠用户名里的 session。
 
 ### 环境变量
 
