@@ -136,22 +136,43 @@ jobs:
       - name: UI/disguise is reachable through Cloudflare
         run: |
           HOST=$(cat /tmp/host-ui.txt)
-          curl -m 30 -s "https://${HOST}/" -o /tmp/page.html -w "GET / -> %{http_code}\n"
+          # A brand-new trycloudflare hostname needs a moment to appear at the
+          # edge/DNS, so the first requests legitimately answer 000.
+          code=""
+          for i in $(seq 1 20); do
+            code=$(curl -m 30 -sS -o /tmp/page.html -w "%{http_code}" "https://${HOST}/" 2>/tmp/curl.err) || true
+            if [ -n "$code" ] && [ "$code" != "000" ]; then
+              echo "GET / -> $code (attempt $i)"
+              break
+            fi
+            echo "attempt $i: $(cat /tmp/curl.err 2>/dev/null)"
+            sleep 6
+          done
+          [ -n "$code" ] && [ "$code" != "000" ] || { echo "tunnel never answered"; exit 1; }
           grep -q "ws-node" /tmp/page.html && echo "disguise page OK (direct link present)"
           grep -q "ws-resi" /tmp/page.html && echo "third path link present on the page"
-          code=$(curl -m 30 -s -o /dev/null -w "%{http_code}" "https://${HOST}/healthz")
-          echo "healthz via tunnel -> $code"
-          [ "$code" = "200" ] || { echo "healthz unreachable through the tunnel"; exit 1; }
+          for i in $(seq 1 20); do
+            hcode=$(curl -m 30 -s -o /dev/null -w "%{http_code}" "https://${HOST}/healthz" || true)
+            [ "$hcode" = "200" ] && break
+            sleep 6
+          done
+          echo "healthz via tunnel -> $hcode"
+          [ "$hcode" = "200" ] || { echo "healthz unreachable through the tunnel"; exit 1; }
 
       - name: /ws-resi answers a WebSocket upgrade through Cloudflare
         run: |
           HOST=$(cat /tmp/host-resi.txt)
-          code=$(curl -m 30 -s -o /dev/null -w "%{http_code}" \
-            -H "Connection: Upgrade" -H "Upgrade: websocket" \
-            -H "Sec-WebSocket-Version: 13" \
-            -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
-            "https://${HOST}/ws-resi" || true)
-          echo "https://${HOST}/ws-resi upgrade -> ${code}"
+          code=""
+          for i in $(seq 1 20); do
+            code=$(curl -m 30 -s -o /dev/null -w "%{http_code}" \
+              -H "Connection: Upgrade" -H "Upgrade: websocket" \
+              -H "Sec-WebSocket-Version: 13" \
+              -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+              "https://${HOST}/ws-resi" || true)
+            echo "attempt $i: https://${HOST}/ws-resi upgrade -> ${code:-<none>}"
+            [ "$code" = "101" ] && break
+            sleep 6
+          done
           [ "$code" = "101" ] || { echo "no WS upgrade through the tunnel"; exit 1; }
           echo "TUNNEL WS OK: Cloudflare edge reached the manager balancer"
 
@@ -197,17 +218,17 @@ jobs:
           EOF
           "$SB" check -c /tmp/vless-tunnel.json
           "$SB" run -c /tmp/vless-tunnel.json > /tmp/vless-tunnel.log 2>&1 &
-          sleep 6
+          sleep 12
 
           : > /tmp/ips.txt
-          for i in $(seq 1 12); do
+          for i in $(seq 1 16); do
             ip=$(curl -m 60 -s -x socks5h://127.0.0.1:18091 https://api.ipify.org || true)
             echo "sample $i: ${ip:-<failed>}"
             if [ -n "$ip" ]; then echo "$ip" >> /tmp/ips.txt; fi
             samples=$(wc -l < /tmp/ips.txt)
             distinct=$(sort -u /tmp/ips.txt | wc -l)
             if [ "$samples" -ge 5 ] && [ "$distinct" -ge 3 ]; then break; fi
-            sleep 2
+            sleep 4
           done
           pkill -f vless-tunnel || true
           python3 - <<'EOF'
