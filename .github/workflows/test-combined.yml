@@ -752,8 +752,20 @@ jobs:
           # After a full probe the container must have auto-pinned the two
           # lowest measured nodes: status pins plus the serving chain
           # selector must read [best, second, auto].
-          curl -m 10 -s -H "Authorization: Bearer trial-admin-token-0123456789" \
-            http://127.0.0.1:3000/api/status -o /tmp/trial-pin.json
+          AUTH="Authorization: Bearer trial-admin-token-0123456789"
+          # full_probe.state=done means the dial loop finished; auto-pin runs
+          # after it (exit-IP verification of up to 3 candidates), so give the
+          # pin its own wait window instead of racing it.
+          for i in $(seq 1 24); do
+            curl -m 10 -s -H "$AUTH" http://127.0.0.1:3000/api/status \
+              -o /tmp/trial-pin.json
+            if python3 -c "import json;exit(0 if json.load(open('/tmp/trial-pin.json')).get('preferred_tag') else 1)"; then
+              echo "auto-pin landed after ~$((i * 5))s"; break
+            fi
+            sleep 5
+          done
+          curl -m 10 -s -H "$AUTH" http://127.0.0.1:3000/api/status \
+            -o /tmp/trial-pin.json
           docker exec combined-trial cat /app/singbox-railway.json > /tmp/trial-serving.json
           # Diagnostics first: the pin step below exits 1 on mismatch, and we
           # need the reason (auto-pin-skipped/-failed) in the log when it does.
