@@ -214,13 +214,17 @@ curl http://127.0.0.1:3000/healthz   # ok
 
 ## CI
 
-`.github/workflows/test-combined.yml`：单测 → sing-box check →
-真实快照转换 → 真拨号 → 稳定性探针 → 镜像构建冒烟 →
-trial-run（含双 VLESS 路径拨号验证：chain 出口 ≠ direct 出口，
-direct 出口 == runner 本机 IP）。
+`.github/workflows/publish-image.yml`：在 `main` 上构建仓库 `Dockerfile` 并把镜像推到
+GHCR（`ghcr.io/<owner>/<repo>`），支持 `workflow_dispatch` 手动触发。流水线里不再跑测试，
+所有验证都在本地完成：
 
-另有 `live-resi` job：仓库配了 `RESI_GATEWAY` / `RESI_USER` / `RESI_PASS`
-三个 secret 时，真连住宅网关跑 3 次出口 IP 采样并要求 `distinct >= 2`；
-没配 secret（fork / PR / 未开通住宅）时自动跳过，日志里凭据会被 `::add-mask::`。
-该 job 只在 `push` 与 `workflow_dispatch` 上有意义，住宅流量按 GB 计费，
-不要在 PR 上依赖它。
+```bash
+python -m unittest discover -s tests -v          # 单元测试
+python vpngate_to_singbox.py \
+  --input tests/fixtures/vpngate_tcp_sample.ovpn --output /tmp/singbox.json
+sing-box check -c /tmp/singbox.json              # 配置形状（含三路入站）校验
+```
+
+住宅网关的真连验证同样在本地：配好 `RESI_*` 后 `POST /api/resi_probe {"count":3}`
+要求 `distinct >= 2`，或直接 `curl --socks5-hostname` 连打几次 `https://api.ipify.org`
+看出口 IP 是否变化。住宅流量按 GB 计费，不要放进自动流水线。

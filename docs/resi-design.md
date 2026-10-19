@@ -413,7 +413,7 @@ done
 | 集成 | `POST /api/resi_probe` 注入 fake `rotation_fn` → 202，随后 status 出现 `last_probe`；并发第二次 → 409 |
 | 集成 | 网关不可达 → `state="down"`，`/healthz` 仍 200，`/ws-chain` 配置不受影响（防止把 resi 故障升级成全局故障） |
 | 协议 | 扩展 `tests/` 里的 `FakeSocks5Server`：支持 RFC1929 用户名密码协商，返回可轮换的出口 IP，供 `measure_resi_rotation` 直接跑 |
-| CI | `sing-box check` 对"含 resi outbound + vless-resi + resi-in"的配置跑一次；真实网关**不进 CI**（需要账号，且按流量计费） |
+| 自动化 | 配置形状由本地 `sing-box check` 覆盖（含 resi outbound + vless-resi + resi-in）；真实网关**只在本地验证**（需要账号，且按流量计费） |
 
 ---
 
@@ -462,7 +462,7 @@ done
 | 凭据存放 | **env only**；`settings.json` 只存 `resi_session_ttl`；`/api/status` 不含凭据 |
 | 粘性入口 | **单一 `/ws-resi`**，由 `RESI_SESSION_TTL` 决定旋转/粘性；另提供 `POST /api/resi_session` 显式换 session |
 | UDP | **彻底关闭**，出站硬编码 `network: "tcp"` |
-| CI | **真连网关**：`live-resi` job，靠 `RESI_GATEWAY/RESI_USER/RESI_PASS` secrets，缺 secret 自动跳过，日志 `::add-mask::` |
+| 自动化 | 原 `live-resi` job 随 `test-combined.yml` 一起删除；真连网关改为本地 `POST /api/resi_probe`，CI 只保留镜像构建（`publish-image.yml`） |
 
 ### 实施时的两处修正（推翻本草案早期假设）
 
