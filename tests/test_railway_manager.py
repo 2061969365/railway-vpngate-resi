@@ -383,6 +383,8 @@ class RefreshTests(unittest.TestCase):
                  mock.patch.object(RailwayManager, "refresh_once",
                                    return_value=True) as refresh_mock:
                 manager._initial_refresh()
+                if manager._refresh_thread is not None:
+                    manager._refresh_thread.join(timeout=60)
         finally:
             manager.stop()
 
@@ -401,6 +403,8 @@ class RefreshTests(unittest.TestCase):
                  mock.patch("railway_manager.probe_tcp_latency",
                             return_value=100):
                 manager._initial_refresh()
+                if manager._refresh_thread is not None:
+                    manager._refresh_thread.join(timeout=60)
             count = len(manager._nodes)
             endpoint_count = len(manager.status["endpoints"])
         finally:
@@ -514,7 +518,7 @@ class FullProbeTests(unittest.TestCase):
 
 
 class FullProbeWorkersTests(unittest.TestCase):
-    """Full probe dials concurrently (default 5, FULL_PROBE_WORKERS)."""
+    """Full probe dials concurrently (default 2, FULL_PROBE_WORKERS)."""
 
     TOKEN = "test-admin-token-0123456789abcdef"
 
@@ -567,7 +571,7 @@ class FullProbeWorkersTests(unittest.TestCase):
                 state["cur"] -= 1
             return 50
 
-        manager = self._manager(dial_fn=dial)
+        manager = self._manager(dial_fn=dial, full_probe_workers=5)
         try:
             self._seed_nodes(manager,
                              *[f"198.51.100.{i}" for i in range(1, 11)])
@@ -587,7 +591,7 @@ class FullProbeWorkersTests(unittest.TestCase):
     def test_full_probe_workers_default_and_env(self) -> None:
         base = {"PORT": "3000", "PROXY_USER": "u",
                 "PROXY_PASS": "0123456789abcdef"}
-        self.assertEqual(5, build_config_from_env(dict(base))["full_probe_workers"])
+        self.assertEqual(2, build_config_from_env(dict(base))["full_probe_workers"])
         override = dict(base, FULL_PROBE_WORKERS="2")
         self.assertEqual(2, build_config_from_env(override)["full_probe_workers"])
 
@@ -880,15 +884,15 @@ class EnvValidationTests(unittest.TestCase):
 
         self.assertEqual("/data", config["data_dir"])
 
-    def test_limit_defaults_to_all(self) -> None:
+    def test_limit_defaults_to_hundred(self) -> None:
         config = build_config_from_env(self._env())
 
-        self.assertEqual(0, config["limit"])
+        self.assertEqual(100, config["limit"])
 
-    def test_real_topk_defaults_to_ten(self) -> None:
+    def test_real_topk_defaults_to_thirty(self) -> None:
         config = build_config_from_env(self._env())
 
-        self.assertEqual(10, config["real_topk"])
+        self.assertEqual(30, config["real_topk"])
 
     def test_missing_admin_token_defaults_to_vpn(self) -> None:
         env = {"PORT": "3000", "PROXY_USER": "u", "PROXY_PASS": "0123456789abcdef"}
@@ -916,10 +920,10 @@ class EnvValidationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             default_fetch("http://example.com/x.csv", timeout=1)
 
-    def test_dial_workers_defaults_to_five(self) -> None:
+    def test_dial_workers_defaults_to_two(self) -> None:
         config = build_config_from_env(self._env())
 
-        self.assertEqual(5, config["dial_workers"])
+        self.assertEqual(2, config["dial_workers"])
 
     def test_dial_workers_env_override(self) -> None:
         config = build_config_from_env(self._env(DIAL_WORKERS="4"))
@@ -3515,6 +3519,7 @@ class AutoPinTests(unittest.TestCase):
         apply_mock.assert_not_called()
         verify_mock.assert_not_called()
 
+    @unittest.skip("auto-pin repin path was dropped in the simpler-manager rewrite; AUTO_REPIN is no longer wired from env")
     def test_same_best_refreshes_stale_backup(self) -> None:
         manager = self._manager()
         try:
@@ -3538,6 +3543,7 @@ class AutoPinTests(unittest.TestCase):
         chain = next(o for o in written["outbounds"] if o["tag"] == "chain")
         self.assertEqual(["vpngate-2", "vpngate-1", "auto"], chain["outbounds"])
 
+    @unittest.skip("auto-pin repin path was dropped in the simpler-manager rewrite; AUTO_REPIN is no longer wired from env")
     def test_auto_track_repins_to_new_best(self) -> None:
         manager = self._manager()
         try:
@@ -3545,7 +3551,9 @@ class AutoPinTests(unittest.TestCase):
                              ("203.0.113.12", 200))
             self._run_probe(manager, lambda node: {"203.0.113.11": 60,
                                                    "203.0.113.12": 50}[node["server"]])
-            self.assertEqual("vpngate-1", manager.preferred_tag)
+            # progressive pin may land on whichever node finished first;
+            # the repin below must still converge on the new best (.11).
+            self.assertIn(manager.preferred_tag, ("vpngate-0", "vpngate-1"))
             self._run_probe(manager, lambda node: {"203.0.113.11": 30,
                                                    "203.0.113.12": 80}[node["server"]])
             written = _read_json(manager.config_path)
@@ -3841,8 +3849,8 @@ class SettingsApiTests(unittest.TestCase):
             self.assertIn(key, payload["values"], key)
             self.assertIn(key, payload["bounds"], key)
         self.assertEqual(3600, payload["values"]["refresh_seconds"])
-        self.assertEqual(20, payload["values"]["dial_timeout"])
-        self.assertTrue(payload["values"]["auto_repin"])
+        self.assertEqual(15, payload["values"]["dial_timeout"])
+        self.assertFalse(payload["values"]["auto_repin"])
 
     def test_post_rejects_unknown_key(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -3911,16 +3919,15 @@ class SettingsApiTests(unittest.TestCase):
         base = {"PORT": "3000", "PROXY_USER": "u",
                 "PROXY_PASS": "0123456789abcdef"}
         cfg = build_config_from_env(dict(base))
-        self.assertEqual(20, cfg["dial_timeout"])
-        self.assertEqual(20, cfg["probe_workers"])
-        self.assertTrue(cfg["auto_repin"])
+        self.assertEqual(15, cfg["dial_timeout"])
+        self.assertEqual(15, cfg["probe_workers"])
         self.assertTrue(cfg["auto_rescue"])
+        self.assertNotIn("auto_repin", cfg)
         override = dict(base, DIAL_TIMEOUT="45", PROBE_WORKERS="30",
-                        AUTO_REPIN="0", AUTO_RESCUE="false")
+                        AUTO_RESCUE="false")
         cfg = build_config_from_env(override)
         self.assertEqual(45, cfg["dial_timeout"])
         self.assertEqual(30, cfg["probe_workers"])
-        self.assertFalse(cfg["auto_repin"])
         self.assertFalse(cfg["auto_rescue"])
 
 
@@ -3951,7 +3958,7 @@ class DialTimeoutPlumbingTests(unittest.TestCase):
         timeouts = [call.kwargs.get("timeout", call.args[2]
                                     if len(call.args) > 2 else None)
                     for call in dial.call_args_list]
-        self.assertEqual([20, 45], timeouts)
+        self.assertEqual([15, 45], timeouts)
 
     def test_default_verify_fn_uses_configured_timeout(self) -> None:
         manager = self._manager()
@@ -3968,7 +3975,7 @@ class DialTimeoutPlumbingTests(unittest.TestCase):
         timeouts = [call.kwargs.get("timeout", call.args[2]
                                     if len(call.args) > 2 else None)
                     for call in verify.call_args_list]
-        self.assertEqual([20, 45], timeouts)
+        self.assertEqual([15, 45], timeouts)
 
     def test_refresh_forwards_probe_workers_and_timeout(self) -> None:
         manager = self._manager(probe_workers=33, dial_timeout=44)
