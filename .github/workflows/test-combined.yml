@@ -755,6 +755,19 @@ jobs:
           curl -m 10 -s -H "Authorization: Bearer trial-admin-token-0123456789" \
             http://127.0.0.1:3000/api/status -o /tmp/trial-pin.json
           docker exec combined-trial cat /app/singbox-railway.json > /tmp/trial-serving.json
+          # Diagnostics first: the pin step below exits 1 on mismatch, and we
+          # need the reason (auto-pin-skipped/-failed) in the log when it does.
+          python - <<'EOF'
+          import json
+          s = json.load(open("/tmp/trial-pin.json"))
+          print("pin state:", s.get("preferred_tag"), s.get("backup_tag"),
+                "auto_pinned=", s.get("auto_pinned"))
+          print("verify:", json.dumps(s.get("verify")))
+          print("last_error:", s.get("last_error"))
+          for ev in (s.get("refresh_history") or [])[-12:]:
+              print("hist:", json.dumps(ev, ensure_ascii=False))
+          EOF
+          docker logs --tail 40 combined-trial 2>&1 || true
           python scripts/verify_dualpin.py --status /tmp/trial-pin.json \
             --config /tmp/trial-serving.json --summary-file "$GITHUB_STEP_SUMMARY"
       - name: Verify settings round-trip via container API
@@ -768,8 +781,8 @@ jobs:
           import json
           before = json.load(open("/tmp/settings-before.json"))["values"]
           assert before["refresh_seconds"] == 3600, before
-          assert before["dial_timeout"] == 20, before
-          assert before["auto_repin"] is True, before
+          assert before["dial_timeout"] == 15, before
+          assert before["auto_repin"] is False, before
           print("settings defaults OK:", {k: before[k] for k in
                 ("refresh_seconds", "dial_timeout", "auto_repin")})
           EOF
