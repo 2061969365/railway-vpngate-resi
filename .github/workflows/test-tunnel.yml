@@ -114,11 +114,14 @@ jobs:
           wait_host() {
             local log="$1" name="$2"
             for i in $(seq 1 60); do
-              local host
-              host=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$log" | head -n1)
-              if [ -n "$host" ]; then
+              local url host
+              url=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$log" | head -n1)
+              if [ -n "$url" ]; then
+                # Store the bare hostname: callers build the URL and the VLESS
+                # client needs a hostname, not a scheme.
+                host="${url#https://}"
                 echo "$host" > "/tmp/host-${name}.txt"
-                echo "${name} tunnel: $host"
+                echo "${name} tunnel host: $host"
                 return 0
               fi
               sleep 2
