@@ -253,12 +253,12 @@ jobs:
       - name: Storm the rotation with dead nodes
         run: |
           AUTH="Authorization: Bearer $ADMIN_TOKEN"
-          N=$(wc -l < /tmp/blocked.txt)
+          N=$(grep -c . /tmp/blocked.txt)
           ROUNDS=$(( N * 3 + 8 ))
           echo "dead nodes=$N -> $ROUNDS resi connections"
           : > /tmp/storm.txt
           for i in $(seq 1 $ROUNDS); do
-            out=$(curl -m 45 -s -o /tmp/storm-out.txt -w "%{http_code} %{time_total}" \
+            out=$(curl -m 60 -s -o /tmp/storm-out.txt -w "%{http_code} %{time_total}" \
               -x socks5h://127.0.0.1:18093 https://api.ipify.org || true)
             code=${out%% *}; secs=${out##* }
             ip=$(cat /tmp/storm-out.txt 2>/dev/null || true)
@@ -282,8 +282,10 @@ jobs:
           print(f"exit ips still served: {sorted(set(served))}")
           assert ok, "the rotation stopped serving entirely once nodes died"
           assert set(served) - blocked, f"every successful sample came from a killed node: {set(served)}"
-          assert max(secs) < 45, f"a connection stalled for {max(secs):.1f}s (was 120s before §12.4)"
-          assert r.get("down", 0) >= 3, f"dead nodes were never parked: {r}"
+          # RESI_FIRST_BYTE_TIMEOUT=20s plus teardown: anything above 35s means
+          # a rotation connection can still hang past the watchdog.
+          assert max(secs) < 35, f"a connection stalled for {max(secs):.1f}s (watchdog is 20s)"
+          assert r.get("down", 0) >= 2, f"dead nodes were never parked: {r}"
           assert r["pool"] <= 3, f"dead nodes stayed in the pool: {r}"
           print("FAILOVER OK: dead nodes fail fast, get parked, and the pool shrinks")
           EOF

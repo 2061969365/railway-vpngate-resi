@@ -13,7 +13,8 @@ import time
 import unittest
 from unittest import mock
 
-from railway_manager import RESI_NODE_STRIKES_DOWN, RailwayManager, build_config_from_env
+from railway_manager import (RESI_NODE_STRIKES_DOWN, RailwayManager, _pump_pair,
+                             build_config_from_env)
 from vpngate_to_singbox import (DEFAULT_RESI_PORT, RESI_IN_PORT,
                                 RESI_ROTATE_BASE, _collect_rotate_samples,
                                 build_singbox_config, render_resi_username)
@@ -1182,6 +1183,101 @@ class RotateManagerTests(unittest.TestCase):
             self._cleanup(manager)
 
         self.assertEqual(b"node-1", received)
+
+    def test_a_node_that_swallows_the_request_is_struck(self) -> None:
+        # sing-box holds the inbound while its endpoint keeps dial-probing a
+        # dead IP, so the client's bytes go nowhere and nothing ever comes back.
+        manager = self._manager(resi_port=_free_port())
+        try:
+            manager._set_resi_routes([("vpngate-a", RESI_ROTATE_BASE)])
+            manager._resi_note_connection("vpngate-a", 700, 0, 21.0, False,
+                                          first_byte_stalled=True)
+            strikes = (manager._resi_health.get("vpngate-a") or {}).get("strikes")
+        finally:
+            manager.stop()
+            self._cleanup(manager)
+
+        self.assertEqual(1, strikes)
+
+    def test_the_pump_gives_a_silent_node_only_the_first_byte_budget(self) -> None:
+        # No closure from either side: the watchdog must end the connection once
+        # the client's bytes have been unanswered for the budget (20s in prod,
+        # 0.4s here), instead of waiting out PIPE_IDLE_TIMEOUT.
+        client, client_peer = socket.socketpair()
+        backend, backend_peer = socket.socketpair()
+        client.settimeout(120)
+        backend.settimeout(120)
+        result: dict = {}
+        started = time.monotonic()
+
+        def run() -> None:
+            result.update(_pump_pair(client, backend, started))
+
+        worker = threading.Thread(target=run, daemon=True)
+        closed_after = 0.0
+        try:
+            with mock.patch("railway_manager.RESI_FIRST_BYTE_TIMEOUT", 0.4):
+                worker.start()
+                client_peer.sendall(b"GET / HTTP/1.1\r\n\r\n")
+                # The client sees the connection die when the watchdog fires.
+                client_peer.settimeout(6)
+                self.assertEqual(b"", client_peer.recv(64))
+                closed_after = time.monotonic() - started
+                worker.join(timeout=12)
+        finally:
+            for sock in (client, client_peer, backend, backend_peer):
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(result.get("first_byte_stalled"), result)
+        self.assertEqual(18, result.get("up"))
+        self.assertEqual(0, result.get("down"))
+        self.assertLess(closed_after, 4.0)
+
+    def test_a_node_that_answered_is_not_struck_for_a_stall(self) -> None:
+        manager = self._manager(resi_port=_free_port())
+        try:
+            manager._set_resi_routes([("vpngate-a", RESI_ROTATE_BASE)])
+            # It stalled, but it did answer eventually: payload wins.
+            manager._resi_note_connection("vpngate-a", 700, 4096, 25.0, False,
+                                          first_byte_stalled=True)
+            health = dict(manager._resi_health.get("vpngate-a") or {})
+        finally:
+            manager.stop()
+            self._cleanup(manager)
+
+        self.assertEqual(0, health.get("strikes", 0))
+
+    def test_a_failed_handshake_replay_still_closes_the_backend(self) -> None:
+        # The handshake replay happens before the pump. If the node has already
+        # dropped the loopback connection, sendall raises - and the backend must
+        # still be closed, otherwise every bad node leaks one descriptor and the
+        # manager dies after a few hundred rotations.
+        manager = self._manager(resi_port=_free_port())
+        backend = mock.Mock()
+        backend.sendall.side_effect = OSError("replay failed")
+        client, peer = socket.socketpair()
+        worker = threading.Thread(target=manager._handle_resi_client,
+                                  args=(client, b"GET /ws-resi HTTP/1.1\r\n\r\n"),
+                                  daemon=True)
+        try:
+            manager._set_resi_routes([("vpngate-a", RESI_ROTATE_BASE)])
+            with mock.patch("railway_manager.socket.create_connection",
+                            return_value=backend):
+                worker.start()
+                worker.join(timeout=5)
+            inflight = manager._mux_inflight
+        finally:
+            peer.close()
+            manager.stop()
+            self._cleanup(manager)
+
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(backend.close.called)
+        self.assertEqual(0, inflight)
         self.assertFalse(worker.is_alive())
 
 

@@ -59,6 +59,13 @@ RESI_PAYLOAD_BYTES = 1024
 # Longer than this the node plausibly held an idle tunnel (keepalive reaping
 # closes idle NAT mappings), so it must not feed the strike counter.
 RESI_FAIL_MAX_SECONDS = 30.0
+# A node that takes the client's bytes but returns none for this long is dead to
+# us, even if it never closes: sing-box holds the inbound connection while its
+# endpoint keeps dial-probing an IP that RSTs or blackholes, so without this the
+# client waits out the whole PIPE_IDLE_TIMEOUT (120s) and calls it "卡死".
+# 20s is above the endpoint dial-probe warm-up (~5s) and below a human's
+# patience; a rotation target that needs 20s to its first byte is not usable.
+RESI_FIRST_BYTE_TIMEOUT = 20.0
 SETTINGS_SPEC: dict = {
     "refresh_seconds": {"type": "int", "min": 300, "max": 86400},
     "dial_timeout": {"type": "int", "min": 5, "max": 60},
@@ -1662,8 +1669,15 @@ def _pump_pair(a: socket.socket, b: socket.socket, started: float) -> dict:
     whole idle timeout whenever the *upstream* dropped the connection first -
     which is exactly what a dead VPNGate node does, so a dead node looked like
     a stall instead of a fast failure the client could retry.
+
+    It also enforces a first-byte deadline: sing-box holds an inbound
+    connection while the endpoint is "not ready yet" (dial-probe still trying a
+    dead IP), so a node can swallow the client's request and answer nothing for
+    a minute or more. Once the client has sent bytes and the node has returned
+    none for RESI_FIRST_BYTE_TIMEOUT, the node is dead to us.
     """
     up = [0]; down = [0]; ended = [0.0, 0.0]; timed_out = [False, False]
+    first_byte_stalled = [False]
     events = [threading.Event(), threading.Event()]
     def _run(src, dst, sink, slot: int) -> None:
         try:
@@ -1674,12 +1688,20 @@ def _pump_pair(a: socket.socket, b: socket.socket, started: float) -> dict:
     second = threading.Thread(target=_run, args=(b, a, down, 1), daemon=True)
     first.start(); second.start()
     deadline = started + PIPE_IDLE_TIMEOUT + 5
+    first_byte_deadline = started + RESI_FIRST_BYTE_TIMEOUT
     while not (events[0].is_set() or events[1].is_set()):
-        if time.monotonic() > deadline:
+        now = time.monotonic()
+        if now > deadline:
+            break
+        if now > first_byte_deadline and up[0] > 0 and down[0] == 0:
+            first_byte_stalled[0] = True
             break
         time.sleep(0.05)
-    finished = 0 if events[0].is_set() else 1
-    events[1 - finished].wait(timeout=1.0)  # flush grace for the surviving side
+    if events[0].is_set() or events[1].is_set():
+        # Flush grace for the direction that is still draining; a watchdog
+        # teardown has nothing to drain, so it must not wait at all.
+        finished = 0 if events[0].is_set() else 1
+        events[1 - finished].wait(timeout=1.0)
     for sock in (a, b):
         try:
             sock.shutdown(socket.SHUT_RDWR)
@@ -1698,6 +1720,7 @@ def _pump_pair(a: socket.socket, b: socket.socket, started: float) -> dict:
     return {"up": up[0], "down": down[0], "ended": ended,
             "upstream_first": bool(ended[0] and ended[1] and ended[0] <= ended[1]),
             "timed_out": timed_out,
+            "first_byte_stalled": first_byte_stalled[0],
             "elapsed": max(0.0, time.monotonic() - started)}
 def _reap_process(proc, handle=None) -> None:
     if proc is not None:
@@ -3301,16 +3324,20 @@ class RailwayManager:
 
     def _resi_note_connection(self, tag: str, up_bytes: int, down_bytes: int,
                               elapsed: float, backend_closed_first: bool,
-                              down_idle: bool = False) -> None:
+                              down_idle: bool = False,
+                              first_byte_stalled: bool = False) -> None:
         """Passive health check on real traffic.
 
         A healthy node either carried payload or kept the connection open; a
         dead one drops us quickly after only the local WS/VLESS handshake.
         Client-initiated closes never count (that would punish idle clients),
         and a connection that lived past RESI_FAIL_MAX_SECONDS counts as
-        healthy: that is an idle-NAT close, not a dead node. The one exception
-        is a *node side* that stayed silent for the whole idle window
-        (``down_idle``): it carried nothing for two minutes, so it is dead.
+        healthy: that is an idle-NAT close, not a dead node. Two exceptions are
+        still dead nodes: a *node side* that stayed silent for the whole idle
+        window (``down_idle``), and a node that swallowed the client's bytes
+        without returning a single one for RESI_FIRST_BYTE_TIMEOUT
+        (``first_byte_stalled`` - sing-box holding the connection while its
+        endpoint dial-probes a dead IP).
         """
         payload = down_bytes >= RESI_PAYLOAD_BYTES
         if payload:
@@ -3319,6 +3346,9 @@ class RailwayManager:
             return
         if up_bytes <= 0:
             self._resi_mark_ok(tag)
+            return
+        if first_byte_stalled:
+            self._resi_mark_fail(tag)
             return
         if down_idle or (backend_closed_first and elapsed < RESI_FAIL_MAX_SECONDS):
             self._resi_mark_fail(tag)
@@ -3360,20 +3390,24 @@ class RailwayManager:
                 return
             client.settimeout(PIPE_IDLE_TIMEOUT)
             backend.settimeout(PIPE_IDLE_TIMEOUT)
-            if prefix:
-                # Bytes already consumed by the mux (the VLESS+WS handshake):
-                # replay them to the loopback inbound so nothing is lost.
-                backend.sendall(prefix)
             with self._lock:
                 self._mux_inflight += 1
                 self.status["traffic"]["connections"] += 1
-            started = time.monotonic()
             try:
+                if prefix:
+                    # Bytes already consumed by the mux (the VLESS+WS handshake):
+                    # replay them to the loopback inbound so nothing is lost.
+                    backend.sendall(prefix)
+                started = time.monotonic()
                 stats = _pump_pair(client, backend, started)
                 with self._lock:
                     self.status["traffic"]["bytes_up"] += stats["up"] + len(prefix)
                     self.status["traffic"]["bytes_down"] += stats["down"]
             finally:
+                # The close lives in the same try as the replay: a looping
+                # rotation hits this path on every bad node, so a socket left
+                # open here is a file-descriptor leak that eventually takes the
+                # whole manager down.
                 try:
                     backend.close()
                 except OSError:
@@ -3390,7 +3424,8 @@ class RailwayManager:
                 self._resi_note_connection(
                     tag, stats["up"] + len(prefix), stats["down"],
                     stats["elapsed"], not stats["upstream_first"],
-                    down_idle=bool(stats.get("timed_out", [False, False])[1]))
+                    down_idle=bool(stats.get("timed_out", [False, False])[1]),
+                    first_byte_stalled=bool(stats.get("first_byte_stalled")))
             if held:
                 try:
                     self._mux_slots.release()

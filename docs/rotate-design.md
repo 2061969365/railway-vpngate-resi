@@ -323,13 +323,21 @@ UUID 保护的公开端点，不是 API），并把 mux 已经读到的握手字
     立即算健康并清零 strikes。
   - 另一种死法：节点侧**整整 120 秒一个字节都没下行**（`PIPE_IDLE_TIMEOUT` 空闲超时，
     `down_idle`）——这不算"活得久"，记一次失败，避免客户端被按在死节点上两分钟。
+  - 第三种死法（云端实测才发现）：节点**吃掉了客户端的请求但一个字节都不回**，也
+    **不主动关**。sing-box 在 endpoint "not ready yet" 时会 hold 住入站连接、后台继续
+    dial-probe 一个 RST/黑洞的 IP，这条连接既不下行也不结束，于是上面的三条规则全都不
+    触发（没关、没满 120 秒、下行 0 但不算 payload）。加了**首字节预算**
+    `RESI_FIRST_BYTE_TIMEOUT = 20s`：客户端已经写过字节、节点 20 秒内没有任何下行 ⇒
+    看门狗砍连接 + 记一次失败。20 秒是在 endpoint dial-probe 预热（约 5 秒）之上留的余量。
 - 证据：`test_a_failing_node_is_parked_then_returns`（3 次 → 只剩另一个；窗口过期 →
   回池；成功一次 → 计数清零）、`test_client_side_closes_never_count_as_strikes`、
   `test_an_all_parked_pool_still_serves_the_least_recent_failure`、
   `test_a_fast_node_drop_is_counted_as_a_strike`（真 socket 拨号，节点 accept 后立刻关）、
   `test_a_slow_node_side_failure_also_counts_as_a_strike`（10 秒后才关也算失败）、
   `test_a_long_idle_close_is_not_a_strike`（45 秒空闲关闭不算失败）、
-  `test_a_silent_node_side_strikes_even_after_the_idle_window`。
+  `test_a_silent_node_side_strikes_even_after_the_idle_window`、
+  `test_a_node_that_swallows_the_request_is_struck`、
+  `test_a_node_that_answered_is_not_struck_for_a_stall`（回过了就来算 payload，不误杀）。
 
 ### 12.4 D4：上游先死时挂满 120 秒（"卡死在那里"的直接原因）
 
@@ -340,12 +348,17 @@ UUID 保护的公开端点，不是 API），并把 mux 已经读到的握手字
   连接就能让第三路整体"假死"。
 - 修法：新增 `_pump_pair(a, b, started)`：
   - 任一方向结束 ⇒ 立刻拆另一端（`shutdown(SHUT_RDWR)`），不再等另一个方向；
-  - 之前保留的 1 秒 flush 宽限保留，避免截断紧跟数据的 close 帧；
+  - 两个方向都没结束时，看门狗按 `RESI_FIRST_BYTE_TIMEOUT` 结束"只有上行、没有下行"
+    的连接（见 §12.3 第三种死法），并把这种情形标成 `first_byte_stalled` 交给健康表；
+  - 有结束事件时才保留 1 秒 flush 宽限（避免截断紧跟数据的 close 帧）；看门狗路径
+    没有东西可 flush，立刻拆；
   - 有界 join（2s），极端平台（`shutdown` 唤不醒阻塞 `recv`）再补一次 close 兜底，
     不泄漏线程。
-  - 返回值带 `upstream_first`，供健康表判断"是不是节点先关的"。
+  - 返回值带 `upstream_first` / `timed_out` / `first_byte_stalled` / `elapsed`，
+    供健康表判断"是不是节点先关的"。
 - 证据：`test_node_close_tears_the_connection_down_at_once`（节点 0.2s 后关闭，客户端
-  < 4s 收到 EOF，线程不残留）。
+  < 4s 收到 EOF，线程不残留）、`test_the_pump_gives_a_silent_node_only_the_first_byte_budget`
+  （节点收下字节但不回也不关，客户端在预算内收到 EOF）。
 
 ### 12.5 D5：配置顺序跟着延迟排名走 ⇒ 每次探针都"看起来变了"
 
@@ -390,10 +403,11 @@ UUID 保护的公开端点，不是 API），并把 mux 已经读到的握手字
 1. **健康/池子决策不得写配置文件、不得重启 sing-box**（`/ws-resi` 的抖动不能影响
    前两路）。回归测试：`test_probe_results_do_not_rewrite_the_config`。
 2. **池成员 = 真拨通过 且 未 park**；没有"猜一个"的兜底。
-3. **任一方向的连接结束 ⇒ 另一方向在 5 秒内拆掉**（不得挂到 `PIPE_IDLE_TIMEOUT`）。
+3. **任一方向的连接结束 ⇒ 另一方向在 5 秒内拆掉**（不得挂到 `PIPE_IDLE_TIMEOUT`）；
+   **只有上行没有下行时，`RESI_FIRST_BYTE_TIMEOUT` 内必须砍掉**。
 4. **配置稳定**：同样的节点集合 → 同样的 JSON 字节（顺序按 tag，不带延迟字段）。
 
-### 12.10 测试矩阵（`tests/test_resi.py`，72 项全绿）
+### 12.10 测试矩阵（`tests/test_resi.py`，76 项全绿）
 
 | 场景 | 测试 |
 |---|---|
@@ -410,6 +424,9 @@ UUID 保护的公开端点，不是 API），并把 mux 已经读到的握手字
 | 慢失败（拨号黑洞十几秒）也算 | `test_a_slow_node_side_failure_also_counts_as_a_strike` |
 | 长时间空闲后关闭不算失败 | `test_a_long_idle_close_is_not_a_strike` |
 | 节点侧 120 秒无下行算失败 | `test_a_silent_node_side_strikes_even_after_the_idle_window` |
+| 节点吞下请求不回也不关 → 首字节预算砍连接 + 记失败 | `test_a_node_that_swallows_the_request_is_struck`、`test_the_pump_gives_a_silent_node_only_the_first_byte_budget` |
+| 回过了就不算 stall | `test_a_node_that_answered_is_not_struck_for_a_stall` |
+| 握手重放失败也不漏 backend socket | `test_a_failed_handshake_replay_still_closes_the_backend` |
 | 拨号失败自动换下一个 | `test_backend_dial_failure_steps_to_the_next_node` |
 | 真连接 round-robin | `test_balancer_round_robins_real_connections` |
 
@@ -428,7 +445,7 @@ route rules: 100 {'inbound': 'resi-rot-0', 'outbound': 'vpngate-0'} ... 'resi-ro
   同一连接上的所有目标复用同一条出站。要按请求轮换，得在最前面挂一个真正的
   socks/http 代理（第三路原本的设计），代价见 §2/§7。客户端多开连接即可获得轮换。
 - **出口是 VPNGate 的机房 IP**，不是住宅 IP；文案统一写「轮换出口」。
-- **park 阈值是启发式的**：3 次 + 30 秒 + 1KB 的规则来自线上样本，真正误判也需要 3 次
+- **park 阈值是启发式的**：3 次 + 30 秒 + 1KB(+20 秒首字节) 的规则来自线上样本，真正误判也需要 3 次
   连续快速失败，且 2 分钟后自动重试，不会永久拉黑。
 - 峰值并发仍受 `MAX_CONCURRENT_DIALS=10` 限制：这是 1 进程 400 连接场景下的保护，
   第三路的重连风暴不会把 sing-box 拖死（代价是并发拨号排队）。
@@ -443,7 +460,8 @@ route rules: 100 {'inbound': 'resi-rot-0', 'outbound': 'vpngate-0'} ... 'resi-ro
    `vpngate-7 parked for 120s after 3 fast failures`。
 4. 该时段**不应**出现 sing-box 重启 / 配置写入：容器日志里没有新的
    `wrote config`、`sing-box restarted`，前两路的现有连接不掉。
-5. 客户端体感：撞到坏节点应在 1~2 秒内失败（被 REJECT/RST 的情况）或最迟十几秒
-   （拨号黑洞），**不再是 120 秒**；重试即落到健康节点。
+5. 客户端体感：撞到坏节点应在 1~2 秒内失败（被 REJECT/RST 的情况）或最迟二十几秒
+   （节点吞包不回，撞 `RESI_FIRST_BYTE_TIMEOUT=20s` 看门狗），**不再是 120 秒**；
+   重试即落到健康节点。
 6. 每小时的全量真拨把死掉的节点写成 `real_latency_ms=null`，它们会**自动退出池子**
    且不触发重启——面板上 `pool` 会掉、`inbounds` 不变。
