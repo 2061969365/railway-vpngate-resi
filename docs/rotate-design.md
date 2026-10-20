@@ -428,6 +428,56 @@ UUID 保护的公开端点，不是 API），并把 mux 已经读到的握手字
   `test_rotate_mode_never_unpins_a_dead_chain_node`。
 - 边界：pin 本身变化（rescue/refresh）仍会重启 sing-box，见 D6；这不是本条的回归。
 
+### 12.9b D10：pin 只做 TCP 握手检查 ⇒ 隧道死了也永远不换（"失效了也不会换节点，就一直卡死"）
+
+- 症状（云端验收 run 39438409070）：基线阶段 `/ws-chain` 连续 8 分钟拿不到出口 IP，
+  容器日志里 `pin: vpngate-0 backup: vpngate-2 auto_pinned: True`，但**没有任何**
+  rescue/switch 记录，`last_error: None`。第三路同一时刻 `inbounds=16`、轮换有连接。
+- 根因：`check_pinned_health()` 对 pin 只做 `probe_tcp_latency(节点 host, port)`。
+  VPNGate 节点**接受 TCP 握手完全正常**，但 OpenVPN 会话可能已被踢掉/已被
+  `auth-retry none` 判死（见 D9 的 duplicate-cn）。于是健康检查永远返回 `pinned`，
+  rotate 模式又刻意**永不 unpin**（D9 的修法），两个"正确"的决定叠加 = chain 永久死锁。
+  用户的体感正是"失效了也不会换节点"。
+- 修法：rotate 模式下给 pin 增加**端到端**判活，而不是只看握手：
+  - `_chain_probe_ok()` 通过**自己的 mux** 拨一次 `/ws-chain` 并取出口 IP（复用
+    `measure_resi_rotate`，走的是 chain 已持有的那条会话，不会新建 VPNGate 会话，
+    也就不触发 duplicate-cn）。
+  - 连续 `CHAIN_FAIL_THRESHOLD=2` 轮（约 40 秒，健康循环 20 秒一次）失败 ⇒
+    `_rescue_chain()`：只在**真拨验证过**（`real_latency_ms is not None`）且不是当前
+    pin/backup 的节点里挑最快的一个重新钉住；**仍然不 unpin**（unpin 会把 chain 交给
+    urltest，D9 复现）。
+  - 防抖：rescue 有 45 秒起步、逐次翻倍的冷却（上限 300 秒）；没有已验证的备选时只记
+    `chain-rescue-skipped` 不折腾；每次 `_apply_config` 成功后清空失败计数（重启后首个
+    探测是跟 endpoint 起来赛跑，不该算数）。日志与状态历史里分别是
+    `chain rescue: ...`、`chain-rescue` / `chain-rescue-skipped`。
+- 代价：pin 换人必须重写配置并重启 sing-box（D6 的边界），所以一次 chain rescue 会掉
+  三条路的既有连接——但这是"死锁 8 分钟"与"重连一次"之间的选择，且冷却把频率压到
+  最多一次/45 秒、失败备选不存在时为零。
+- 证据：`test_rotate_mode_rescues_a_tcp_alive_but_tunnel_dead_pin`、
+  `test_rotate_mode_keeps_the_pin_while_the_chain_carries_traffic`、
+  `test_chain_rescue_without_an_alternative_keeps_the_pin`。
+
+### 12.9c D11：出口 IP 检查只认一个站点 ⇒ 好节点被判死、pin 永远验证不过
+
+- 症状（本机复现 + 云端 run 39438409070）：同一台机器上，经隧道访问
+  `https://www.gstatic.com/generate_204`、`https://icanhazip.com`、
+  `https://ifconfig.me/ip`、`https://cloudflare.com/cdn-cgi/trace` 全部正常，唯独
+  `https://api.ipify.org` 在隧道里 100% 超时（直连却正常）。而 `measure_exit_ip()` /
+  `measure_resi_rotate()` 只认 `api.ipify.org`。
+- 后果有三层，全都是用户抱怨的那些现象：
+  1. 全量真拨里能用的节点被写成 `real_latency_ms=None` ⇒ **池子凭空变小**
+     （云端 run 39438409070 池子只有 6/16）；
+  2. `_auto_pin_best()` 的 exit 验证对每个候选都失败 ⇒ pin 退化成"未验证钉住"
+     ⇒ chain 钉在一个谁都没验证过的节点上；
+  3. 面板/探针显示 `no serving endpoint answered`，而真实客户端可能正在轮换成功。
+- 修法：`EXIT_IP_TARGETS` + `_fetch_exit_ip()` 顺序回退
+  （ipify → icanhazip → ifconfig.me → ipinfo → cloudflare trace，支持 `ip=` 形式），
+  整个回退链共用调用方给的时间预算（单站点最多 6 秒），所以不会把"一个站点挂起"
+  放大成 5 倍超时。全部退出检查点（`measure_exit_ip`、`_resi_probe_run`、
+  `measure_resi_rotate`）都改走这个函数。
+- 证据：`ExitIpFallbackTests`（纯文本/`ip=`/HTML 解析、首个站点失败后换站点、
+  全挂时返回 None）。
+
 ### 12.10 不变量（后续改动必须守住）
 
 1. **健康/池子决策不得写配置文件、不得重启 sing-box**（`/ws-resi` 的抖动不能影响
@@ -440,6 +490,12 @@ UUID 保护的公开端点，不是 API），并把 mux 已经读到的握手字
    否则 VPNGate 的单会话限制会让 chain 静默失效。
 6. **轮换模式下 chain 永不 unpin**：unpinned 的 chain 会用轮换正在拨的 endpoint，
    等于把 D9 重新打开。
+7. **pin 的判活必须是端到端的**：TCP 握手通过 ≠ 隧道能用。rotate 模式必须周期性从
+   `/ws-chain` 真的取一次出口 IP，连续两轮失败才换人（D10）。
+8. **换 pin 只能换成真拨验证过的节点**，且必须带冷却/倍数退避；没有备选就保持原 pin
+   并记录 `chain-rescue-skipped`，不得为了"看起来在动"而空转重启（D10）。
+9. **退出 IP 检查不得只依赖一个站点**：任一站点的地域/网络差异都不能让好节点被判死
+   （D11）。
 
 ### 12.11 测试矩阵（`tests/test_resi.py`，79 项全绿）
 
@@ -464,8 +520,12 @@ UUID 保护的公开端点，不是 API），并把 mux 已经读到的握手字
 | chain 的节点不参与轮换 | `test_the_chain_nodes_stay_out_of_the_rotation`、`test_an_unpinned_node_returns_to_the_rotation`、`test_a_pool_that_only_holds_the_chain_node_is_empty` |
 | 轮换模式永远留 pin（无 exit 探测也钉） | `test_rotate_mode_never_leaves_the_chain_unpinned` |
 | 轮换模式不把死 pin 丢给 urltest | `test_rotate_mode_never_unpins_a_dead_chain_node` |
-| 环回入站被拒不算节点失败 | `test_a_refused_loopback_dial_never_strikes_the_node` |
-| 拨号失败自动换下一个 | `test_backend_dial_failure_steps_to_the_next_node` |
+| TCP 通但隧道死的 pin → 换到下一个已验证节点 | `test_rotate_mode_rescues_a_tcp_alive_but_tunnel_dead_pin` |
+| 隧道在跑就绝不动 pin、不重写配置 | `test_rotate_mode_keeps_the_pin_while_the_chain_carries_traffic` |
+| 没有已验证备选 → 保持 pin、只记 skipped、不空转 | `test_chain_rescue_without_an_alternative_keeps_the_pin` |
+| 出口 IP 检查多站点回退（解析 + 失败切换） | `ExitIpFallbackTests`（`tests/test_vpngate_to_singbox.py`） |
+| rotate 自探针必须打 mux 的 `$PORT`，不是 `RESI_PORT` | `test_probe_goes_through_the_listener` |
+| 环回入站被拒不算节点失败 | `test_a_refused_loopback_dial_never_strikes_the_node` || 拨号失败自动换下一个 | `test_backend_dial_failure_steps_to_the_next_node` |
 | 真连接 round-robin | `test_balancer_round_robins_real_connections` |
 
 另外用真 sing-box 1.14.0 校验了 100 节点静态入站的配置（不是 mock）：

@@ -441,6 +441,59 @@ def _looks_like_ipv4(text: bytes) -> bool:
     return text.count(b".") == 3
 
 
+# Exit-IP echo services, tried in order. One hardcoded service is one more
+# thing that can be unreachable from a given VPNGate node: the same node can
+# serve gstatic fine and still hang on api.ipify.org (measured locally: the
+# direct path reached gstatic/cloudflare/icanhazip while ipify timed out).
+# Treating that as "no exit ip" dropped usable nodes from the rotation pool
+# and left the chain pinned to a node nobody could verify.
+EXIT_IP_TARGETS = (
+    ("api.ipify.org", 443, "/?format=text"),
+    ("icanhazip.com", 443, "/"),
+    ("ifconfig.me", 443, "/ip"),
+    ("ipinfo.io", 443, "/ip"),
+    ("cloudflare.com", 443, "/cdn-cgi/trace"),
+)
+
+
+def _parse_exit_ip(body: bytes) -> str | None:
+    """Pull an IPv4 out of a plain ("1.2.3.4") or keyed ("ip=1.2.3.4") body."""
+    if _looks_like_ipv4(body):
+        return body.decode("ascii").strip()
+    for line in body.decode("ascii", errors="ignore").splitlines():
+        line = line.strip()
+        if line.startswith("ip="):
+            candidate = line[3:].strip()
+            try:
+                socket.inet_aton(candidate)
+            except OSError:
+                return None
+            return candidate
+    return None
+
+
+def _fetch_exit_ip(proxy_host: str, proxy_port: int, timeout: float = 20) -> tuple | None:
+    """One exit IP through the SOCKS5 proxy; (200, ip, ms) or None.
+
+    Same shape as _socks5_get_text so call sites only swap the function.
+    The whole fallback chain shares one `timeout` budget: a hanging first
+    service must not eat the caller's deadline five times over.
+    """
+    deadline = time.monotonic() + max(2.0, float(timeout))
+    for host, port, path in EXIT_IP_TARGETS:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        fetched = _socks5_get_text(proxy_host, proxy_port, host, port, path,
+                                   timeout=min(remaining, 6.0))
+        if fetched is None or fetched[0] != 200:
+            continue
+        ip = _parse_exit_ip(fetched[1])
+        if ip:
+            return (fetched[0], ip.encode("ascii"), fetched[2])
+    return None
+
+
 def _free_port() -> int:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
@@ -594,9 +647,8 @@ def measure_exit_ip(endpoint: dict, singbox_bin: str = "sing-box",
             deadline = time.monotonic() + timeout
             while time.monotonic() < deadline:
                 remaining = deadline - time.monotonic()
-                fetched = _socks5_get_text(
-                    "127.0.0.1", port, "api.ipify.org", 443, "/?format=text",
-                    timeout=min(10, max(1, remaining)))
+                fetched = _fetch_exit_ip("127.0.0.1", port,
+                                         timeout=min(10, max(1, remaining)))
                 if (fetched is not None and fetched[0] == 200
                         and _looks_like_ipv4(fetched[1])):
                     return (fetched[1].decode("ascii").strip(), fetched[2])
@@ -694,9 +746,8 @@ def _resi_probe_run(resi: dict, count: int, singbox_bin: str, timeout: int,
         errors: list[str] = []
         while time.monotonic() < deadline and not ips:
             remaining = deadline - time.monotonic()
-            fetched = _socks5_get_text(
-                "127.0.0.1", port, "api.ipify.org", 443, "/?format=text",
-                timeout=min(10, max(1, remaining)))
+            fetched = _fetch_exit_ip("127.0.0.1", port,
+                                     timeout=min(10, max(1, remaining)))
             if (fetched is not None and fetched[0] == 200
                     and _looks_like_ipv4(fetched[1])):
                 ips.append(fetched[1].decode("ascii").strip())
@@ -708,8 +759,7 @@ def _resi_probe_run(resi: dict, count: int, singbox_bin: str, timeout: int,
             time.sleep(poll_interval)
         total_deadline = deadline + (count - 1) * 15
         while ips and len(ips) < count and time.monotonic() < total_deadline:
-            fetched = _socks5_get_text("127.0.0.1", port, "api.ipify.org", 443,
-                                       "/?format=text", timeout=15)
+            fetched = _fetch_exit_ip("127.0.0.1", port, timeout=15)
             if (fetched is not None and fetched[0] == 200
                     and _looks_like_ipv4(fetched[1])):
                 ips.append(fetched[1].decode("ascii").strip())
@@ -862,9 +912,8 @@ def measure_resi_rotate(vless_uuid: str, port: int, path: str, count: int = 3,
         errors: list[str] = []
         while time.monotonic() < deadline and not ips:
             remaining = deadline - time.monotonic()
-            fetched = _socks5_get_text(
-                "127.0.0.1", listen_port, "api.ipify.org", 443, "/?format=text",
-                timeout=min(10, max(1, remaining)))
+            fetched = _fetch_exit_ip("127.0.0.1", listen_port,
+                                     timeout=min(10, max(1, remaining)))
             if (fetched is not None and fetched[0] == 200
                     and _looks_like_ipv4(fetched[1])):
                 ips.append(fetched[1].decode("ascii").strip())
@@ -879,9 +928,8 @@ def measure_resi_rotate(vless_uuid: str, port: int, path: str, count: int = 3,
         total_deadline = deadline + count * 15
         def _fetch():
             remaining = total_deadline - time.monotonic()
-            return _socks5_get_text("127.0.0.1", listen_port, "api.ipify.org",
-                                    443, "/?format=text",
-                                    timeout=int(min(15, max(1, remaining))))
+            return _fetch_exit_ip("127.0.0.1", listen_port,
+                                  timeout=int(min(15, max(1, remaining))))
         more_ips, more_stamps, more_errors = _collect_rotate_samples(
             _fetch, count - 1, total_deadline)
         ips += more_ips

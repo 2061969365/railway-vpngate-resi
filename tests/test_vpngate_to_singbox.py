@@ -8,6 +8,8 @@ from pathlib import Path
 from unittest import mock
 
 from vpngate_to_singbox import (
+    _fetch_exit_ip,
+    _parse_exit_ip,
     build_singbox_config,
     nodes_to_endpoints,
     ovpn_to_endpoint,
@@ -880,6 +882,46 @@ class DualPinConfigTests(unittest.TestCase):
 
         chain = next(o for o in cfg["outbounds"] if o["tag"] == "chain")
         self.assertEqual(["vpngate-0", "auto"], chain["outbounds"])
+
+
+class ExitIpFallbackTests(unittest.TestCase):
+    """One unreachable IP-echo service must not condemn a node.
+
+    A node that serves gstatic can still hang on api.ipify.org; treating that
+    as "no exit ip" dropped usable nodes from the rotation pool and left the
+    chain pinned to a node nothing could verify.
+    """
+
+    def test_plain_body_is_an_exit_ip(self) -> None:
+        self.assertEqual("203.0.113.7", _parse_exit_ip(b"203.0.113.7\n"))
+
+    def test_keyed_body_is_parsed(self) -> None:
+        body = b"fl=abc\nh=cloudflare.com\nip=203.0.113.7\nts=1\n"
+        self.assertEqual("203.0.113.7", _parse_exit_ip(body))
+
+    def test_html_or_error_body_is_rejected(self) -> None:
+        self.assertIsNone(_parse_exit_ip(b"<html>blocked</html>"))
+        self.assertIsNone(_parse_exit_ip(b"ip=not-an-ip"))
+
+    def test_first_unreachable_service_falls_through_to_the_next(self) -> None:
+        replies = [None, (200, b"203.0.113.7\n", 42)]
+
+        with mock.patch("vpngate_to_singbox._socks5_get_text",
+                        side_effect=replies) as fetch:
+            got = _fetch_exit_ip("127.0.0.1", 40000, timeout=5)
+
+        self.assertEqual((200, b"203.0.113.7", 42), got)
+        self.assertEqual(2, fetch.call_count)
+        # The retry used a different service, not the same one twice.
+        hosts = [call.args[2] for call in fetch.call_args_list]
+        self.assertEqual(len(set(hosts)), 2)
+
+    def test_all_services_unreachable_returns_none(self) -> None:
+        with mock.patch("vpngate_to_singbox._socks5_get_text", return_value=None) as fetch:
+            got = _fetch_exit_ip("127.0.0.1", 40000, timeout=3)
+
+        self.assertIsNone(got)
+        self.assertGreater(fetch.call_count, 1)
 
 
 if __name__ == "__main__":

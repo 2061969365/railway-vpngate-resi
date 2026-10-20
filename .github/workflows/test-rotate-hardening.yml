@@ -192,31 +192,42 @@ jobs:
           done
           sleep 12
 
+          # An exit that cannot reach api.ipify.org is not necessarily broken:
+          # a node can carry gstatic/icanhazip fine and still hang on ipify
+          # (measured locally), so a single echo service must not condemn a path.
+          ip_via() {
+            local port="$1" url ip
+            for url in https://api.ipify.org https://icanhazip.com https://ifconfig.me/ip; do
+              ip=$(curl -m 30 -s -x "socks5h://127.0.0.1:${port}" "$url" || true)
+              [ -n "$ip" ] && { echo "$ip"; return 0; }
+            done
+            echo ""
+          }
           get_ip() {
             local port="$1"
             for i in $(seq 1 15); do
-              ip=$(curl -m 60 -s -x "socks5h://127.0.0.1:${port}" https://api.ipify.org || true)
+              ip=$(ip_via "$port")
               [ -n "$ip" ] && { echo "$ip"; return 0; }
               sleep 6
             done
             echo ""
           }
           echo "node exit=$(get_ip 18091)" >> /tmp/baseline.txt
-          # The chain path pins one VPNGate node. If that node happens to die right
-          # now, the service rescues to another one after ~3 health rounds, but the
-          # rescue restarts sing-box, so give it two full retry rounds before
-          # declaring the second path dead.
+          # The chain path pins one VPNGate node. If that node's tunnel is dead
+          # right now, the service rescues to another verified node after two
+          # failing exit probes (~40s) and the rescue restarts sing-box, so give
+          # it several full retry rounds before calling the second path dead.
           chain_ip=""
-          for round in 1 2; do
+          for round in 1 2 3 4; do
             chain_ip=$(get_ip 18092)
             [ -n "$chain_ip" ] && break
-            echo "chain empty in round ${round}, waiting for auto-rescue"
-            sleep 15
+            echo "chain empty in round ${round}, waiting for chain rescue"
+            sleep 20
           done
           echo "chain exit=${chain_ip}" >> /tmp/baseline.txt
           : > /tmp/resi-ips.txt
           for i in $(seq 1 10); do
-            ip=$(curl -m 60 -s -x socks5h://127.0.0.1:18093 https://api.ipify.org || true)
+            ip=$(ip_via 18093)
             [ -n "$ip" ] && echo "$ip" >> /tmp/resi-ips.txt
             samples=$(wc -l < /tmp/resi-ips.txt)
             distinct=$(sort -u /tmp/resi-ips.txt | wc -l)
@@ -274,11 +285,21 @@ jobs:
           ROUNDS=$(( N * 3 + 8 ))
           echo "dead nodes=$N -> $ROUNDS resi connections"
           : > /tmp/storm.txt
+          # One connection = one rotation slot. Each attempt tries two echo
+          # services (still within the 20s first-byte watchdog plus teardown).
+          storm_once() {
+            local url out code secs ip
+            for url in https://icanhazip.com https://api.ipify.org; do
+              out=$(curl -m 20 -s -o /tmp/storm-out.txt -w "%{http_code} %{time_total}" \
+                -x socks5h://127.0.0.1:18093 "$url" || true)
+              code=${out%% *}; secs=${out##* }
+              ip=$(cat /tmp/storm-out.txt 2>/dev/null || true)
+              [ -n "$ip" ] && { echo "$code $secs $ip"; return 0; }
+            done
+            echo "${code:-000} ${secs:-60} "
+          }
           for i in $(seq 1 $ROUNDS); do
-            out=$(curl -m 60 -s -o /tmp/storm-out.txt -w "%{http_code} %{time_total}" \
-              -x socks5h://127.0.0.1:18093 https://api.ipify.org || true)
-            code=${out%% *}; secs=${out##* }
-            ip=$(cat /tmp/storm-out.txt 2>/dev/null || true)
+            read -r code secs ip <<< "$(storm_once)"
             echo "$i code=$code secs=$secs ip=${ip:-<none>}" | tee -a /tmp/storm.txt
             sleep 1
           done
@@ -316,12 +337,23 @@ jobs:
           AUTH="Authorization: Bearer $ADMIN_TOKEN"
           SB_PID_AFTER=$(docker exec rotate-trial python3 /tmp/pid.py)
           CFG_AFTER=$(docker exec rotate-trial md5sum /app/singbox-railway.json | awk '{print $1}')
+          RESCUES=$(docker logs rotate-trial 2>&1 | grep -c "chain rescue:" || true)
           echo "sing-box pid before=$(cat /tmp/sb_pid_before.txt) after=$SB_PID_AFTER"
           echo "config md5 before=$(cat /tmp/cfg_before.txt) after=$CFG_AFTER"
-          [ "$(cat /tmp/sb_pid_before.txt)" = "$SB_PID_AFTER" ] || {
-            echo "sing-box restarted because of third-path health churn"; exit 1; }
-          [ "$(cat /tmp/cfg_before.txt)" = "$CFG_AFTER" ] || {
-            echo "health/pool changes rewrote the config"; exit 1; }
+          echo "chain rescues so far=$RESCUES"
+          if [ "$(cat /tmp/sb_pid_before.txt)" = "$SB_PID_AFTER" ]; then
+            [ "$(cat /tmp/cfg_before.txt)" = "$CFG_AFTER" ] || {
+              echo "config was rewritten without a restart"; exit 1; }
+            echo "no restart: third-path health never touched the other two paths"
+          else
+            # Repinning the chain is the one legitimate restart: it happens only
+            # when the pinned node's tunnel is dead, and it must be rare.
+            [ "$RESCUES" -ge 1 ] || {
+              echo "sing-box restarted but no chain rescue was logged (third-path churn)"; exit 1; }
+            [ "$RESCUES" -le 1 ] || {
+              echo "chain rescue looped $RESCUES times: pinning keeps choosing dead nodes"; exit 1; }
+            echo "sing-box restarted once for a legitimate chain rescue"
+          fi
           HOST=$(cat /tmp/host.txt)
           for path in /ws-node /ws-chain /ws-resi; do
             code=$(curl -m 30 --http1.1 -s -o /dev/null -w "%{http_code}" \
@@ -331,8 +363,16 @@ jobs:
             echo "https://${HOST}${path} -> $code"
             [ "$code" = "101" ] || exit 1
           done
-          node=$(curl -m 60 -s -x socks5h://127.0.0.1:18091 https://api.ipify.org || true)
-          chain=$(curl -m 60 -s -x socks5h://127.0.0.1:18092 https://api.ipify.org || true)
+          ip_via() {
+            local port="$1" url ip
+            for url in https://api.ipify.org https://icanhazip.com https://ifconfig.me/ip; do
+              ip=$(curl -m 30 -s -x "socks5h://127.0.0.1:${port}" "$url" || true)
+              [ -n "$ip" ] && { echo "$ip"; return 0; }
+            done
+            echo ""
+          }
+          node=$(ip_via 18091)
+          chain=$(ip_via 18092)
           direct=$(cat /tmp/direct_ip.txt)
           echo "/ws-node exit=$node (runner $direct)"
           echo "/ws-chain exit=$chain"

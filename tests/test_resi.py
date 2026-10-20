@@ -644,6 +644,91 @@ class RotateManagerTests(unittest.TestCase):
         self.assertEqual("pinned", state)
         self.assertEqual("vpngate-a", pinned)
 
+    def test_rotate_mode_rescues_a_tcp_alive_but_tunnel_dead_pin(self) -> None:
+        # The node accepts the TCP handshake and still cannot carry a byte:
+        # before this check the handshake looked healthy, rotate mode never
+        # unpins, and /ws-chain exited nowhere for the rest of the deployment.
+        manager = self._manager()
+        try:
+            manager._nodes = [
+                {"server": "198.51.100.1", "server_port": 443,
+                 "real_latency_ms": 10, "endpoint": _endpoint("vpngate-a")},
+                {"server": "198.51.100.2", "server_port": 443,
+                 "real_latency_ms": 20, "endpoint": _endpoint("vpngate-b")},
+                {"server": "198.51.100.3", "server_port": 443,
+                 "real_latency_ms": 30, "endpoint": _endpoint("vpngate-c")},
+            ]
+            with manager._lock:
+                manager.preferred_tag = "vpngate-a"
+                manager.status["preferred_tag"] = "vpngate-a"
+            with mock.patch("railway_manager.probe_tcp_latency", return_value=25), \
+                    mock.patch.object(RailwayManager, "_chain_probe_ok", return_value=False), \
+                    mock.patch.object(RailwayManager, "_apply_config", return_value=True), \
+                    mock.patch.object(RailwayManager, "_invalidate_verify"):
+                states = [manager.check_pinned_health() for _ in range(2)]
+            pinned = manager.preferred_tag
+            backup = manager.backup_tag
+            events = [entry["event"] for entry in manager.status["refresh_history"]]
+        finally:
+            manager.stop()
+            self._cleanup(manager)
+
+        self.assertEqual(["pinned", "rescued"], states)
+        self.assertEqual("vpngate-b", pinned)
+        self.assertIsNone(backup)
+        self.assertIn("chain-rescue", events)
+
+    def test_rotate_mode_keeps_the_pin_while_the_chain_carries_traffic(self) -> None:
+        manager = self._manager()
+        try:
+            manager._nodes = [
+                {"server": "198.51.100.1", "server_port": 443,
+                 "real_latency_ms": 10, "endpoint": _endpoint("vpngate-a")},
+                {"server": "198.51.100.2", "server_port": 443,
+                 "real_latency_ms": 20, "endpoint": _endpoint("vpngate-b")},
+            ]
+            with manager._lock:
+                manager.preferred_tag = "vpngate-a"
+                manager.status["preferred_tag"] = "vpngate-a"
+            with mock.patch("railway_manager.probe_tcp_latency", return_value=25), \
+                    mock.patch.object(RailwayManager, "_chain_probe_ok", return_value=True) as probe, \
+                    mock.patch.object(RailwayManager, "_apply_config") as apply_cfg:
+                states = [manager.check_pinned_health() for _ in range(3)]
+            pinned = manager.preferred_tag
+        finally:
+            manager.stop()
+            self._cleanup(manager)
+
+        self.assertEqual(["pinned", "pinned", "pinned"], states)
+        self.assertEqual("vpngate-a", pinned)
+        self.assertEqual(3, probe.call_count)
+        apply_cfg.assert_not_called()
+
+    def test_chain_rescue_without_an_alternative_keeps_the_pin(self) -> None:
+        manager = self._manager()
+        try:
+            manager._nodes = [
+                {"server": "198.51.100.1", "server_port": 443,
+                 "real_latency_ms": 10, "endpoint": _endpoint("vpngate-a")},
+            ]
+            with manager._lock:
+                manager.preferred_tag = "vpngate-a"
+                manager.status["preferred_tag"] = "vpngate-a"
+            with mock.patch("railway_manager.probe_tcp_latency", return_value=25), \
+                    mock.patch.object(RailwayManager, "_chain_probe_ok", return_value=False), \
+                    mock.patch.object(RailwayManager, "_apply_config") as apply_cfg:
+                states = [manager.check_pinned_health() for _ in range(2)]
+            pinned = manager.preferred_tag
+            events = [entry["event"] for entry in manager.status["refresh_history"]]
+        finally:
+            manager.stop()
+            self._cleanup(manager)
+
+        self.assertEqual(["pinned", "pinned"], states)
+        self.assertEqual("vpngate-a", pinned)
+        self.assertIn("chain-rescue-skipped", events)
+        apply_cfg.assert_not_called()
+
     def test_rebuilding_the_table_resets_the_cursor(self) -> None:
         manager = self._manager()
         try:
@@ -696,7 +781,11 @@ class RotateManagerTests(unittest.TestCase):
         finally:
             manager.stop()
 
-        self.assertEqual((VLESS, DEFAULT_RESI_PORT, "/ws-resi"), args[:3])
+        # Rotate mode serves /ws-resi from the mux on $PORT; RESI_PORT is only
+        # the sing-box gateway listener, so probing it always failed ("no
+        # serving endpoint answered") while real clients kept rotating.
+        self.assertEqual((VLESS, manager.port, "/ws-resi"), args[:3])
+        self.assertNotEqual(DEFAULT_RESI_PORT, args[1])
         self.assertTrue(probe_state["rotating"])
         self.assertEqual("up", state)
 

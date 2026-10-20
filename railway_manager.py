@@ -43,6 +43,17 @@ DRAIN_TIMEOUT = 10.0
 STALE_RUNNING_AFTER = 180.0
 HEALTH_CHECK_INTERVAL = 20
 PINNED_FAIL_THRESHOLD = 3
+# Rotate mode: a chain pin is only useful if the tunnel actually carries
+# traffic. VPNGate nodes routinely accept the TCP handshake and then refuse or
+# drop the OpenVPN session, so a handshake-only health check stays green while
+# /ws-chain exits nowhere - and, because rotate mode never unpins, the chain sat
+# dead on that node forever. Two failed end-to-end probes in a row rescue the
+# pin to the next tunnel-verified node; the cooldown doubles up to the cap so a
+# genuinely broken pool cannot turn into a config-restart storm.
+CHAIN_FAIL_THRESHOLD = 2
+CHAIN_RESCUE_COOLDOWN = 45.0
+CHAIN_RESCUE_COOLDOWN_MAX = 300.0
+CHAIN_PROBE_TIMEOUT = 8.0
 SUPERVISE_INTERVAL = 10
 EXIT_VERIFY_CAP = 3
 REFRESH_PROBE_GRACE = 30.0
@@ -1810,6 +1821,7 @@ class RailwayManager:
         self._nodes: list[dict] = []; self._first_seen: dict[str, str] = {}
         self._cpu_model = _cpu_model(); self._cpu_cores = os.cpu_count(); self._cpu_last = None
         self._fail_streak = 0; self._pinned_fail_streak = 0; self._rescue_round = 0; self._crash_streak = 0; self._retry_after = 0.0; self._mixed_fail_streak = 0; self._mixed_retry_after = 0.0; self._health_mixed_streak = 0; self._refresh_generation = 0
+        self._chain_fail_streak = 0; self._chain_rescue_at = 0.0; self._chain_rescue_attempts = 0
         self._lock = threading.RLock(); self._refresh_lock = threading.Lock(); self._config_lock = threading.Lock()
         if resi:
             resi_status = {"enabled": True, "mode": ("sticky" if self.resi_session_ttl > 0 else "rotation"),
@@ -2598,6 +2610,66 @@ class RailwayManager:
         order = {((n.get("endpoint") or {}).get("tag")): k for k, n in enumerate(cands)}
         return sorted(alive, key=lambda t: order.get(t, 10 ** 9))
 
+    def _chain_probe_ok(self) -> bool | None:
+        """End-to-end exit-IP probe of the chain path through the live instance.
+
+        Cheap by design: it opens one client connection to our own mux and rides
+        the endpoint session the chain already holds, so it neither creates a
+        second VPNGate session (duplicate-cn) nor disturbs the rotation.
+        Returns None when the check does not apply (not rotate mode).
+        """
+        if not (self.resi_rotate and self.vless_uuid):
+            return None
+        try:
+            result = measure_resi_rotate(
+                self.vless_uuid, self.port, self.vless_chain_path,
+                count=1, singbox_bin=self.singbox_bin,
+                timeout=CHAIN_PROBE_TIMEOUT)
+        except Exception:
+            result = None
+        return bool(result and result.get("ips"))
+
+    def _rescue_chain(self, reason: str, round_id: int) -> str:
+        """Repin the chain when the tunnel behind a TCP-alive pin is dead.
+
+        Rotate mode must not unpin (an unpinned chain turns the urltest group
+        into a second client of the very nodes the rotation dials), so the only
+        safe move is another single pin. Candidate ranking is real_latency only:
+        those are the nodes that were tunnel-verified, not merely reachable.
+        """
+        now = time.monotonic()
+        with self._lock:
+            if now - self._chain_rescue_at < min(
+                    CHAIN_RESCUE_COOLDOWN_MAX,
+                    CHAIN_RESCUE_COOLDOWN * (2 ** max(0, self._chain_rescue_attempts - 1))):
+                return "pinned"
+            tag = self.preferred_tag
+            cands = [n for n in self._nodes
+                     if n.get("real_latency_ms") is not None
+                     and (n.get("endpoint") or {}).get("tag") not in (self.preferred_tag, self.backup_tag)]
+            cands.sort(key=lambda n: (n["real_latency_ms"], (n.get("endpoint") or {}).get("tag") or ""))
+            best = (cands[0].get("endpoint") or {}).get("tag") if cands else None
+        if best is None:
+            with self._lock:
+                self._chain_rescue_attempts += 1
+                self._chain_rescue_at = now
+            self._record_history("chain-rescue-skipped", f"{reason}: no tunnel-verified alternative")
+            print(f"chain rescue skipped: {reason}: no tunnel-verified alternative", flush=True)
+            return "pinned"
+        with self._config_lock:
+            if not self._apply_config(final="auto", preferred=best, backup=None):
+                return "pinned"
+            if not self._commit_rescue(round_id, best, None):
+                return "pinned"
+            with self._lock:
+                self._chain_rescue_attempts += 1
+                self._chain_rescue_at = now
+                self._chain_fail_streak = 0
+        self._invalidate_verify(f"chain rescue to {best}")
+        self._record_history("chain-rescue", f"{reason}: {tag} -> {best}")
+        print(f"chain rescue: {reason}: {tag} -> {best}", flush=True)
+        return "rescued"
+
     def check_pinned_health(self, probe_fn=None) -> str:
         """Simple health: pinned handshake must pass; serving handled gated.
 
@@ -2628,7 +2700,28 @@ class RailwayManager:
                 self._pinned_fail_streak = 0
             if self.want_singbox and not self._serving_ok():
                 self._note_mixed_down(f"{tag} serving down, watching")
-            return "pinned"
+                return "pinned"
+            chain_ok = self._chain_probe_ok()
+            if chain_ok is None:
+                return "pinned"
+            recovered = False
+            with self._lock:
+                if chain_ok:
+                    recovered = self._chain_fail_streak > 0
+                    self._chain_fail_streak = 0
+                    self._chain_rescue_attempts = 0
+                else:
+                    self._chain_fail_streak += 1
+                    chain_streak = self._chain_fail_streak
+            if chain_ok:
+                if recovered:
+                    self._record_history("chain-probe-ok", f"{tag} chain carries traffic again")
+                return "pinned"
+            if chain_streak < CHAIN_FAIL_THRESHOLD:
+                self._record_history("chain-probe-fail",
+                                     f"{tag} {chain_streak}/{CHAIN_FAIL_THRESHOLD} tunnel probes failed")
+                return "pinned"
+            return self._rescue_chain(f"{tag} tunnel dead {chain_streak}x", round_id)
         with self._lock:
             self._pinned_fail_streak += 1
             streak = self._pinned_fail_streak
@@ -2853,6 +2946,10 @@ class RailwayManager:
             pass
         if want_singbox:
             self._restart_singbox()
+            # A fresh config (and a fresh process) deserves a fresh chain probe:
+            # the first attempt after a restart races the endpoints coming up.
+            with self._lock:
+                self._chain_fail_streak = 0
         return True
 
     def _start_refresh_bg(self) -> bool:
@@ -3550,8 +3647,13 @@ class RailwayManager:
         result = None
         error = None
         if self.resi_rotate:
+            # In rotate mode the mux serves /ws-resi in-process on $PORT (one
+            # Cloudflare catch-all rule is enough); nothing listens on
+            # RESI_PORT, so probing 127.0.0.1:RESI_PORT always failed and the
+            # UI/status showed "no serving endpoint answered" even while real
+            # third-path clients were rotating fine.
             try:
-                result = measure_resi_rotate(self.vless_uuid, self.resi_port, self.resi_path,
+                result = measure_resi_rotate(self.vless_uuid, self.port, self.resi_path,
                                              count=count, singbox_bin=self.singbox_bin,
                                              timeout=self.dial_timeout)
             except Exception as exc:
@@ -3589,7 +3691,7 @@ class RailwayManager:
         error = None
         if self.resi_rotate:
             try:
-                sampled = measure_resi_rotate(self.vless_uuid, self.resi_port, self.resi_path,
+                sampled = measure_resi_rotate(self.vless_uuid, self.port, self.resi_path,
                                               count=1, singbox_bin=self.singbox_bin,
                                               timeout=self.dial_timeout)
             except Exception as exc:
