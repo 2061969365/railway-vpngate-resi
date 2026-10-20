@@ -343,6 +343,10 @@ jobs:
       - name: Failure diagnostics
         if: failure()
         run: |
+          echo "=== manager events (refresh / pin / restart) ==="
+          docker logs rotate-trial 2>&1 | grep -E "refreshed|auto-pin|rescue|switch|restart|supervise|health|config" | tail -n 80 || true
+          echo "=== sing-box restarts ==="
+          docker logs rotate-trial 2>&1 | grep -c "sing-box started" || true
           echo "=== container log tail ==="
           docker logs --tail 200 rotate-trial 2>&1 || true
           echo "=== cloudflared ==="
@@ -355,7 +359,19 @@ jobs:
           echo "=== status ==="
           curl -m 10 -s -H "Authorization: Bearer $ADMIN_TOKEN" \
             http://127.0.0.1:3000/api/status -o /tmp/status-fail.json || true
-          python3 -m json.tool /tmp/status-fail.json 2>/dev/null | head -n 80 || true
+          python3 - <<'EOF' || true
+          import json
+          try:
+              s = json.load(open("/tmp/status-fail.json"))
+          except Exception as exc:
+              print("no status:", exc); raise SystemExit
+          print("resi:", json.dumps(s.get("resi"), ensure_ascii=False))
+          print("pin:", s.get("preferred_tag"), "backup:", s.get("backup_tag"),
+                "auto_pinned:", s.get("auto_pinned"))
+          print("last_error:", s.get("last_error"))
+          for event in (s.get("history") or [])[-40:]:
+              print("  hist:", json.dumps(event, ensure_ascii=False))
+          EOF
 
       - name: Cleanup
         if: always()
