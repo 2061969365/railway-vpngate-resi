@@ -34,7 +34,7 @@ CC Switch / 伪装页 / 哪吒探针从 `railway-proxy-combined` 全量搬运
        直接 `python railway_manager.py` 会无 VLESS）、`NEZHA_SERVER`/`NEZHA_KEY`、
        `LIMIT`（默认 100，0=全量、上限 100）、`REAL_TOPK`（默认 30，真拨 TopK）、
        `DIAL_WORKERS`（默认 2，真测并发；1GB 内存够用，OOM 就往小调）、`FULL_PROBE_WORKERS`（默认 3，
-       全量真测并发；和 DIAL_WORKERS 叠加受全局 dial gate 上限 10 约束）、`REFRESH_SECONDS`（默认 3600，每小时拉新快照并自动全量真测）、`PROBE_WORKERS`（默认 15，握手并发）、`DIAL_TIMEOUT`（默认 15，真拨超时秒）、`AUTO_REPIN`（默认开，每小时自动重 pin 最优）、`AUTO_RESCUE`（默认开，手动 pin 挂了自动救最优）、`HEALTH_CHECK_INTERVAL`（默认 20s）、`MAX_MUX_CONNECTIONS`（默认 100）、`NEZHA_URL`（可选）、`SNAPSHOT_URLS`（可选，逗号分隔的快照镜像，主源失败自动顺延）
+       全量真测并发；和 DIAL_WORKERS 叠加受全局 dial gate 上限 10 约束）、`REFRESH_SECONDS`（默认 3600，每小时拉新快照并补测新/被踢节点）、`PROBE_WORKERS`（默认 15，握手并发）、`DIAL_TIMEOUT`（默认 15，真拨超时秒）、`AUTO_REPIN`（默认开，每小时自动重 pin 最优）、`AUTO_RESCUE`（默认开，手动 pin 挂了自动救最优）、`HEALTH_CHECK_INTERVAL`（默认 20s）、`MAX_MUX_CONNECTIONS`（默认 100）、`NEZHA_URL`（可选）、`SNAPSHOT_URLS`（可选，逗号分隔的快照镜像，主源失败自动顺延）
      - 第三出口（默认开启、节点轮换、零配置；只有要接外部住宅网关才需要下面这些）：
        `RESI_GATEWAY`（`host:port`，固定 backconnect 网关，**永远只连这个地址**；填了就切到住宅模式）、
        `RESI_USER`、`RESI_PASS`、
@@ -109,7 +109,9 @@ vless://<UUID>@node.example.com:443?security=tls&sni=node.example.com&type=ws&pa
   出口 IP 就是该节点的 VPNGate IP（机房 IP，不是家宽）。
   首启只用 `REAL_TOPK`（默认 30）真拨一批好让服务先起来，**服务起来后自动在后台把剩余节点
   全部真拨一遍**，池子随之涨到全部可用节点（100 个快照通常 60~70 个）；之后每次刷新（默认
-  每小时）同样自动全量真拨。
+  每小时）只补测**新出现**和**已被踢出池子**的节点——正在服务的节点不会重拨，因为
+  VPNGate 每节点只允许一个会话，重拨会把用户正在用的连接踢掉（见
+  `docs/rotate-design.md` §12.9e D13）。服务中节点的健康由真实流量判定（连续失败即临时踢出）。
   没有「凑不够就随便拿没验证的节点顶上」的兜底：池子空时面板会写明
   `rotation pool empty (waiting for a verified node)`，等验证通过即自动恢复。
   某个节点连续 3 次「刚连上就被它掐断、还没传过数据」会被**临时踢出轮换**
@@ -250,7 +252,7 @@ curl http://127.0.0.1:3000/healthz   # ok
 ```
 
 管理页：`http://127.0.0.1:3000/ui`（粘贴 ADMIN_TOKEN）。节点列表显示出口 IP（`tag` 只留在 API 参数里）；搜索框＋范围下拉＋排序同一行；右上可切 Google 白浅色主题；底部显示真机 CPU 型号与实时占用（`GET /api/status` 的 `cpu{model,cores,pct}`、`memory.pct`，Linux 下读 `/proc`，取不到为 `None`）。
-全量真测：管理页按钮或 `POST /api/full_probe`（需 `Authorization: Bearer`）。每次刷新成功（开机/每小时/手动）都会自动在后台全量真测，按握手延迟从小到大 5 并发拨号，超时 20 秒。自动轨道每轮跑完都重 pin 到实测最低（主）＋次低（保底），chain 出 `[best, second, auto]`，相同不重启；手动切换的不覆盖，手动挂了（连续 3 次握手失败）自动救到实测最优并回到自动轨道。状态条节点 title 显示主备。
+全量真测：管理页按钮或 `POST /api/full_probe`（需 `Authorization: Bearer`）。每次刷新成功（开机/每小时/手动）都会自动在后台真测，按握手延迟从小到大 5 并发拨号，超时 20 秒；轮换模式下只拨"当前不在服务中"的节点（新节点、被踢出池子的节点、预留之外未被验证的节点），绝不重拨正在服务的节点和 chain 的主/备节点（重拨会抢走它唯一的 VPNGate 会话）。自动轨道每轮跑完都重 pin 到实测最低（主）＋次低（保底），chain 出 `[best, second, auto]`，相同不重启；手动切换的不覆盖，手动挂了（连续 3 次握手失败）自动救到实测最优并回到自动轨道。状态条节点 title 显示主备。
 单节点测速：节点列表每行“测速”按钮，或 `POST /api/probe {"tag":"vpngate-N"}`；
 测通的节点自动可切换（全部存活节点本就在 sing-box 配置里，无需重建）。切换即切即换，成功后总览出现 15 秒「撤销换回」按钮（键盘可达，过期焦点自动回到当前节点）；成功的操作只在行内确认，失败才右下角弹窗。表头按钮可键盘排序，状态条圆点三态（绿=已验证新鲜/黄=未验证或数据旧/红=刷新失败），token 失效自动回登录页，全量真测可中途取消并显示中文进度＋预计剩余时间。日志支持搜索＋自动滚动开关；订阅行标注直连/经 VPN 用途，切换失败提示取后端 detail；统计卡自适应列、流量带单位、时长人性化显示，移动端保留导航并冻结首末列。
 
