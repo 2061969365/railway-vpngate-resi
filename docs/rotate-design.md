@@ -478,6 +478,26 @@ UUID 保护的公开端点，不是 API），并把 mux 已经读到的握手字
 - 证据：`ExitIpFallbackTests`（纯文本/`ip=`/HTML 解析、首个站点失败后换站点、
   全挂时返回 None）。
 
+### 12.9d D12：三条路共用 mux 槽位 ⇒ 第三路风暴把前两路饿死（反向串扰）
+
+- 症状（云端 run 39458441077 的收尾观察）：前两路已全绿，但窗口内 sing-box 被
+  重启一次、配置 md5 变化、没有 chain rescue 日志——说明有一个"第三路相关"的动作
+  改写了配置。
+- 机理：`MAX_MUX_CONNECTIONS = 100` 是**三条路共用**的一张槽位表，表满时新连接被
+  直接丢弃（不是排队）。轮换一旦被 100 个并发隧道占满，`/ws-node` 与 `/ws-chain`
+  的新连接根本进不来——现象与"第三路把另外两路弄死"完全一致，只是方向相反。
+- 另一层：配置写入 + 重启会掐断三条路的在途连接，而这种动作原先在日志里没有痕迹，
+  于是一次"顺带重启"看起来和"第三路抖动导致重启"无法区分。
+- 修法：
+  1. 轮换单独限流：`resi_cap = max_mux_connections - max(1, max_mux_connections // 5)`
+     （默认 80/100），恒定留 20 个槽位给前两路；超限连接关闭并记
+     `resi-mux-throttled`，状态里暴露 `resi.mux_limit` / `resi.throttled`。
+  2. 关键生命周期留痕：`config rewritten: …`（只在真正写盘时）、
+     `refresh triggered: <原因>`、`refresh loop armed`、`scheduled refresh firing`、
+     `full probe done`。验收脚本据此区分"合法重启"与"抖动重启"。
+- 证据：`test_rotation_cannot_starve_the_other_two_paths`（5 槽时上限 4，占满后
+  node 仍能拿到全局槽位）；云端诊断新增进程表/带时间戳生命周期/`refresh_history`。
+
 ### 12.10 不变量（后续改动必须守住）
 
 1. **健康/池子决策不得写配置文件、不得重启 sing-box**（`/ws-resi` 的抖动不能影响
@@ -496,8 +516,10 @@ UUID 保护的公开端点，不是 API），并把 mux 已经读到的握手字
    并记录 `chain-rescue-skipped`，不得为了"看起来在动"而空转重启（D10）。
 9. **退出 IP 检查不得只依赖一个站点**：任一站点的地域/网络差异都不能让好节点被判死
    （D11）。
+10. **轮换的连接预算不得吃满 mux 槽位**：前两路必须保留独立额度，否则第三路的风暴
+    会以"新连接被丢弃"的形式掐死另外两路（D12）。
 
-### 12.11 测试矩阵（`tests/test_resi.py`，79 项全绿）
+### 12.11 测试矩阵（`tests/test_resi.py`，86 项全绿）
 
 | 场景 | 测试 |
 |---|---|
@@ -525,7 +547,9 @@ UUID 保护的公开端点，不是 API），并把 mux 已经读到的握手字
 | 没有已验证备选 → 保持 pin、只记 skipped、不空转 | `test_chain_rescue_without_an_alternative_keeps_the_pin` |
 | 出口 IP 检查多站点回退（解析 + 失败切换） | `ExitIpFallbackTests`（`tests/test_vpngate_to_singbox.py`） |
 | rotate 自探针必须打 mux 的 `$PORT`，不是 `RESI_PORT` | `test_probe_goes_through_the_listener` |
-| 环回入站被拒不算节点失败 | `test_a_refused_loopback_dial_never_strikes_the_node` || 拨号失败自动换下一个 | `test_backend_dial_failure_steps_to_the_next_node` |
+| 轮换风暴不得占满 mux 槽位、前两路必须有额度 | `test_rotation_cannot_starve_the_other_two_paths` |
+| 环回入站被拒不算节点失败 | `test_a_refused_loopback_dial_never_strikes_the_node` |
+| 拨号失败自动换下一个 | `test_backend_dial_failure_steps_to_the_next_node` |
 | 真连接 round-robin | `test_balancer_round_robins_real_connections` |
 
 另外用真 sing-box 1.14.0 校验了 100 节点静态入站的配置（不是 mock）：
