@@ -368,7 +368,7 @@ UUID 保护的公开端点，不是 API），并把 mux 已经读到的握手字
 
 `/ws-resi` 的健康表、park、游标、池子**永不**在此列表里（有 §12.1 的回归测试守着）。
 
-### 12.7 D8：游标在路由表变化时被清零 ⇒ 头部节点被反复使用
+### 12.7 D7：游标在路由表变化时被清零 ⇒ 头部节点被反复使用
 
 - 旧行为：任何路由表重建（`_set_resi_routes`）都把 `_resi_cursor` 归零，等于永远从
   0 号开始轮，尾部节点实际吃不到流量。
@@ -378,7 +378,7 @@ UUID 保护的公开端点，不是 API），并把 mux 已经读到的握手字
 - 证据：`test_cursor_cycles_and_wraps`（旧测试保留）、`test_rebuilding_the_table_resets_the_cursor`
   （表内容变化才重置）。
 
-### 12.8 D9：空池/全 park 时的对外表现
+### 12.8 D8：空池/全 park 时的对外表现
 
 - `/ws-resi` 的 VLESS 握手仍然成功（101），随后立即关闭：客户端（v2rayN/sing-box）
   会自然重试，比"握手失败"更容易被客户端正确归类。
@@ -393,7 +393,7 @@ UUID 保护的公开端点，不是 API），并把 mux 已经读到的握手字
 3. **任一方向的连接结束 ⇒ 另一方向在 5 秒内拆掉**（不得挂到 `PIPE_IDLE_TIMEOUT`）。
 4. **配置稳定**：同样的节点集合 → 同样的 JSON 字节（顺序按 tag，不带延迟字段）。
 
-### 12.10 测试矩阵（`tests/test_resi.py`，69 项全绿）
+### 12.10 测试矩阵（`tests/test_resi.py`，72 项全绿）
 
 | 场景 | 测试 |
 |---|---|
@@ -407,6 +407,9 @@ UUID 保护的公开端点，不是 API），并把 mux 已经读到的握手字
 | 全 park 仍有兜底 | `test_an_all_parked_pool_still_serves_the_least_recent_failure` |
 | 节点快速掉线 → 连接快速拆 | `test_node_close_tears_the_connection_down_at_once` |
 | 节点快速掉线 → 记一次 strike | `test_a_fast_node_drop_is_counted_as_a_strike` |
+| 慢失败（拨号黑洞十几秒）也算 | `test_a_slow_node_side_failure_also_counts_as_a_strike` |
+| 长时间空闲后关闭不算失败 | `test_a_long_idle_close_is_not_a_strike` |
+| 节点侧 120 秒无下行算失败 | `test_a_silent_node_side_strikes_even_after_the_idle_window` |
 | 拨号失败自动换下一个 | `test_backend_dial_failure_steps_to_the_next_node` |
 | 真连接 round-robin | `test_balancer_round_robins_real_connections` |
 
@@ -425,7 +428,22 @@ route rules: 100 {'inbound': 'resi-rot-0', 'outbound': 'vpngate-0'} ... 'resi-ro
   同一连接上的所有目标复用同一条出站。要按请求轮换，得在最前面挂一个真正的
   socks/http 代理（第三路原本的设计），代价见 §2/§7。客户端多开连接即可获得轮换。
 - **出口是 VPNGate 的机房 IP**，不是住宅 IP；文案统一写「轮换出口」。
-- **park 阈值是启发式的**：3 次 + 6 秒 + 1KB 的规则来自线上样本，真正误判也需要 3 次
+- **park 阈值是启发式的**：3 次 + 30 秒 + 1KB 的规则来自线上样本，真正误判也需要 3 次
   连续快速失败，且 2 分钟后自动重试，不会永久拉黑。
 - 峰值并发仍受 `MAX_CONCURRENT_DIALS=10` 限制：这是 1 进程 400 连接场景下的保护，
   第三路的重连风暴不会把 sing-box 拖死（代价是并发拨号排队）。
+
+### 12.12 上线后自查清单
+
+1. `GET /api/status` → `resi.pool`（可用节点数）、`resi.down`（临时剔除数）、
+   `resi.inbounds`（= serving 节点数）。三者应满足 `pool + down <= inbounds`。
+2. 面板第三路卡片显示 `节点池 24/30 可用 · 每连接轮换 · 3 个临时剔除`；
+   池为 0 时状态是「不可用」并写明 `rotation pool empty` 或 `every rotation node is parked`。
+3. 节点死亡时历史里出现 `resi-node-parked`，`error` 形如
+   `vpngate-7 parked for 120s after 3 fast failures`。
+4. 该时段**不应**出现 sing-box 重启 / 配置写入：容器日志里没有新的
+   `wrote config`、`sing-box restarted`，前两路的现有连接不掉。
+5. 客户端体感：撞到坏节点应在 1~2 秒内失败（被 REJECT/RST 的情况）或最迟十几秒
+   （拨号黑洞），**不再是 120 秒**；重试即落到健康节点。
+6. 每小时的全量真拨把死掉的节点写成 `real_latency_ms=null`，它们会**自动退出池子**
+   且不触发重启——面板上 `pool` 会掉、`inbounds` 不变。

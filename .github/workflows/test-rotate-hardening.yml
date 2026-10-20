@@ -195,7 +195,7 @@ jobs:
             done
             echo ""
           }
-          echo "node  exit=$(get_ip 18091)" >> /tmp/baseline.txt
+          echo "node exit=$(get_ip 18091)" >> /tmp/baseline.txt
           echo "chain exit=$(get_ip 18092)" >> /tmp/baseline.txt
           : > /tmp/resi-ips.txt
           for i in $(seq 1 10); do
@@ -210,9 +210,14 @@ jobs:
           echo "resi distinct=$(sort -u /tmp/resi-ips.txt | wc -l) of $(wc -l < /tmp/resi-ips.txt)"
           python3 - <<'EOF'
           import pathlib
-          lines = dict(l.split(" exit=", 1) for l in pathlib.Path("/tmp/baseline.txt").read_text().splitlines())
+          lines = {}
+          for line in pathlib.Path("/tmp/baseline.txt").read_text().splitlines():
+              if " exit=" in line:
+                  k, v = line.split(" exit=", 1)
+                  lines[k.strip()] = v.strip()
           direct = pathlib.Path("/tmp/direct_ip.txt").read_text().strip()
           ips = [l.strip() for l in pathlib.Path("/tmp/resi-ips.txt").read_text().splitlines() if l.strip()]
+          print("baseline:", lines, "direct:", direct, "resi:", ips)
           assert lines.get("node") == direct, (lines, direct)
           assert lines.get("chain") and lines["chain"] != direct, lines
           assert len(set(ips)) >= 2, ips
