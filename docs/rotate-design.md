@@ -413,8 +413,19 @@ UUID 保护的公开端点，不是 API），并把 mux 已经读到的握手字
 - 修法：`_resi_pool_locked()` 把 `preferred_tag`/`backup_tag` 从轮换候选里**排除**，
   并在 `status.resi.reserved` 里报数（面板显示「N 个留给 chain」）。这只是路由选择层的
   过滤——那两条 loopback 入站还在配置里，pin 变了立刻回到池子里，不需要重写配置、不重启。
+- 修法（第二半，同样关键）：轮换模式下 chain **永远保持 pin**。
+  - `check_pinned_health()`：pin 的节点死了且没有别的已验证节点时，不再 `unpin → final=auto`，
+    而是保留 pin（历史记 `auto-pin-kept`）。
+  - `_auto_pin_best()`：exit 探测全失败时不再留空 pin，而是钉住真拨评分最好的节点
+    （历史记 `auto-pin-unverified`），且**不编造**未验证的 standby。
+  - 为什么必须这样：unpin 之后 chain 走的是 `auto`（urltest over 全部 endpoint），
+    而轮换拨的正是同一批 endpoint —— 两条路抢同一节点唯一会话，"一个死两个一起死"
+    照样复现（云端 run 39432025613 的 `refreshed 12 endpoints, final=auto` 就是这个状态）。
+  - 代价：pin 的节点死掉时，chain 要等它复活或等下一轮 refresh 才可能换（这期间轮换仍在
+    其它节点上正常服务）；这是有意的取舍，避免两条路互相踩。
 - 证据：`test_the_chain_nodes_stay_out_of_the_rotation`、`test_an_unpinned_node_returns_to_the_rotation`、
-  `test_a_pool_that_only_holds_the_chain_node_is_empty`。
+  `test_a_pool_that_only_holds_the_chain_node_is_empty`、`test_rotate_mode_never_leaves_the_chain_unpinned`、
+  `test_rotate_mode_never_unpins_a_dead_chain_node`。
 - 边界：pin 本身变化（rescue/refresh）仍会重启 sing-box，见 D6；这不是本条的回归。
 
 ### 12.10 不变量（后续改动必须守住）
@@ -427,6 +438,8 @@ UUID 保护的公开端点，不是 API），并把 mux 已经读到的握手字
 4. **配置稳定**：同样的节点集合 → 同样的 JSON 字节（顺序按 tag，不带延迟字段）。
 5. **轮换永远不碰 chain 的节点**：`preferred_tag`/`backup_tag` 不在轮换路由里，
    否则 VPNGate 的单会话限制会让 chain 静默失效。
+6. **轮换模式下 chain 永不 unpin**：unpinned 的 chain 会用轮换正在拨的 endpoint，
+   等于把 D9 重新打开。
 
 ### 12.11 测试矩阵（`tests/test_resi.py`，79 项全绿）
 
@@ -449,6 +462,9 @@ UUID 保护的公开端点，不是 API），并把 mux 已经读到的握手字
 | 回过了就不算 stall | `test_a_node_that_answered_is_not_struck_for_a_stall` |
 | 握手重放失败也不漏 backend socket | `test_a_failed_handshake_replay_still_closes_the_backend` |
 | chain 的节点不参与轮换 | `test_the_chain_nodes_stay_out_of_the_rotation`、`test_an_unpinned_node_returns_to_the_rotation`、`test_a_pool_that_only_holds_the_chain_node_is_empty` |
+| 轮换模式永远留 pin（无 exit 探测也钉） | `test_rotate_mode_never_leaves_the_chain_unpinned` |
+| 轮换模式不把死 pin 丢给 urltest | `test_rotate_mode_never_unpins_a_dead_chain_node` |
+| 环回入站被拒不算节点失败 | `test_a_refused_loopback_dial_never_strikes_the_node` |
 | 拨号失败自动换下一个 | `test_backend_dial_failure_steps_to_the_next_node` |
 | 真连接 round-robin | `test_balancer_round_robins_real_connections` |
 

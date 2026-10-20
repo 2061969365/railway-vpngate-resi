@@ -2643,6 +2643,16 @@ class RailwayManager:
         if not cands:
             if streak < PINNED_FAIL_THRESHOLD:
                 return "pinned"
+            if self.resi_rotate:
+                # Rotate mode keeps the chain pinned to exactly one node. With
+                # the pin dropped the chain falls back to urltest over the very
+                # endpoints the rotation is dialing, and both paths fight for
+                # VPNGate's single session per node: /ws-resi keeps working
+                # while /ws-chain silently dies ("one dead, two dead").
+                with self._lock:
+                    self._pinned_fail_streak = 0
+                self._record_history("auto-pin-kept", f"{tag} dead but rotate mode keeps the chain pinned")
+                return "pinned"
             with self._lock:
                 self._pinned_fail_streak = 0
             with self._config_lock:
@@ -3056,6 +3066,28 @@ class RailwayManager:
                         break
                 break
         if pinned is None:
+            if self.resi_rotate:
+                # Rotate mode must never run with the chain unpinned: an
+                # unpinned chain uses the urltest group, i.e. the same nodes the
+                # rotation dials, and the two fight over VPNGate's one session
+                # per node. Pin the best *dial-verified* node even without an
+                # exit probe; the pin is what lets the rotation exclude it.
+                pinned = best
+                pinned_second = None    # never invent an unverified standby
+                with self._config_lock:
+                    if not self._apply_config(final="auto", preferred=pinned, backup=pinned_second):
+                        self._record_history("auto-pin-failed", pinned)
+                        return
+                    with self._lock:
+                        if self.preferred_tag is not None:
+                            self._record_history("auto-pin-skipped", "pin won the race")
+                            return
+                        self.preferred_tag = pinned; self.backup_tag = pinned_second; self._auto_pinned = True
+                        self.status["preferred_tag"] = pinned; self.status["backup_tag"] = pinned_second; self.status["auto_pinned"] = True
+                        self._persist_state()
+                self._invalidate_verify(f"auto-pinned to {pinned} (unverified, rotate mode)")
+                self._record_history("auto-pin-unverified", f"rotate mode pins {pinned} without exit ip")
+                return
             self._record_history("auto-pin-skipped", "no exit ip")
             return
         with self._config_lock:
@@ -3396,7 +3428,13 @@ class RailwayManager:
                     backend = socket.create_connection(("127.0.0.1", port), timeout=10)
                     break
                 except OSError:
-                    self._resi_mark_fail(tag)
+                    # A refused *loopback* dial is not the node's fault: the
+                    # rotate inbound only disappears while sing-box is being
+                    # restarted, and striking nodes for that would park healthy
+                    # ones during a pin change. Just step to the next route.
+                    if attempt == 0:
+                        self._record_history("resi-inbound-missing",
+                                             f"loopback :{port} refused, stepping over {tag}")
                     route = self._resi_next_route() if attempt < 2 else None
                     if route is None:
                         break

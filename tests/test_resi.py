@@ -13,8 +13,8 @@ import time
 import unittest
 from unittest import mock
 
-from railway_manager import (RESI_NODE_STRIKES_DOWN, RailwayManager, _pump_pair,
-                             build_config_from_env)
+from railway_manager import (PINNED_FAIL_THRESHOLD, RESI_NODE_STRIKES_DOWN, RailwayManager,
+                             _pump_pair, build_config_from_env)
 from vpngate_to_singbox import (DEFAULT_RESI_PORT, RESI_IN_PORT,
                                 RESI_ROTATE_BASE, _collect_rotate_samples,
                                 build_singbox_config, render_resi_username)
@@ -589,6 +589,60 @@ class RotateManagerTests(unittest.TestCase):
 
         self.assertIsNone(route)
         self.assertEqual(0, pool_size)
+
+    def test_rotate_mode_never_leaves_the_chain_unpinned(self) -> None:
+        # Unpinned, the chain path falls back to urltest over the same endpoints
+        # the rotation dials, and the two fight for VPNGate's one session per
+        # node. Rotate mode therefore pins the best dial-verified node even when
+        # the exit probe fails, so the rotation has one node to exclude.
+        manager = self._manager()
+        try:
+            manager._nodes = [
+                {"real_latency_ms": 10, "endpoint": _endpoint("vpngate-a")},
+                {"real_latency_ms": 20, "endpoint": _endpoint("vpngate-b")},
+                {"real_latency_ms": 30, "endpoint": _endpoint("vpngate-c")},
+            ]
+            manager.verify_fn = lambda endpoint: (None, None)
+            with mock.patch.object(RailwayManager, "_check_config", return_value=True), \
+                    mock.patch.object(RailwayManager, "_restart_singbox"):
+                manager._auto_pin_best(manager._nodes, None)
+            # _apply_config rebuilds the route table from status["endpoints"],
+            # which this test bypasses: publish it after the pin instead.
+            manager._set_resi_routes([("vpngate-a", RESI_ROTATE_BASE),
+                                      ("vpngate-b", RESI_ROTATE_BASE + 1),
+                                      ("vpngate-c", RESI_ROTATE_BASE + 2)])
+            pinned = manager.preferred_tag
+            backup = manager.backup_tag
+            pool = [tag for tag, _ in manager._resi_pool()]
+        finally:
+            manager.stop()
+            self._cleanup(manager)
+
+        self.assertEqual("vpngate-a", pinned)
+        self.assertIsNone(backup)   # an unverified node never becomes standby
+        self.assertEqual(["vpngate-b", "vpngate-c"], pool)
+
+    def test_rotate_mode_never_unpins_a_dead_chain_node(self) -> None:
+        # Dropping the pin would hand the chain to urltest, which is exactly the
+        # collision this design avoids: keep the pin and let the node recover.
+        manager = self._manager()
+        try:
+            manager._nodes = [
+                {"server": "198.51.100.1", "server_port": 443,
+                 "real_latency_ms": 10, "endpoint": _endpoint("vpngate-a")},
+            ]
+            with manager._lock:
+                manager.preferred_tag = "vpngate-a"
+                manager._pinned_fail_streak = PINNED_FAIL_THRESHOLD - 1
+            with mock.patch("railway_manager.probe_tcp_latency", return_value=0):
+                state = manager.check_pinned_health()
+            pinned = manager.preferred_tag
+        finally:
+            manager.stop()
+            self._cleanup(manager)
+
+        self.assertEqual("pinned", state)
+        self.assertEqual("vpngate-a", pinned)
 
     def test_rebuilding_the_table_resets_the_cursor(self) -> None:
         manager = self._manager()
@@ -1346,6 +1400,35 @@ class RotateManagerTests(unittest.TestCase):
         self.assertTrue(backend.close.called)
         self.assertEqual(0, inflight)
         self.assertFalse(worker.is_alive())
+
+    def test_a_refused_loopback_dial_never_strikes_the_node(self) -> None:
+        # The rotate inbound is gone for a moment whenever sing-box restarts
+        # (pin change/rescue). That is not the node's fault: striking it would
+        # park healthy nodes exactly when the service is recovering.
+        manager = self._manager(resi_port=_free_port())
+        client, peer = socket.socketpair()
+        worker = threading.Thread(target=manager._handle_resi_client,
+                                  args=(client, b"GET /ws-resi HTTP/1.1\r\n\r\n"),
+                                  daemon=True)
+        try:
+            manager._set_resi_routes([("vpngate-a", RESI_ROTATE_BASE),
+                                      ("vpngate-b", RESI_ROTATE_BASE + 1)])
+            with mock.patch("railway_manager.socket.create_connection",
+                            side_effect=ConnectionRefusedError("no listener")):
+                worker.start()
+                worker.join(timeout=5)
+            health = dict(manager._resi_health)
+            pool = [tag for tag, _ in manager._resi_pool()]
+            inflight = manager._mux_inflight
+        finally:
+            peer.close()
+            manager.stop()
+            self._cleanup(manager)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual({}, {k: v for k, v in health.items() if v.get("strikes")})
+        self.assertEqual(["vpngate-a", "vpngate-b"], pool)
+        self.assertEqual(0, inflight)
 
 
 class RotateSampleTests(unittest.TestCase):
