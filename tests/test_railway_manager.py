@@ -518,7 +518,7 @@ class FullProbeTests(unittest.TestCase):
 
 
 class FullProbeWorkersTests(unittest.TestCase):
-    """Full probe dials concurrently (default 2, FULL_PROBE_WORKERS)."""
+    """Full probe dials concurrently (default 3, FULL_PROBE_WORKERS)."""
 
     TOKEN = "test-admin-token-0123456789abcdef"
 
@@ -591,7 +591,7 @@ class FullProbeWorkersTests(unittest.TestCase):
     def test_full_probe_workers_default_and_env(self) -> None:
         base = {"PORT": "3000", "PROXY_USER": "u",
                 "PROXY_PASS": "0123456789abcdef"}
-        self.assertEqual(2, build_config_from_env(dict(base))["full_probe_workers"])
+        self.assertEqual(3, build_config_from_env(dict(base))["full_probe_workers"])
         override = dict(base, FULL_PROBE_WORKERS="2")
         self.assertEqual(2, build_config_from_env(override)["full_probe_workers"])
 
@@ -1241,7 +1241,9 @@ class PinnedHealthTests(unittest.TestCase):
                 self.assertEqual(["vpngate-1", "vpngate-2", "auto"],
                                  chain["outbounds"])
                 events = [e["event"] for e in manager.status["refresh_history"]]
-                self.assertIn("auto-rescue", events)
+                # "auto-rescue-stale" when no candidate had a fresh verify:
+                # the rescue still happens, it is just based on stale data.
+                self.assertTrue([e for e in events if e.startswith("auto-rescue")])
             finally:
                 manager.stop()
 

@@ -13,7 +13,7 @@ import time
 import unittest
 from unittest import mock
 
-from railway_manager import RailwayManager, build_config_from_env
+from railway_manager import RESI_NODE_STRIKES_DOWN, RailwayManager, build_config_from_env
 from vpngate_to_singbox import (DEFAULT_RESI_PORT, RESI_IN_PORT,
                                 RESI_ROTATE_BASE, _collect_rotate_samples,
                                 build_singbox_config, render_resi_username)
@@ -718,38 +718,49 @@ class RotateManagerTests(unittest.TestCase):
         self.assertEqual("rotate", mode)
 
 
-    def test_rotate_pool_keeps_verified_nodes_only(self) -> None:
+    def test_rotation_pool_keeps_verified_nodes_only(self) -> None:
+        # A node that was never really dialed (or that failed its dial) must
+        # never receive third-path traffic: that is how clients ended up stuck
+        # on dead nodes.
         manager = self._manager(resi_port=_free_port())
         try:
-            serving = [
+            manager._nodes = [
                 {"real_latency_ms": 30, "endpoint": _endpoint("vpngate-a")},
                 {"real_latency_ms": None, "endpoint": _endpoint("vpngate-b")},
                 {"real_latency_ms": 10, "endpoint": _endpoint("vpngate-c")},
             ]
-            pool = [n["endpoint"]["tag"] for n in manager._rotate_nodes(serving)]
+            manager._set_resi_routes([("vpngate-a", RESI_ROTATE_BASE),
+                                      ("vpngate-b", RESI_ROTATE_BASE + 1),
+                                      ("vpngate-c", RESI_ROTATE_BASE + 2)])
+            pool = [tag for tag, _ in manager._resi_pool()]
         finally:
             manager.stop()
             self._cleanup(manager)
 
         self.assertEqual(["vpngate-a", "vpngate-c"], pool)
 
-    def test_rotate_pool_falls_back_until_two_nodes_are_verified(self) -> None:
+    def test_rotation_pool_is_empty_until_a_node_is_verified(self) -> None:
+        # No silent fallback to the unverified snapshot (old design §2).
         manager = self._manager(resi_port=_free_port())
         try:
-            serving = [
-                {"real_latency_ms": 30, "endpoint": _endpoint("vpngate-a")},
+            manager._nodes = [
+                {"real_latency_ms": None, "endpoint": _endpoint("vpngate-a")},
                 {"real_latency_ms": None, "endpoint": _endpoint("vpngate-b")},
             ]
-            pool = [n["endpoint"]["tag"] for n in manager._rotate_nodes(serving)]
-            empty = manager._rotate_nodes([])
+            manager._set_resi_routes([("vpngate-a", RESI_ROTATE_BASE),
+                                      ("vpngate-b", RESI_ROTATE_BASE + 1)])
+            pool = manager._resi_pool()
+            route = manager._resi_next_route()
         finally:
             manager.stop()
             self._cleanup(manager)
 
-        self.assertEqual(["vpngate-a", "vpngate-b"], pool)
-        self.assertEqual([], empty)
+        self.assertEqual([], pool)
+        self.assertIsNone(route)
 
-    def test_apply_config_rotates_over_verified_nodes_only(self) -> None:
+    def test_apply_config_creates_one_inbound_per_serving_node(self) -> None:
+        # The config must not encode the *health* pool: one inbound per serving
+        # node, always, so verification results never rewrite the file.
         manager = self._manager()
         try:
             manager._nodes = [
@@ -763,23 +774,60 @@ class RotateManagerTests(unittest.TestCase):
             with mock.patch.object(RailwayManager, "_check_config", return_value=True):
                 manager._apply_config()
             ports = list(manager._resi_ports)
-            nodes = manager.status["resi"]["nodes"]
+            pool = manager.status["resi"]["pool"]
+            inbounds = manager.status["resi"]["inbounds"]
             with open(manager.config_path, encoding="utf-8") as handle:
                 cfg = json.load(handle)
         finally:
             manager.stop()
             self._cleanup(manager)
 
-        self.assertEqual([RESI_ROTATE_BASE, RESI_ROTATE_BASE + 1], ports)
-        self.assertEqual(2, nodes)
+        self.assertEqual([RESI_ROTATE_BASE, RESI_ROTATE_BASE + 1, RESI_ROTATE_BASE + 2],
+                         ports)
+        self.assertEqual(2, pool)          # vpngate-2 was never dialed
+        self.assertEqual(3, inbounds)
         self.assertEqual(3, len(cfg["endpoints"]))
         rot = [i["tag"] for i in cfg["inbounds"] if i["tag"].startswith("resi-rot-")]
-        self.assertEqual(["resi-rot-0", "resi-rot-1"], rot)
+        self.assertEqual(["resi-rot-0", "resi-rot-1", "resi-rot-2"], rot)
 
-    def test_full_probe_grows_the_rotation_pool(self) -> None:
+    def test_probe_results_do_not_rewrite_the_config(self) -> None:
+        # Regression: any health/pool change used to rewrite the config and
+        # restart sing-box, killing the direct and chain paths together with
+        # the third one ("一个死两个一起死").
+        manager = self._manager()
+        try:
+            manager._nodes = [
+                {"server": f"198.51.100.{i + 1}", "server_port": 443,
+                 "latency_ms": 100 + i, "real_latency_ms": 20 + i,
+                 "endpoint": _endpoint(f"vpngate-{i}")} for i in range(3)]
+            with mock.patch.object(RailwayManager, "_check_config", return_value=True), \
+                    mock.patch.object(RailwayManager, "_restart_singbox") as restart:
+                manager._apply_config()
+                restart.reset_mock()
+                first = sorted(manager._resi_ports)
+                with open(manager.config_path, "rb") as handle:
+                    before = handle.read()
+                # One node dies, another is re-verified slower: pool changes,
+                # config must not.
+                manager._nodes[0]["real_latency_ms"] = None
+                manager._nodes[1]["real_latency_ms"] = 999
+                manager._apply_config()
+                with open(manager.config_path, "rb") as handle:
+                    after = handle.read()
+            restarts = restart.call_count
+            pool = manager.status["resi"]["pool"]
+        finally:
+            manager.stop()
+            self._cleanup(manager)
+
+        self.assertEqual(before, after)
+        self.assertEqual(0, restarts)
+        self.assertEqual(2, pool)
+        self.assertEqual(3, len(first))
+
+    def test_full_probe_grows_the_pool_without_touching_the_config(self) -> None:
         # Regression: the post-refresh full pass is what verifies the nodes
-        # REAL_TOPK skipped. Without it the pool stays at REAL_TOPK while
-        # 60-70% of a 100-node snapshot is actually usable.
+        # REAL_TOPK skipped; it must grow the *runtime* pool, not the file.
         manager = self._manager()
         try:
             manager._nodes = [
@@ -787,26 +835,87 @@ class RotateManagerTests(unittest.TestCase):
                  "latency_ms": 100 + i,
                  "real_latency_ms": (20 + i if i < 2 else None),
                  "endpoint": _endpoint(f"vpngate-{i}")} for i in range(4)]
-            with mock.patch.object(RailwayManager, "_check_config", return_value=True):
-                manager._apply_config()
-                before = list(manager._resi_ports)
+            with mock.patch.object(RailwayManager, "_check_config", return_value=True), \
+                    mock.patch.object(RailwayManager, "_restart_singbox") as restart:
+                # Keep the pin fixed: an auto-pin change is a legitimate config
+                # rewrite, and this test is about the pool/health path only.
+                manager.preferred_tag = "vpngate-0"
+                manager._apply_config(final="auto", preferred="vpngate-0")
+                restart.reset_mock()
+                before = manager.status["resi"]["pool"]
+                with open(manager.config_path, "rb") as handle:
+                    cfg_before = handle.read()
                 # Every node really dials this time: the pool must grow to all 4.
                 manager.dial_fn = lambda node: 30
                 manager.verify_fn = lambda endpoint: ("198.51.100.9", 5)
                 manager._run_full_probe_inner()
-            after = list(manager._resi_ports)
-            nodes = manager.status["resi"]["nodes"]
-            with open(manager.config_path, encoding="utf-8") as handle:
-                cfg = json.load(handle)
+                after = manager.status["resi"]["pool"]
+                inbounds = manager.status["resi"]["inbounds"]
+                with open(manager.config_path, "rb") as handle:
+                    cfg_after = handle.read()
+            restarts = restart.call_count
         finally:
             manager.stop()
             self._cleanup(manager)
 
-        self.assertEqual(2, len(before))
-        self.assertEqual([RESI_ROTATE_BASE + i for i in range(4)], after)
-        self.assertEqual(4, nodes)
-        rot = [i["tag"] for i in cfg["inbounds"] if i["tag"].startswith("resi-rot-")]
-        self.assertEqual(["resi-rot-0", "resi-rot-1", "resi-rot-2", "resi-rot-3"], rot)
+        self.assertEqual(2, before)
+        self.assertEqual(4, after)
+        self.assertEqual(4, inbounds)
+        self.assertEqual(cfg_before, cfg_after)
+        self.assertEqual(0, restarts)      # a probe result never restarts sing-box
+
+    def test_a_failing_node_is_parked_then_returns(self) -> None:
+        manager = self._manager(resi_port=_free_port())
+        try:
+            manager._set_resi_routes([("vpngate-a", RESI_ROTATE_BASE),
+                                      ("vpngate-b", RESI_ROTATE_BASE + 1)])
+            for _ in range(RESI_NODE_STRIKES_DOWN):
+                manager._resi_note_connection("vpngate-a", 200, 128, 0.4, True)
+            pool = [tag for tag, _ in manager._resi_pool()]
+            # Expire the window: the node is tried again (and can recover).
+            manager._resi_health["vpngate-a"]["down_until"] = 0.0
+            recovered = [tag for tag, _ in manager._resi_pool()]
+            manager._resi_note_connection("vpngate-a", 200, 4096, 0.4, True)
+            health = dict(manager._resi_health.get("vpngate-a") or {})
+        finally:
+            manager.stop()
+            self._cleanup(manager)
+
+        self.assertEqual(["vpngate-b"], pool)
+        self.assertEqual(["vpngate-a", "vpngate-b"], recovered)
+        self.assertEqual({}, health)
+
+    def test_client_side_closes_never_count_as_strikes(self) -> None:
+        # A client that closes first (idle keep-alive, tcping) must not park a
+        # healthy node.
+        manager = self._manager(resi_port=_free_port())
+        try:
+            manager._set_resi_routes([("vpngate-a", RESI_ROTATE_BASE)])
+            for _ in range(RESI_NODE_STRIKES_DOWN * 2):
+                manager._resi_note_connection("vpngate-a", 1, 128, 0.1, False)
+            health = dict(manager._resi_health.get("vpngate-a") or {})
+            pool = manager._resi_pool()
+        finally:
+            manager.stop()
+            self._cleanup(manager)
+
+        self.assertEqual(0, health.get("strikes", 0))
+        self.assertEqual(["vpngate-a"], [tag for tag, _ in pool])
+
+    def test_an_all_parked_pool_still_serves_the_least_recent_failure(self) -> None:
+        manager = self._manager(resi_port=_free_port())
+        try:
+            manager._set_resi_routes([("vpngate-a", RESI_ROTATE_BASE),
+                                      ("vpngate-b", RESI_ROTATE_BASE + 1)])
+            now = time.monotonic()
+            manager._resi_health["vpngate-a"] = {"strikes": 0, "downs": 1, "down_until": now + 200}
+            manager._resi_health["vpngate-b"] = {"strikes": 0, "downs": 1, "down_until": now + 100}
+            pool = manager._resi_pool()
+        finally:
+            manager.stop()
+            self._cleanup(manager)
+
+        self.assertEqual(["vpngate-b"], [tag for tag, _ in pool])
 
     @staticmethod
     def _fake_backend(tag: str) -> tuple[socket.socket, int]:
@@ -904,6 +1013,133 @@ class RotateManagerTests(unittest.TestCase):
             self._cleanup(manager)
 
         self.assertIn(b"401", received)
+
+    def test_node_close_tears_the_connection_down_at_once(self) -> None:
+        # Regression: the pipe waited for client->backend to end first, so a
+        # node that dropped us left the client hanging for the whole idle
+        # timeout - the "stuck on a dead node" symptom.
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        backend_port = srv.getsockname()[1]
+
+        def serve() -> None:
+            try:
+                conn, _ = srv.accept()
+                conn.recv(4096)
+                time.sleep(0.2)
+                conn.close()
+            except OSError:
+                return
+
+        threading.Thread(target=serve, daemon=True).start()
+        manager = self._manager(resi_port=_free_port())
+        manager._set_resi_ports([backend_port])
+        client, peer = socket.socketpair()
+        worker = threading.Thread(target=manager._handle_resi_client,
+                                  args=(client,), daemon=True)
+        try:
+            worker.start()
+            peer.sendall(b"GET /ws-resi HTTP/1.1\r\n\r\n")
+            peer.settimeout(5)
+            started = time.monotonic()
+            received = peer.recv(64)
+            elapsed = time.monotonic() - started
+            worker.join(timeout=5)
+            alive = worker.is_alive()
+        finally:
+            peer.close()
+            srv.close()
+            manager.stop()
+            self._cleanup(manager)
+
+        self.assertEqual(b"", received)   # the node dropped us, so did the mux
+        self.assertLess(elapsed, 4.0)
+        self.assertFalse(alive)
+
+    def test_a_fast_node_drop_is_counted_as_a_strike(self) -> None:
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        backend_port = srv.getsockname()[1]
+
+        def serve() -> None:
+            try:
+                conn, _ = srv.accept()
+                conn.recv(4096)
+                conn.close()
+            except OSError:
+                return
+
+        threading.Thread(target=serve, daemon=True).start()
+        manager = self._manager(resi_port=_free_port())
+        manager._set_resi_ports([backend_port])
+        client, peer = socket.socketpair()
+        worker = threading.Thread(target=manager._handle_resi_client,
+                                  args=(client,), daemon=True)
+        try:
+            worker.start()
+            peer.sendall(b"GET /ws-resi HTTP/1.1\r\n\r\n")
+            peer.settimeout(5)
+            try:
+                peer.recv(64)
+            except socket.timeout:
+                pass
+            worker.join(timeout=5)
+            health = dict(manager._resi_health.get(f"port-{backend_port}") or {})
+        finally:
+            peer.close()
+            srv.close()
+            manager.stop()
+            self._cleanup(manager)
+
+        self.assertEqual(1, health.get("strikes", 0))
+
+    def test_a_slow_node_side_failure_also_counts_as_a_strike(self) -> None:
+        # A blackholed node makes sing-box sit on the dial for ~10s before it
+        # closes: that is still a dead node, not a healthy one.
+        manager = self._manager(resi_port=_free_port())
+        try:
+            manager._set_resi_routes([("vpngate-a", RESI_ROTATE_BASE)])
+            manager._resi_note_connection("vpngate-a", 200, 128, 12.0, True)
+            strikes = (manager._resi_health.get("vpngate-a") or {}).get("strikes")
+        finally:
+            manager.stop()
+            self._cleanup(manager)
+
+        self.assertEqual(1, strikes)
+
+    def test_a_long_idle_close_is_not_a_strike(self) -> None:
+        # Idle NAT reaping closes a perfectly good tunnel after a minute or
+        # more; that must not park the node.
+        manager = self._manager(resi_port=_free_port())
+        try:
+            manager._set_resi_routes([("vpngate-a", RESI_ROTATE_BASE)])
+            for _ in range(RESI_NODE_STRIKES_DOWN * 2):
+                manager._resi_note_connection("vpngate-a", 200, 128, 45.0, True)
+            health = dict(manager._resi_health.get("vpngate-a") or {})
+        finally:
+            manager.stop()
+            self._cleanup(manager)
+
+        self.assertEqual(0, health.get("strikes", 0))
+
+    def test_a_silent_node_side_strikes_even_after_the_idle_window(self) -> None:
+        # Nothing came back down for the full idle timeout: the node carried no
+        # payload at all, so the client must not keep being sent there.
+        manager = self._manager(resi_port=_free_port())
+        try:
+            manager._set_resi_routes([("vpngate-a", RESI_ROTATE_BASE)])
+            manager._resi_note_connection("vpngate-a", 200, 128, 120.0, False,
+                                          down_idle=True)
+            strikes = (manager._resi_health.get("vpngate-a") or {}).get("strikes")
+        finally:
+            manager.stop()
+            self._cleanup(manager)
+
+        self.assertEqual(1, strikes)
 
     def test_backend_dial_failure_steps_to_the_next_node(self) -> None:
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

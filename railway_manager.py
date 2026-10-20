@@ -48,6 +48,17 @@ EXIT_VERIFY_CAP = 3
 REFRESH_PROBE_GRACE = 30.0
 MAX_SERVING_ENDPOINTS = 100
 VERIFY_STALE_AFTER_SEC = 600
+# Third path (rotate mode) runtime health. A node that kicks us out without
+# ever carrying payload is failing; three of those in a row park it for a while
+# so the balancer stops handing it clients, and success restores it at once.
+RESI_NODE_STRIKES_DOWN = 3
+RESI_NODE_DOWN_BASE = 120.0
+RESI_NODE_DOWN_MAX = 900.0
+RESI_PAYLOAD_BYTES = 1024
+# A node-initiated close within this window, with no payload, is a failure.
+# Longer than this the node plausibly held an idle tunnel (keepalive reaping
+# closes idle NAT mappings), so it must not feed the strike counter.
+RESI_FAIL_MAX_SECONDS = 30.0
 SETTINGS_SPEC: dict = {
     "refresh_seconds": {"type": "int", "min": 300, "max": 86400},
     "dial_timeout": {"type": "int", "min": 5, "max": 60},
@@ -841,7 +852,9 @@ function renderRoutes(s) {
     const kind = document.getElementById("route-resi-kind");
     if (kind) kind.textContent = rotate ? "节点轮换" : "住宅出口";
     const cell = document.getElementById("route-resi");
-    if (cell) cell.textContent = rotate ? ((resi.nodes || 0) + " 个节点") : (resi.exit_ip || "未探测");
+    if (cell) cell.textContent = rotate
+      ? ((resi.pool || 0) + " / " + (resi.inbounds || resi.nodes || 0) + " 可用")
+      : (resi.exit_ip || "未探测");
   }
   renderResi(s);
 }
@@ -852,7 +865,9 @@ function renderResi(s) {
   if (!r.enabled) { card.hidden = true; return; }
   card.hidden = false;
   const rotate = r.mode === "rotate";
-  const mode = rotate ? ("节点池 " + (r.nodes || 0) + " 个 · 每连接轮换")
+  const mode = rotate
+    ? ("节点池 " + (r.pool || 0) + "/" + (r.inbounds || 0) + " 可用 · 每连接轮换" +
+       (r.down ? (" · " + r.down + " 个临时剔除") : ""))
     : (r.mode === "sticky" ? ("粘性 · ttl " + r.sticky_ttl + "s") : "旋转");
   const where = rotate ? ("入口 :" + r.port + r.path) : ("网关 " + r.host + ":" + r.port);
   const state = r.state === "up" ? "正常" : (r.state === "down" ? "不可用" : "未探测");
@@ -1616,6 +1631,74 @@ def _forward(source: socket.socket, dest: socket.socket) -> int:
     except OSError:
         pass
     return moved
+def _forward_counted(source: socket.socket, dest: socket.socket, sink: list,
+                     ended: list | None = None, slot: int = 0,
+                     timed_out: list | None = None) -> int:
+    """Copy one direction and record progress for the health watchdog."""
+    moved = 0
+    try:
+        while True:
+            try:
+                chunk = source.recv(65536)
+            except socket.timeout:
+                if timed_out is not None:
+                    timed_out[slot] = True
+                break
+            if not chunk:
+                break
+            dest.sendall(chunk)
+            moved += len(chunk)
+            sink[0] = moved
+    except OSError:
+        pass
+    finally:
+        if ended is not None:
+            ended[slot] = time.monotonic()
+    return moved
+def _pump_pair(a: socket.socket, b: socket.socket, started: float) -> dict:
+    """Byte-copy both directions and tear down as soon as either side ends.
+
+    Waiting only for a->b (the original code) left the client hanging for the
+    whole idle timeout whenever the *upstream* dropped the connection first -
+    which is exactly what a dead VPNGate node does, so a dead node looked like
+    a stall instead of a fast failure the client could retry.
+    """
+    up = [0]; down = [0]; ended = [0.0, 0.0]; timed_out = [False, False]
+    events = [threading.Event(), threading.Event()]
+    def _run(src, dst, sink, slot: int) -> None:
+        try:
+            _forward_counted(src, dst, sink, ended, slot, timed_out)
+        finally:
+            events[slot].set()
+    first = threading.Thread(target=_run, args=(a, b, up, 0), daemon=True)
+    second = threading.Thread(target=_run, args=(b, a, down, 1), daemon=True)
+    first.start(); second.start()
+    deadline = started + PIPE_IDLE_TIMEOUT + 5
+    while not (events[0].is_set() or events[1].is_set()):
+        if time.monotonic() > deadline:
+            break
+        time.sleep(0.05)
+    finished = 0 if events[0].is_set() else 1
+    events[1 - finished].wait(timeout=1.0)  # flush grace for the surviving side
+    for sock in (a, b):
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+    first.join(timeout=2); second.join(timeout=2)
+    if first.is_alive() or second.is_alive():
+        # shutdown() does not reliably wake a blocked recv on every platform;
+        # closing does, and both directions are already dead at this point.
+        for sock in (a, b):
+            try:
+                sock.close()
+            except OSError:
+                pass
+        first.join(timeout=2); second.join(timeout=2)
+    return {"up": up[0], "down": down[0], "ended": ended,
+            "upstream_first": bool(ended[0] and ended[1] and ended[0] <= ended[1]),
+            "timed_out": timed_out,
+            "elapsed": max(0.0, time.monotonic() - started)}
 def _reap_process(proc, handle=None) -> None:
     if proc is not None:
         try:
@@ -1695,7 +1778,8 @@ class RailwayManager:
         self.resi = dict(resi) if resi else None; self.resi_port = resi_port; self.resi_path = resi_path
         self.resi_session_ttl = int(resi_session_ttl or 0)
         self.resi_rotate = bool(resi_rotate)
-        self._resi_ports: list[int] = []; self._resi_cursor = 0; self._resi_listener = None
+        self._resi_routes: list[tuple[str, int]] = []; self._resi_cursor = 0; self._resi_listener = None
+        self._resi_health: dict[str, dict] = {}
         self._resi_session_id = ""; self._resi_session_started = 0.0; self._resi_lock = threading.Lock(); self._resi_probe_lock = threading.Lock()
         self.tunnel_token = tunnel_token; self.cloudflared_bin = cloudflared_bin; self.disguise_path = disguise_path
         self._cloudflared_proc = None; self.preferred_tag = None; self.backup_tag = None; self._auto_pinned = False
@@ -1712,6 +1796,7 @@ class RailwayManager:
         elif self.resi_rotate:
             resi_status = {"enabled": True, "mode": "rotate", "listen": "0.0.0.0",
                 "port": resi_port, "path": resi_path, "nodes": 0, "cursor": 0,
+                "inbounds": 0, "pool": 0, "down": 0,
                 "state": "unknown", "exit_ip": None, "ms": None, "checked_at": None, "error": None,
                 "last_probe": {"state": "idle", "ips": [], "distinct": 0, "rotating": None, "checked_at": None}}
         else:
@@ -2164,23 +2249,11 @@ class RailwayManager:
         backend.settimeout(PIPE_IDLE_TIMEOUT)
         try:
             backend.sendall(peek)
-            up = [0]; down = [0]
-            first = threading.Thread(target=lambda: up.__setitem__(0, _forward(client, backend)), daemon=True)
-            second = threading.Thread(target=lambda: down.__setitem__(0, _forward(backend, client)), daemon=True)
-            first.start(); second.start(); first.join()
-            # Let bytes already read from the backend reach the client before
-            # tearing the pair down; a WebSocket close right after a data frame
-            # would otherwise be truncated by the shutdown below.
-            second.join(timeout=1.0)
-            for sock in (client, backend):
-                try:
-                    sock.shutdown(socket.SHUT_RDWR)
-                except OSError:
-                    pass
-            second.join(timeout=10)
+            started = time.monotonic()
+            stats = _pump_pair(client, backend, started)
             with self._lock:
-                self.status["traffic"]["bytes_up"] += up[0] + len(peek)
-                self.status["traffic"]["bytes_down"] += down[0]
+                self.status["traffic"]["bytes_up"] += stats["up"] + len(peek)
+                self.status["traffic"]["bytes_down"] += stats["down"]
         except OSError:
             pass
         finally:
@@ -2218,6 +2291,14 @@ class RailwayManager:
                 ep["alive_seconds"] = max(0, int((now - seen).total_seconds()))
             except (ValueError, TypeError):
                 ep["alive_seconds"] = 0
+        resi = snapshot.get("resi")
+        if isinstance(resi, dict) and resi.get("enabled") and self.resi_rotate:
+            with self._lock:
+                usable, parked, _ = self._resi_pool_locked()
+                resi["pool"] = usable
+                resi["down"] = parked
+                resi["inbounds"] = len(self._resi_routes)
+                resi["nodes"] = usable
         return snapshot
     def _record_history(self, event: str, detail: str = "") -> None:
         with self._lock:
@@ -2651,18 +2732,31 @@ class RailwayManager:
                     top.append(hit); tags.add(t)
         return top
 
-    def _rotate_nodes(self, serving: list[dict]) -> list[dict]:
-        """Nodes the third path rotates over (design §2: verified nodes).
+    def _ordered_serving(self) -> list[dict]:
+        """Serving nodes in a config-stable order (by endpoint tag).
 
-        Only nodes that passed a real dial (`real_latency_ms` measured) go
-        into the pool, ranked best first. While fewer than two are verified
-        (cold boot, probing still running, or REAL_TOPK=0) fall back to the
-        whole serving set so the third path is never dead for lack of data.
+        Order must not follow latency ranking: every probe reshuffles it, the
+        written config would look "changed", and sing-box would restart -
+        dropping every live connection of all three paths. The pool selection
+        happens at runtime instead (see _resi_pool_locked).
+        """
+        return sorted(self._serving_nodes(),
+                      key=lambda n: ((n.get("endpoint") or {}).get("tag") or "",))
+
+    def _rotate_routes(self, serving: list[dict]) -> list[tuple[str, int]]:
+        """(endpoint tag, loopback port) for every serving node, in config order.
+
+        Rotate mode gives *every* serving node its own VLESS inbound; which of
+        them may actually serve a client is decided at runtime by the health
+        pool, never by rewriting the config. Baking the pool into the config
+        was a real bug: each health change rewrote the file and restarted
+        sing-box, so one dead VPNGate node took the direct and chain paths down
+        with it.
         """
         if not self.resi_rotate:
             return []
-        verified = [n for n in serving if n.get("real_latency_ms") is not None]
-        return verified if len(verified) >= 2 else serving
+        return [((n.get("endpoint") or {}).get("tag") or "", RESI_ROTATE_BASE + i)
+                for i, n in enumerate(serving)]
 
     def _serving_config_unchanged(self, config: dict) -> bool:
         try:
@@ -2675,12 +2769,12 @@ class RailwayManager:
                 return False
         return True
     def _apply_config(self, final: str = "auto", preferred: str | None = None, backup: str | None = None) -> bool:
-        serving = self._serving_nodes()
+        serving = self._ordered_serving()
         resi_outbound = self._resi_outbound()
-        rotate_tags = [n["endpoint"]["tag"] for n in self._rotate_nodes(serving)] if self.resi_rotate else []
+        rotate_routes = self._rotate_routes(serving)
+        rotate_tags = [tag for tag, _ in rotate_routes]
         with self._lock:
             endpoints = [n["endpoint"] for n in serving]
-            rotate_ports = [RESI_ROTATE_BASE + i for i in range(len(rotate_tags))]
             username, password = self.username, self.password; mixed_port = self.mixed_port
             vless_uuid = self.vless_uuid or None; direct_port = self.vless_direct_port; chain_port = self.vless_chain_port
             resi_port = self.resi_port; resi_path = self.resi_path
@@ -2691,7 +2785,7 @@ class RailwayManager:
             resi=resi_outbound, resi_port=resi_port, resi_path=resi_path,
             resi_rotate=self.resi_rotate, resi_rotate_tags=rotate_tags)
         if self.resi_rotate:
-            self._set_resi_ports(rotate_ports)
+            self._set_resi_routes(rotate_routes)
         if want_singbox and self._serving_config_unchanged(config):
             with self._lock:
                 proc = self._singbox_proc
@@ -2889,8 +2983,10 @@ class RailwayManager:
     def _republish_config(self) -> None:
         """Re-apply the serving config from the current node set.
 
-        Needed after every probe pass: the verified set (and therefore the
-        third path's rotation pool) changes even when the auto-pin does not.
+        Needed after a probe pass when the verified set changed the *pin* or
+        the endpoint list. The rotation pool itself is runtime state now, so a
+        plain verification result no longer rewrites the config: _apply_config
+        short-circuits on the unchanged file and sing-box keeps running.
         """
         with self._config_lock:
             with self._lock:
@@ -3082,56 +3178,185 @@ class RailwayManager:
                 continue
             threading.Thread(target=self._handle_resi_client, args=(client,),
                              daemon=True).start()
-    def _resi_next_port(self) -> int | None:
-        """Round-robin the loopback inbound ports; None when nothing to serve."""
+    @property
+    def _resi_ports(self) -> list[int]:
+        """Ports of the published rotate inbounds (config order)."""
         with self._lock:
-            ports = list(self._resi_ports)
-            if not ports:
-                return None
-            port = ports[self._resi_cursor % len(ports)]
-            self._resi_cursor = (self._resi_cursor + 1) % len(ports)
-            resi_status = self.status.get("resi")
-            if isinstance(resi_status, dict) and resi_status.get("enabled"):
-                resi_status["cursor"] = self._resi_cursor
-            return port
-    def _set_resi_ports(self, ports: list[int]) -> None:
-        """Publish the current node -> loopback port table (order = serving order)."""
+            return [port for _, port in self._resi_routes]
+
+    def _set_resi_routes(self, routes: list[tuple[str, int]]) -> None:
+        """Publish the node -> loopback port table (config order = tag order)."""
+        routes = [(str(tag), int(port)) for tag, port in routes]
         with self._lock:
-            changed = list(ports) != self._resi_ports
-            self._resi_ports = list(ports)
+            changed = routes != self._resi_routes
+            self._resi_routes = routes
+            live = {tag for tag, _ in routes}
+            for tag in [t for t in self._resi_health if t not in live]:
+                del self._resi_health[tag]
             if changed:
                 self._resi_cursor = 0
             resi_status = self.status.get("resi")
             if isinstance(resi_status, dict) and resi_status.get("enabled"):
-                resi_status["nodes"] = len(ports)
+                usable, parked, _ = self._resi_pool_locked()
+                resi_status["inbounds"] = len(routes)
+                resi_status["nodes"] = usable
+                resi_status["pool"] = usable
+                resi_status["down"] = parked
                 if changed:
                     resi_status["cursor"] = 0
+
+    def _set_resi_ports(self, ports: list[int]) -> None:
+        """Compat shim: publish ports without node tags (legacy callers/tests)."""
+        self._set_resi_routes([(f"port-{int(p)}", int(p)) for p in ports])
+
+    def _resi_health_ok_locked(self, tag: str, now: float) -> bool:
+        entry = self._resi_health.get(tag)
+        return entry is None or entry.get("down_until", 0.0) <= now
+
+    def _resi_pool_locked(self) -> tuple[int, int, list[tuple[str, int]]]:
+        """(usable, parked, routes) for the third path.
+
+        Only nodes that passed a real dial (`real_latency_ms`) are eligible -
+        never the whole snapshot. Nodes that keep kicking clients out without
+        carrying payload are parked until their down window expires.
+        """
+        routes = self._resi_routes
+        if not routes:
+            return 0, 0, []
+        verified_by_tag: dict[str, bool] = {}
+        for node in self._nodes:
+            tag = (node.get("endpoint") or {}).get("tag")
+            if tag:
+                verified_by_tag[tag] = node.get("real_latency_ms") is not None
+        now = time.monotonic()
+        eligible: list[tuple[str, int]] = []
+        parked: list[tuple[str, int]] = []
+        for tag, port in routes:
+            # A tag with no node behind it (legacy port table) is trusted.
+            if verified_by_tag.get(tag) is False:
+                continue
+            if self._resi_health_ok_locked(tag, now):
+                eligible.append((tag, port))
+            else:
+                parked.append((tag, port))
+        if eligible:
+            return len(eligible), len(parked), eligible
+        if parked:
+            # Everything is parked: hand out the node that failed longest ago.
+            # A fast failure beats a dead third path, and it may have recovered.
+            parked.sort(key=lambda item: (self._resi_health.get(item[0], {}).get("down_until", 0.0), item[0]))
+            return 0, len(parked), parked[:1]
+        return 0, 0, []
+
+    def _resi_pool(self) -> list[tuple[str, int]]:
+        with self._lock:
+            return self._resi_pool_locked()[2]
+
+    def _resi_next_route(self) -> tuple[str, int] | None:
+        """Round-robin over the *usable* nodes; None when the pool is empty."""
+        with self._lock:
+            usable, parked, pool = self._resi_pool_locked()
+            resi_status = self.status.get("resi")
+            if isinstance(resi_status, dict) and resi_status.get("enabled"):
+                resi_status["pool"] = usable
+                resi_status["down"] = parked
+            if not pool:
+                return None
+            route = pool[self._resi_cursor % len(pool)]
+            self._resi_cursor = (self._resi_cursor + 1) % len(pool)
+            if isinstance(resi_status, dict) and resi_status.get("enabled"):
+                resi_status["cursor"] = self._resi_cursor
+            return route
+
+    def _resi_next_port(self) -> int | None:
+        """Compat: the loopback port the next connection would use."""
+        route = self._resi_next_route()
+        return None if route is None else route[1]
+
+    def _resi_mark_ok(self, tag: str) -> None:
+        with self._lock:
+            entry = self._resi_health.get(tag)
+            if entry:
+                self._resi_health.pop(tag, None)
+
+    def _resi_mark_fail(self, tag: str) -> None:
+        """One failure: park the node once the strike limit is reached."""
+        with self._lock:
+            now = time.monotonic()
+            entry = self._resi_health.setdefault(tag, {"strikes": 0, "downs": 0, "down_until": 0.0})
+            if entry.get("down_until", 0.0) > now:
+                return
+            entry["strikes"] = int(entry.get("strikes", 0)) + 1
+            if entry["strikes"] < RESI_NODE_STRIKES_DOWN:
+                return
+            entry["strikes"] = 0
+            entry["downs"] = int(entry.get("downs", 0)) + 1
+            delay = min(RESI_NODE_DOWN_BASE * (2 ** (entry["downs"] - 1)), RESI_NODE_DOWN_MAX)
+            entry["down_until"] = now + delay
+            usable = self._resi_pool_locked()[0]
+            self._set_resi(error=f"{tag} parked for {int(delay)}s after {RESI_NODE_STRIKES_DOWN} fast failures")
+            if usable == 0:
+                self._set_resi(state="down", error="every rotation node is parked, retrying the least recent one")
+            self._record_history("resi-node-parked", f"{tag} down for {int(delay)}s")
+
+    def _resi_note_connection(self, tag: str, up_bytes: int, down_bytes: int,
+                              elapsed: float, backend_closed_first: bool,
+                              down_idle: bool = False) -> None:
+        """Passive health check on real traffic.
+
+        A healthy node either carried payload or kept the connection open; a
+        dead one drops us quickly after only the local WS/VLESS handshake.
+        Client-initiated closes never count (that would punish idle clients),
+        and a connection that lived past RESI_FAIL_MAX_SECONDS counts as
+        healthy: that is an idle-NAT close, not a dead node. The one exception
+        is a *node side* that stayed silent for the whole idle window
+        (``down_idle``): it carried nothing for two minutes, so it is dead.
+        """
+        payload = down_bytes >= RESI_PAYLOAD_BYTES
+        if payload:
+            self._resi_mark_ok(tag)
+            self._set_resi(state="up", error=None)
+            return
+        if up_bytes <= 0:
+            self._resi_mark_ok(tag)
+            return
+        if down_idle or (backend_closed_first and elapsed < RESI_FAIL_MAX_SECONDS):
+            self._resi_mark_fail(tag)
+            return
+        self._resi_mark_ok(tag)
+
     def _handle_resi_client(self, client: socket.socket, prefix: bytes = b"",
                             hold_slot: bool = True) -> None:
         held = False
+        tag = None
+        stats: dict | None = None
         try:
             if hold_slot:
                 if not self._mux_slots.acquire(blocking=False):
                     return
                 held = True
-            port = self._resi_next_port()
-            if port is None:
-                self._set_resi(state="down", error="no serving endpoints")
+            route = self._resi_next_route()
+            if route is None:
+                self._set_resi(state="down",
+                               error="rotation pool empty (waiting for a verified node)")
                 return
+            tag, port = route
             backend = None
-            # Design §4.1: a failed backend dial steps to the next node once
-            # instead of failing the client outright.
-            for _ in range(2):
+            # Design §4.1: a failed backend dial steps to the next node instead
+            # of failing the client outright. Loopback dials are instant, so
+            # three tries cost nothing while dead nodes are being parked.
+            for attempt in range(3):
                 try:
                     backend = socket.create_connection(("127.0.0.1", port), timeout=10)
                     break
                 except OSError:
-                    nxt = self._resi_next_port()
-                    if nxt is None:
+                    self._resi_mark_fail(tag)
+                    route = self._resi_next_route() if attempt < 2 else None
+                    if route is None:
                         break
-                    port = nxt
+                    tag, port = route
             if backend is None:
-                self._set_resi(error=f"backend :{port} unavailable")
+                self._set_resi(error=f"rotate inbound :{port} unavailable")
                 return
             client.settimeout(PIPE_IDLE_TIMEOUT)
             backend.settimeout(PIPE_IDLE_TIMEOUT)
@@ -3142,27 +3367,12 @@ class RailwayManager:
             with self._lock:
                 self._mux_inflight += 1
                 self.status["traffic"]["connections"] += 1
+            started = time.monotonic()
             try:
-                up = [0]; down = [0]
-                first = threading.Thread(
-                    target=lambda: up.__setitem__(0, _forward(client, backend)),
-                    daemon=True)
-                second = threading.Thread(
-                    target=lambda: down.__setitem__(0, _forward(backend, client)),
-                    daemon=True)
-                first.start(); second.start(); first.join()
-                # Same flush grace as _pipe_to_backend: the loopback inbound
-                # may close right after its final frame.
-                second.join(timeout=1.0)
-                for sock in (client, backend):
-                    try:
-                        sock.shutdown(socket.SHUT_RDWR)
-                    except OSError:
-                        pass
-                second.join(timeout=10)
+                stats = _pump_pair(client, backend, started)
                 with self._lock:
-                    self.status["traffic"]["bytes_up"] += up[0] + len(prefix)
-                    self.status["traffic"]["bytes_down"] += down[0]
+                    self.status["traffic"]["bytes_up"] += stats["up"] + len(prefix)
+                    self.status["traffic"]["bytes_down"] += stats["down"]
             finally:
                 try:
                     backend.close()
@@ -3173,6 +3383,14 @@ class RailwayManager:
         except OSError:
             pass
         finally:
+            if tag is not None and stats is not None:
+                # Only a node-initiated close after a short, payload-less
+                # connection (or a node side that never delivered for the whole
+                # idle window) is a strike; see _resi_note_connection.
+                self._resi_note_connection(
+                    tag, stats["up"] + len(prefix), stats["down"],
+                    stats["elapsed"], not stats["upstream_first"],
+                    down_idle=bool(stats.get("timed_out", [False, False])[1]))
             if held:
                 try:
                     self._mux_slots.release()

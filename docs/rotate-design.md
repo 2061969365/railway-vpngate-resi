@@ -261,3 +261,171 @@ UUID 保护的公开端点，不是 API），并把 mux 已经读到的握手字
 
 附带加固：`_pipe_to_backend` / `_handle_resi_client` 在拆连接前给另一方向 1 秒 flush
 宽限——WS 在数据帧之后紧跟 close 时，原来的立即 `shutdown(SHUT_RDWR)` 可能截断末帧。
+
+## 12. 轮换死节点事故复盘 + 设计修订（2026-10-20）
+
+用户反馈（原话）：「旋转切换节点的时候，会旋转切换到失效的未被真测的节点，并且把 chain
+本来能用的也拖累产生，产生矛盾，一个死两个一起死。然后就一直死在失效的节点那里，失效了
+也不会换节点，就一直卡死在那里。」
+
+这三句各自对应一个真实缺陷，而且互相放大。下面按「症状 → 根因 → 修法 → 证据」逐条列，
+不修的也写清楚为什么。
+
+### 12.1 D1：池子写进配置 ⇒ 一个节点死，三条路一起断
+
+- 症状：第三路节点波动时，`/ws-node`、`/ws-chain` 的现有连接成批掉线；日志里能看到
+  sing-box 被反复重启。
+- 根因：旧实现里 rotate 入站**只为「已验证池」生成**（`_rotate_nodes`）。池子一变
+  （探针结果、全量真拨、健康剔除）→ 生成的 JSON 变 → `_apply_config` 判定配置变化 →
+  `_restart_singbox()`。sing-box 是三条路共用的进程，重启等于三条路一起清零。
+  这就是「一个死两个一起死」。
+- 修法：**配置只描述拓扑，不描述健康**。
+  - `_rotate_routes(serving)`：serving 里**每个**节点都拿一条入站（`127.0.0.1:41000+i`，
+    tag `resi-rot-<i>`），与验证结果无关；上限 `MAX_SERVING_ENDPOINTS=100`。
+  - 池子/剔除/游标全部是**运行时状态**（`_resi_routes` + `_resi_health`），只影响
+    mux 把连接拨到哪条 loopback 入站，不落盘。
+  - `_republish_config()` 只在**端点集合**变化时被调用，不再因探针结果触发。
+- 证据：`test_probe_results_do_not_rewrite_the_config`（节点从"活着"变"死"、另一个延迟
+  从 20 变 999，配置文件字节完全相同、`_restart_singbox` 调用次数 0）、
+  `test_full_probe_grows_the_pool_without_touching_the_config`（池 2→4，配置不变）。
+
+### 12.2 D2：从未真拨过的节点也进池（"失效的未被真测的节点"）
+
+- 症状：轮换到某个节点，连上去立刻断；客户端重试又撞上另一批同样没验证过的节点。
+- 根因：旧 `_rotate_nodes` 有个"兜底"：真拨通过数 `< 2` 时**回退到整个 servings 集合**，
+  于是「一个都没验证」「刚刷新完还没拨」这些时刻，池子里全是没验证过（甚至已经挂了）的
+  节点。加上 §11.2 的池子 bug，这个兜底被触发得非常频繁。
+- 修法：兜底删除。池成员唯一来源 = `real_latency_ms is not None`（真拨通过）且未 park。
+  池空时不做"随便拿一个试试"，而是 `_set_resi(state="down", error="rotation pool empty
+  (waiting for a verified node)")`，面板/`/healthz` 直接显示原因。
+- 证据：`test_rotation_pool_keeps_verified_nodes_only`、
+  `test_rotation_pool_is_empty_until_a_node_is_verified`（返回 `[]`、`_resi_next_route()` 为 `None`）。
+
+### 12.3 D3：没有健康状态 ⇒ 死节点永远在池里，且不换（"一直卡死在失效节点"）
+
+- 症状：某个节点在池子里但已经不通，轮换每次轮到它都失败，而且下一轮还会轮到；严重时
+  所有连接都失败但池子看起来还有几十个节点。
+- 根因：旧实现完全没有每节点状态：既不记失败，也不剔除，更不会自动恢复。同时
+  §12.4 的长挂起让每条失败连接要占 120 秒，观感就是"卡死"。
+- 修法（新增运行时健康表 `_resi_health[tag]`）：
+  - `_resi_mark_fail(tag)`：**连续 3 次**（`RESI_NODE_STRIKES_DOWN`）失败才 park，
+    park 时长指数退避 `120s → 240s → 480s → 900s`（`RESI_NODE_DOWN_BASE/MAX`）。
+  - park 到期自动回池（`down_until` 过期），不需要任何配置/重启；`_resi_health`
+    在路由表重建时清理已消失的 tag。
+  - 池子按游标轮转，被 park 的节点直接从候选里去掉——**换节点是即时的**，不等重连。
+  - 全池 park 时**不摆烂**：退化为"挑最早该重试的那个"（`down_until` 最小）继续服务，
+    避免「全死 → 一个都不用 → 面板还是绿的」。
+  - 什么算一次失败（故意保守，避免误伤）：连接由**节点侧先关**、下行 < 1KB
+    （`RESI_PAYLOAD_BYTES`）且发生在 **30 秒内**（`RESI_FAIL_MAX_SECONDS`）——
+    这覆盖了「立刻 RST」和「拨号黑洞卡十几秒后关闭」两种死法。超过 30 秒才被关的
+    连接视为健康（那是空闲 NAT 回收，不是死节点）；客户端自己先关（keep-alive 回收、
+    tcping、测活）**不计**失败；任何传过 1KB 以上下行数据的连接即使随后被关，
+    立即算健康并清零 strikes。
+  - 另一种死法：节点侧**整整 120 秒一个字节都没下行**（`PIPE_IDLE_TIMEOUT` 空闲超时，
+    `down_idle`）——这不算"活得久"，记一次失败，避免客户端被按在死节点上两分钟。
+- 证据：`test_a_failing_node_is_parked_then_returns`（3 次 → 只剩另一个；窗口过期 →
+  回池；成功一次 → 计数清零）、`test_client_side_closes_never_count_as_strikes`、
+  `test_an_all_parked_pool_still_serves_the_least_recent_failure`、
+  `test_a_fast_node_drop_is_counted_as_a_strike`（真 socket 拨号，节点 accept 后立刻关）、
+  `test_a_slow_node_side_failure_also_counts_as_a_strike`（10 秒后才关也算失败）、
+  `test_a_long_idle_close_is_not_a_strike`（45 秒空闲关闭不算失败）、
+  `test_a_silent_node_side_strikes_even_after_the_idle_window`。
+
+### 12.4 D4：上游先死时挂满 120 秒（"卡死在那里"的直接原因）
+
+- 症状：轮换到死节点，客户端不是"快速失败后重试"，而是**画面卡住两分钟**。
+- 根因：`_pipe_to_backend` / `_handle_resi_client` 用 `first.join()` 等客户端→后端
+  方向结束；节点先断时这个方向永远不会结束（客户端还在等响应），于是一条连接占满
+  `PIPE_IDLE_TIMEOUT=120s`，期间还占着 `MAX_CONCURRENT_DIALS=10` 的并发槽。10 条这样的
+  连接就能让第三路整体"假死"。
+- 修法：新增 `_pump_pair(a, b, started)`：
+  - 任一方向结束 ⇒ 立刻拆另一端（`shutdown(SHUT_RDWR)`），不再等另一个方向；
+  - 之前保留的 1 秒 flush 宽限保留，避免截断紧跟数据的 close 帧；
+  - 有界 join（2s），极端平台（`shutdown` 唤不醒阻塞 `recv`）再补一次 close 兜底，
+    不泄漏线程。
+  - 返回值带 `upstream_first`，供健康表判断"是不是节点先关的"。
+- 证据：`test_node_close_tears_the_connection_down_at_once`（节点 0.2s 后关闭，客户端
+  < 4s 收到 EOF，线程不残留）。
+
+### 12.5 D5：配置顺序跟着延迟排名走 ⇒ 每次探针都"看起来变了"
+
+- 根因：旧实现按延迟排序生成入站，探针结果一动，顺序就变，JSON 文本不同 →
+  `_serving_config_unchanged()` 认为变了 → 重启。
+- 修法：`_ordered_serving()`：serving 按 endpoint tag 排序后再生成配置（拓扑稳定）；
+  延迟只用于选 serving 集合（超过 100 个节点时的截断）和链路的 auto-pin。
+- 残留风险（诚实记录）：`MAX_SERVING_ENDPOINTS=100` 截断边界附近的节点排名互换时，
+  serving 集合会变 → 配置变化 → 重启。这属于"拓扑真的变了"，无法避免；已通过
+  tag 排序 + 只在刷新时重算，把频率降到每小时最多一次。
+
+### 12.6 D6：仍会重启 sing-box 的路径（明确边界）
+
+只有两类，且都不是健康/池子驱动的：
+
+| 触发 | 为什么必须重启 | 频率 |
+|---|---|---|
+| 端点集合变化（定时刷新、`LIMIT` 变化、快照里节点消失） | 入站/出站的拓扑变了 | 每小时一次 + 手动刷新 |
+| pin 变化（`auto-rescue`、`auto-pin`、手动 switch） | chain 路的 outbound 顺序变了 | 节点死亡/更优节点出现时 |
+
+`/ws-resi` 的健康表、park、游标、池子**永不**在此列表里（有 §12.1 的回归测试守着）。
+
+### 12.7 D8：游标在路由表变化时被清零 ⇒ 头部节点被反复使用
+
+- 旧行为：任何路由表重建（`_set_resi_routes`）都把 `_resi_cursor` 归零，等于永远从
+  0 号开始轮，尾部节点实际吃不到流量。
+- 修法：游标只在**路由表内容真的变化**时归零（节点集合变了，从头轮起是合理的），
+  健康/池子变化不碰它；每取一个候选 `cursor += 1`，天然 round-robin，遍历一遍池子才回头。
+  旧实现的归零发生在「池子一变就重建路由表」的路径上，等价于每次探针后都从头开始。
+- 证据：`test_cursor_cycles_and_wraps`（旧测试保留）、`test_rebuilding_the_table_resets_the_cursor`
+  （表内容变化才重置）。
+
+### 12.8 D9：空池/全 park 时的对外表现
+
+- `/ws-resi` 的 VLESS 握手仍然成功（101），随后立即关闭：客户端（v2rayN/sing-box）
+  会自然重试，比"握手失败"更容易被客户端正确归类。
+- 状态里 `mode=rotate` 不变，但 `pool=0` 且 `error` 写明原因；面板第三路卡片显示
+  `池 0/N 可用`，不再误导成"正常"。
+
+### 12.9 不变量（后续改动必须守住）
+
+1. **健康/池子决策不得写配置文件、不得重启 sing-box**（`/ws-resi` 的抖动不能影响
+   前两路）。回归测试：`test_probe_results_do_not_rewrite_the_config`。
+2. **池成员 = 真拨通过 且 未 park**；没有"猜一个"的兜底。
+3. **任一方向的连接结束 ⇒ 另一方向在 5 秒内拆掉**（不得挂到 `PIPE_IDLE_TIMEOUT`）。
+4. **配置稳定**：同样的节点集合 → 同样的 JSON 字节（顺序按 tag，不带延迟字段）。
+
+### 12.10 测试矩阵（`tests/test_resi.py`，69 项全绿）
+
+| 场景 | 测试 |
+|---|---|
+| 池只含真拨通过的节点 | `test_rotation_pool_keeps_verified_nodes_only` |
+| 没有验证过 → 池空、不兜底 | `test_rotation_pool_is_empty_until_a_node_is_verified` |
+| 每个 serving 节点一条入站 | `test_apply_config_creates_one_inbound_per_serving_node` |
+| 健康变化不重写配置/不重启 | `test_probe_results_do_not_rewrite_the_config` |
+| 全量真拨只扩池不改配置 | `test_full_probe_grows_the_pool_without_touching_the_config` |
+| 三振 park + 到期回池 + 成功清零 | `test_a_failing_node_is_parked_then_returns` |
+| 客户端先关不算失败 | `test_client_side_closes_never_count_as_strikes` |
+| 全 park 仍有兜底 | `test_an_all_parked_pool_still_serves_the_least_recent_failure` |
+| 节点快速掉线 → 连接快速拆 | `test_node_close_tears_the_connection_down_at_once` |
+| 节点快速掉线 → 记一次 strike | `test_a_fast_node_drop_is_counted_as_a_strike` |
+| 拨号失败自动换下一个 | `test_backend_dial_failure_steps_to_the_next_node` |
+| 真连接 round-robin | `test_balancer_round_robins_real_connections` |
+
+另外用真 sing-box 1.14.0 校验了 100 节点静态入站的配置（不是 mock）：
+
+```
+$ sing-box check -c .check-rotate100.json     # rc=0，无告警
+endpoints: 100  inbounds: 103  rotate: 100
+ports ok: True [41000, 41001, 41002] ... 41099
+route rules: 100 {'inbound': 'resi-rot-0', 'outbound': 'vpngate-0'} ... 'resi-rot-99'
+```
+
+### 12.11 已知限制（不打算修）
+
+- **一条 TCP 连接只轮换一次**：mux 的"轮换单位"是一条连接，sing-box 的 VLESS 入站会把
+  同一连接上的所有目标复用同一条出站。要按请求轮换，得在最前面挂一个真正的
+  socks/http 代理（第三路原本的设计），代价见 §2/§7。客户端多开连接即可获得轮换。
+- **出口是 VPNGate 的机房 IP**，不是住宅 IP；文案统一写「轮换出口」。
+- **park 阈值是启发式的**：3 次 + 6 秒 + 1KB 的规则来自线上样本，真正误判也需要 3 次
+  连续快速失败，且 2 分钟后自动重试，不会永久拉黑。
+- 峰值并发仍受 `MAX_CONCURRENT_DIALS=10` 限制：这是 1 进程 400 连接场景下的保护，
+  第三路的重连风暴不会把 sing-box 拖死（代价是并发拨号排队）。
