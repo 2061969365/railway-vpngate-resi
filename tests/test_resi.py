@@ -551,6 +551,117 @@ class RotateManagerTests(unittest.TestCase):
         self.assertEqual(["vpngate-b"], pool)
         self.assertEqual(2, reserved)
 
+    def test_full_probe_never_dials_a_live_rotation_node(self) -> None:
+        # Dialing a node that already holds the rotation session opens a second
+        # VPNGate session (duplicate-cn is off) and kicks the user's connection,
+        # so the probe would report a healthy node dead - "one dead, two dead".
+        manager = self._manager()
+        try:
+            manager._nodes = [
+                {"real_latency_ms": 10, "endpoint": _endpoint("vpngate-a")},
+                {"real_latency_ms": None, "latency_ms": 50,
+                 "endpoint": _endpoint("vpngate-b")},
+                {"real_latency_ms": 30, "endpoint": _endpoint("vpngate-c")},
+            ]
+            manager._set_resi_routes([("vpngate-a", RESI_ROTATE_BASE),
+                                      ("vpngate-b", RESI_ROTATE_BASE + 1),
+                                      ("vpngate-c", RESI_ROTATE_BASE + 2)])
+            with manager._lock:
+                manager.preferred_tag = "vpngate-a"
+                manager.backup_tag = "vpngate-c"
+                targets = [(n.get("endpoint") or {}).get("tag")
+                           for n in manager._full_probe_targets_locked()]
+        finally:
+            manager.stop()
+            self._cleanup(manager)
+
+        # a is the chain's pin and serving, c is its backup: only the
+        # unverified node b can be dialed without stealing a live session.
+        self.assertEqual(["vpngate-b"], targets)
+
+    def test_full_probe_may_dial_a_parked_node(self) -> None:
+        # A parked node is out of the rotation, so probing it is how it heals.
+        manager = self._manager()
+        try:
+            manager._nodes = [
+                {"real_latency_ms": 10, "endpoint": _endpoint("vpngate-a")},
+                {"real_latency_ms": 20, "endpoint": _endpoint("vpngate-b")},
+            ]
+            manager._set_resi_routes([("vpngate-a", RESI_ROTATE_BASE),
+                                      ("vpngate-b", RESI_ROTATE_BASE + 1)])
+            with manager._lock:
+                manager._resi_health["vpngate-b"] = {
+                    "strikes": 3, "down_until": time.monotonic() + 600}
+                targets = [(n.get("endpoint") or {}).get("tag")
+                           for n in manager._full_probe_targets_locked()]
+        finally:
+            manager.stop()
+            self._cleanup(manager)
+
+        self.assertEqual(["vpngate-b"], targets)
+
+    def test_full_probe_skips_the_pin_in_gateway_mode(self) -> None:
+        manager = self._manager(resi_rotate=False, resi=None, vless_uuid=None)
+        try:
+            manager._nodes = [
+                {"real_latency_ms": 10, "endpoint": _endpoint("vpngate-a")},
+                {"real_latency_ms": 20, "endpoint": _endpoint("vpngate-b")},
+                {"real_latency_ms": 30, "endpoint": _endpoint("vpngate-c")},
+            ]
+            with manager._lock:
+                manager.preferred_tag = "vpngate-a"
+                manager.backup_tag = "vpngate-b"
+                targets = [(n.get("endpoint") or {}).get("tag")
+                           for n in manager._full_probe_targets_locked()]
+        finally:
+            manager.stop()
+            self._cleanup(manager)
+
+        self.assertEqual(["vpngate-c"], targets)
+
+    def test_a_refresh_never_redials_the_nodes_it_serves(self) -> None:
+        # The hourly refresh used to tunnel-dial every node again, including the
+        # ones already serving the rotation: a second VPNGate session (one per
+        # node) kicks the live one, so the refresh killed good nodes by itself.
+        import railway_manager as rm
+
+        seen: dict = {}
+
+        def fake_snapshot(_csv_text, **kwargs):
+            seen.update(kwargs)
+            return [
+                {"server": "203.0.113.21", "server_port": 443, "country": "Japan",
+                 "country_short": "JP", "speed": 1, "latency_ms": 12,
+                 "real_latency_ms": None, "endpoint": _endpoint("vpngate-a")},
+                {"server": "203.0.113.99", "server_port": 443, "country": "Japan",
+                 "country_short": "JP", "speed": 2, "latency_ms": 40,
+                 "real_latency_ms": None, "endpoint": _endpoint("vpngate-b")},
+            ]
+
+        manager = self._manager(dial_fn=lambda node: 33)
+        original = rm.snapshot_to_nodes
+        rm.snapshot_to_nodes = fake_snapshot
+        try:
+            manager._nodes = [
+                {"server": "203.0.113.21", "server_port": 443, "country": "Japan",
+                 "country_short": "JP", "speed": 1, "latency_ms": 10,
+                 "real_latency_ms": 77, "endpoint": _endpoint("vpngate-a")},
+            ]
+            manager.refresh_once(fetcher=lambda *a, **k: "csv")
+            nodes = {n["server"]: n for n in manager._nodes}
+        finally:
+            rm.snapshot_to_nodes = original
+            manager.stop()
+            self._cleanup(manager)
+
+        skipped = seen.get("skip_dial_keys") or set()
+        self.assertIn(("203.0.113.21", 443), skipped)
+        self.assertNotIn(("203.0.113.99", 443), skipped)
+        # The node that was not dialed keeps its previous verification instead
+        # of dropping out of the rotation pool on every refresh.
+        self.assertEqual(77, nodes["203.0.113.21"]["real_latency_ms"])
+        self.assertIsNone(nodes["203.0.113.99"]["real_latency_ms"])
+
     def test_an_unpinned_node_returns_to_the_rotation(self) -> None:
         manager = self._manager()
         try:

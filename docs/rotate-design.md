@@ -498,6 +498,58 @@ UUID 保护的公开端点，不是 API），并把 mux 已经读到的握手字
 - 证据：`test_rotation_cannot_starve_the_other_two_paths`（5 槽时上限 4，占满后
   node 仍能拿到全局槽位）；云端诊断新增进程表/带时间戳生命周期/`refresh_history`。
 
+### 12.9e D13：全量真拨把"正在服务"的节点拨死，多远端节点又被单地址判死
+
+D12 留下的疑点（"第三路相关动作改写了配置"）在这一轮被三个实测钉死了，三个都是
+**自己人杀自己人**，不是外部节点坏：
+
+1. **全量真拨抢自己正在用的唯一会话**。`_run_full_probe_inner` 原先拨 `self._nodes`
+   里的**全部**节点，包括正在被 rotate 出站服务的那些。VPNGate 每节点只给一个
+   OpenVPN 会话（duplicate-cn 关闭），而每个 serving 节点的 rotate endpoint 已经占着
+   它——真拨等于第二个会话，直接把握着用户连接的会话踢掉：
+   - 用户在途请求当场断（第三路"无缘无故"失败）；
+   - 该节点随即被 strike/park（**好节点被自己弄成死节点**，池子越来越小）；
+   - pin/backup 也在被拨的名单里，于是 chain 的唯一会话同样被抢，chain 隧道死 →
+     `check_pinned_health` 判死 → 换 pin → 写配置 + 重启 sing-box。日志里同时出现
+     `authentication failed: terminal` 与"无人解释的重启"，和用户描述完全一致：
+     "一个死两个一起死"。
+2. **多远端节点被单地址判死**。VPNGate 的 ovpn 经常给一个节点写多条 `remote`
+   （字面 IP、另一个端口、DDNS 域名），转换后是 sing-box `openvpn-client` 的
+   `servers[]` 故障转移。但三处判活都只看 `primary_server()` 的第一个地址：
+   `snapshot_to_nodes` 的预筛（第一个地址挂 ⇒ 好节点不进池）、
+   `_fresh_probe_tags`（选 pin 前）、`check_pinned_health`（pin 判活）。
+   第一地址暂时不通就整体判死 ⇒ 丢池 + 无谓换 pin，属于 D11 的同类。
+3. **`full_probe.state` 提前置 done**，验收脚本一看到 done 就取 pid/md5 基线，
+   而 `_auto_pin_best` + `_republish_config`（可能写配置并重启）还在后面跑 ⇒
+   基线抓到了"即将被杀掉的进程"，之后的重启看起来是"第三路抖动导致的"。
+4. **每小时刷新重拨全部节点**。`_refresh_once_inner` 把当前节点整表换成新快照，并由
+   `real_topk` 再隧道拨一遍——拨的正是正在服务的那些。同一 duplicate-cn 规则下，
+   刷新自己把好节点踢死；而且换表后只有被重拨的 `REAL_TOPK` 个节点保留
+   `real_latency_ms`，其余节点的验证状态全部丢失 ⇒ 池子从 60~70 个瞬间掉回 30 个。
+
+修法：
+
+- `_full_probe_targets_locked()`：rotate 模式只拨**当前不在服务中**的节点（parked 或
+  从未验证过），pin/backup 永不拨；gateway 模式只跳过 pin/backup。这样真拨既能
+  补齐池子、又能把 parked 的节点捞回来，却不会碰到任何活会话。
+- `endpoint_remotes()` / `probe_endpoint_latency()`：按 sing-box 的故障转移顺序枚举
+  全部 remote，任一个握手通过即算活；上面三处调用点统一改用它。
+- `full_probe.state = "done"` 移到 pin/republish 之后；验收脚本在取基线前要求
+  pid 与 md5 连续两次采样不变（启动期合法重启不算串扰）。
+- 刷新不再重拨"当前已在表里的节点"：`snapshot_to_nodes(..., skip_dial_keys=…)`
+  跳过这些 `(server, port)`（不占 `real_topk` 名额，改拨后面的新节点），
+  被跳过的节点按 `(server, port)` 继承上一轮的 `real_latency_ms`，所以池子
+  不再每小时腰斩一次。
+
+代价（明确写进限制）：**serving 节点的 `real_latency_ms` 不再周期性刷新**，它们的
+健康由真实流量（strike 规则）给出；只有被 park 之后才会重新真拨验证。也就是说
+"全量真拨"从"每小时重验所有节点"变成"补齐/救活不在服务中的节点"。
+
+证据：`test_full_probe_never_dials_a_live_rotation_node`、
+`test_full_probe_may_dial_a_parked_node`、`test_full_probe_skips_the_pin_in_gateway_mode`、
+`test_dead_first_remote_keeps_the_pin`、`test_all_remote_candidates_are_tried_before_a_rescue`、
+`MultiRemoteProbeTests`（转换层 4 项）。
+
 ### 12.10 不变量（后续改动必须守住）
 
 1. **健康/池子决策不得写配置文件、不得重启 sing-box**（`/ws-resi` 的抖动不能影响
@@ -519,7 +571,7 @@ UUID 保护的公开端点，不是 API），并把 mux 已经读到的握手字
 10. **轮换的连接预算不得吃满 mux 槽位**：前两路必须保留独立额度，否则第三路的风暴
     会以"新连接被丢弃"的形式掐死另外两路（D12）。
 
-### 12.11 测试矩阵（`tests/test_resi.py`，86 项全绿）
+### 12.11 测试矩阵（`tests/test_resi.py`，90 项全绿）
 
 | 场景 | 测试 |
 |---|---|
@@ -550,7 +602,13 @@ UUID 保护的公开端点，不是 API），并把 mux 已经读到的握手字
 | 轮换风暴不得占满 mux 槽位、前两路必须有额度 | `test_rotation_cannot_starve_the_other_two_paths` |
 | 环回入站被拒不算节点失败 | `test_a_refused_loopback_dial_never_strikes_the_node` |
 | 拨号失败自动换下一个 | `test_backend_dial_failure_steps_to_the_next_node` |
+| 刷新不重拨正在服务的节点（否则自己踢自己） | `test_a_refresh_never_redials_the_nodes_it_serves` |
+| 跳过的节点不占 `real_topk` 名额、不多拨一个 | `test_skip_dial_keys_never_dials_a_live_node`、`test_skip_dial_keys_that_covers_everything_dials_nothing`（`tests/test_vpngate_to_singbox.py`） |
 | 真连接 round-robin | `test_balancer_round_robins_real_connections` |
+| 全量真拨绝不拨正在服务的节点（含 pin/backup） | `test_full_probe_never_dials_a_live_rotation_node`、`test_full_probe_skips_the_pin_in_gateway_mode` |
+| parked 节点可以被真拨救活 | `test_full_probe_may_dial_a_parked_node` |
+| 多远端节点：一个地址死、另一个活 ⇒ 仍然算活（pin 不换） | `test_dead_first_remote_keeps_the_pin`、`test_all_remote_candidates_are_tried_before_a_rescue` |
+| 多远端节点：全部 remote 都试过才判死 | `MultiRemoteProbeTests`（`tests/test_vpngate_to_singbox.py`，4 项） |
 
 另外用真 sing-box 1.14.0 校验了 100 节点静态入站的配置（不是 mock）：
 
@@ -586,8 +644,10 @@ route rules: 100 {'inbound': 'resi-rot-0', 'outbound': 'vpngate-0'} ... 'resi-ro
 5. 客户端体感：撞到坏节点应在 1~2 秒内失败（被 REJECT/RST 的情况）或最迟二十几秒
    （节点吞包不回，撞 `RESI_FIRST_BYTE_TIMEOUT=20s` 看门狗），**不再是 120 秒**；
    重试即落到健康节点。
-6. 每小时的全量真拨把死掉的节点写成 `real_latency_ms=null`，它们会**自动退出池子**
-   且不触发重启——面板上 `pool` 会掉、`inbounds` 不变。
+6. serving 节点的 `real_latency_ms` **不再**被周期性重拨刷掉（重拨会抢它的唯一会话，
+   见 §12.9e D13）：它们的健康只来自真实流量。被 park 的节点会在下一轮全量真拨里
+   被重新拨活，`pool` 回升、`inbounds` 不变、**不触发重启**。
+   日志出现 `full probe done: N of M nodes dialed, K skipped` 时，K ≈ 服务中 + 预留。
 7. **chain 不许被轮换拖死**：`/ws-resi` 在换节点时，`/ws-chain` 仍要能出出口 IP；
    同一时刻容器日志里不应出现针对 chain 那个节点的
    `authentication failed: terminal`（说明轮换又在抢它的唯一会话）。

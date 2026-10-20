@@ -516,6 +516,43 @@ class RealTopKTests(unittest.TestCase):
             [n["server"] for n in nodes].index("203.0.113.22"),
         )
 
+    def test_skip_dial_keys_never_dials_a_live_node(self) -> None:
+        from vpngate_to_singbox import snapshot_to_nodes
+
+        calls: list = []
+        nodes = snapshot_to_nodes(
+            _real_csv(),
+            probe_fn=lambda host, port: 100,
+            real_topk=2,
+            dial_fn=lambda node: calls.append(node["server"]) or 42,
+            skip_dial_keys={("203.0.113.21", 443)},
+        )
+
+        # Dialing a node the caller already serves would kick its session.
+        self.assertNotIn("203.0.113.21", calls)
+        by_server = {n["server"]: n for n in nodes}
+        self.assertIsNone(by_server["203.0.113.21"]["real_latency_ms"])
+        # A skipped node must not eat a slot: two others are dialed instead.
+        self.assertEqual(2, len(calls))
+        self.assertEqual({"203.0.113.22", "203.0.113.23"}, set(calls))
+        self.assertEqual(42, by_server["203.0.113.22"]["real_latency_ms"])
+
+    def test_skip_dial_keys_that_covers_everything_dials_nothing(self) -> None:
+        from vpngate_to_singbox import snapshot_to_nodes
+
+        calls: list = []
+        nodes = snapshot_to_nodes(
+            _real_csv(),
+            probe_fn=lambda host, port: 100,
+            real_topk=3,
+            dial_fn=lambda node: calls.append(node["server"]) or 42,
+            skip_dial_keys={("203.0.113.21", 443), ("203.0.113.22", 443),
+                            ("203.0.113.23", 443)},
+        )
+
+        self.assertEqual([], calls)
+        self.assertTrue(all(n["real_latency_ms"] is None for n in nodes))
+
     def test_limit_zero_returns_all_nodes(self) -> None:
         from vpngate_to_singbox import snapshot_to_nodes
 

@@ -1056,6 +1056,7 @@ def snapshot_to_nodes(
     singbox_bin: str = "sing-box",
     username: str = DEFAULT_USERNAME,
     password: str = DEFAULT_PASSWORD,
+    skip_dial_keys: set[tuple[str, int]] | None = None,
 ) -> list[dict]:
     """Parse a snapshot into node dicts with country + measured latency.
 
@@ -1070,11 +1071,18 @@ def snapshot_to_nodes(
     or the pool is exhausted; persistent failures stay unmeasured (None)
     and sort last. Returns [] when nothing is reachable (caller decides
     failure).
+
+    ``skip_dial_keys`` lists ``(server, server_port)`` pairs the caller already
+    has a live session on: dialing them would open a second VPNGate session
+    (duplicate-cn is off) and kick the first, so they are left unmeasured for
+    the caller to carry over instead. Skipped nodes do not consume a slot of
+    ``real_topk``; the next handshake-ranked nodes are dialed in their place.
     """
     if probe_pool is not None and probe_pool < 0:
         raise ValueError(f"probe_pool must be >= 0, got {probe_pool}")
     if limit is not None and limit < 0:
         raise ValueError(f"limit must be >= 0, got {limit}")
+    skip_dial = skip_dial_keys or set()
     candidates = list(_iter_tcp_candidates(csv_text, username, password))
     check = probe_fn if probe_fn is not None else (
         lambda host, port: probe_tcp_latency(host, port, probe_timeout))
@@ -1132,8 +1140,14 @@ def snapshot_to_nodes(
             idx = 0
             measured = 0
             while measured < target and idx < len(nodes):
-                batch = nodes[idx:idx + max(1, target - measured)]
-                idx += len(batch)
+                batch = []
+                while not batch and idx < len(nodes):
+                    chunk = nodes[idx:idx + max(1, target - measured)]
+                    idx += len(chunk)
+                    batch = [n for n in chunk
+                             if (n["server"], n["server_port"]) not in skip_dial]
+                if not batch:
+                    break
                 future_map = {executor.submit(_safe_dial, dial, node): node
                               for node in batch}
                 for future in future_map:

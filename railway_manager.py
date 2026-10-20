@@ -3053,17 +3053,37 @@ class RailwayManager:
         finally:
             self._refresh_lock.release()
     def _refresh_once_inner(self, fetcher=None, probe_pool: int = 0) -> bool:
+        # Rotate mode never re-dials a node it may be serving right now: that
+        # would open a second VPNGate session (duplicate-cn is off) and kick the
+        # live one, i.e. the refresh itself would kill good nodes. Those nodes
+        # keep their previous verification and are handed back unchanged.
+        skip_keys: set[tuple[str, int]] = set()
+        carried: dict[tuple[str, int], int] = {}
+        with self._lock:
+            if self.resi_rotate:
+                for node in self._nodes:
+                    key = (node.get("server"), node.get("server_port"))
+                    skip_keys.add(key)
+                    real = node.get("real_latency_ms")
+                    if real is not None:
+                        carried[key] = real
         try:
             fetch = fetcher or self.fetcher
             csv_text = self._fetch_with_retry(fetch)
             nodes = snapshot_to_nodes(csv_text, limit=self.limit, probe_pool=probe_pool,
                 probe_fn=lambda h, p: probe_tcp_latency(h, p, 5), probe_workers=self.probe_workers,
                 real_topk=self.real_topk, dial_fn=self.dial_fn, dial_workers=self.dial_workers,
-                dial_timeout=self.dial_timeout, singbox_bin=self.singbox_bin)
+                dial_timeout=self.dial_timeout, singbox_bin=self.singbox_bin,
+                skip_dial_keys=skip_keys)
             if not nodes:
                 return self._refresh_failed("no reachable nodes, kept previous")
         except Exception as exc:
             return self._refresh_failed(f"{type(exc).__name__}: {exc}")
+        for node in nodes:
+            if node.get("real_latency_ms") is None:
+                real = carried.get((node.get("server"), node.get("server_port")))
+                if real is not None:
+                    node["real_latency_ms"] = real
         with self._lock:
             old_seen = dict(self._first_seen); now = _now_iso(); cur_keys = set()
             for node in nodes:
@@ -3139,12 +3159,43 @@ class RailwayManager:
                 if self.status.get("full_probe", {}).get("state") == "running":
                     self.status["full_probe"]["state"] = "done"
 
+    def _full_probe_targets_locked(self) -> list[dict]:
+        """Nodes a full probe may dial without stealing a live VPNGate session.
+
+        VPNGate allows one OpenVPN session per node (duplicate-cn is off) and
+        every node we serve already holds one through its rotate endpoint, so
+        dialing a *serving* node kicks the very connection a user is riding on:
+        the probe reports the node dead, the rotation parks a healthy node, and
+        the chain path can lose its pin the same way ("one dead, two dead").
+        Rotate mode therefore re-verifies only nodes that are out of service
+        right now (parked, or never tunnel-verified) - exactly the nodes a
+        probe can heal - and never the chain's own pin/backup.
+        """
+        nodes = list(self._nodes)
+        reserved = {tag for tag in (self.preferred_tag, self.backup_tag) if tag}
+        if not (self.resi_rotate and self.vless_uuid):
+            # Gateway mode: one urltest outbound, so only the pin/backup are
+            # worth protecting; everything else is a legit probe target.
+            return [n for n in nodes
+                    if (n.get("endpoint") or {}).get("tag") not in reserved]
+        _usable, _parked, eligible = self._resi_pool_locked()
+        active = {tag for tag, _ in eligible}
+        targets: list[dict] = []
+        for node in nodes:
+            tag = (node.get("endpoint") or {}).get("tag")
+            if tag in reserved or tag in active:
+                continue
+            targets.append(node)
+        return targets
+
     def _run_full_probe_inner(self) -> None:
         with self._lock:
             nodes = list(self._nodes)
-            self.status["full_probe"]["total"] = len(nodes)
+            targets = self._full_probe_targets_locked()
+            self.status["full_probe"]["total"] = len(targets)
+            self.status["full_probe"]["skipped"] = len(nodes) - len(targets)
             start_preferred = self.preferred_tag
-        ordered = sorted(nodes, key=lambda n: (n.get("latency_ms") is None, n.get("latency_ms") or 0, n.get("server") or ""))
+        ordered = sorted(targets, key=lambda n: (n.get("latency_ms") is None, n.get("latency_ms") or 0, n.get("server") or ""))
         def _dial_one(node: dict) -> None:
             try:
                 ms = self.dial_fn(node) if self.dial_fn else None
@@ -3156,14 +3207,23 @@ class RailwayManager:
         with ThreadPoolExecutor(max_workers=self.full_probe_workers) as executor:
             list(executor.map(_dial_one, ordered))
         with self._lock:
-            self.status["full_probe"]["state"] = "done"
             self._sync_probe_results(nodes)
         self._auto_pin_best(nodes, start_preferred)
         # The pin may not have changed, but the verified set did: republish so
         # the third path's rotation pool picks up the freshly dialed nodes.
         self._republish_config()
-        self._record_history("full-probe-done", f"{len(nodes)} nodes dialed")
-        print(f"full probe done: {len(nodes)} nodes dialed, {self.status['full_probe'].get('done')} checked", flush=True)
+        skipped = len(nodes) - len(ordered)
+        self._record_history("full-probe-done",
+                             f"{len(ordered)} nodes dialed, {skipped} skipped")
+        print(f"full probe done: {len(ordered)} of {len(nodes)} nodes dialed, "
+              f"{skipped} skipped (serving or reserved), "
+              f"{self.status['full_probe'].get('done')} checked", flush=True)
+        # Only now is the pass really over: pinning above may rewrite the config
+        # and restart sing-box, so publishing "done" earlier let a caller that
+        # waits on the flag snapshot a process that was about to be replaced
+        # (the restart then looked like unexplained churn).
+        with self._lock:
+            self.status["full_probe"]["state"] = "done"
 
     def _republish_config(self) -> None:
         """Re-apply the serving config from the current node set.

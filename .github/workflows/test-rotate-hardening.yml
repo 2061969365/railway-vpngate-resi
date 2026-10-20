@@ -113,12 +113,25 @@ jobs:
                   print(p.split("/")[2])
                   raise SystemExit
           PY
-          docker exec rotate-trial python3 /tmp/pid.py > /tmp/sb_pid_before.txt
-          docker exec rotate-trial md5sum /app/singbox-railway.json | awk '{print $1}' > /tmp/cfg_before.txt
-          echo "sing-box pid: $(cat /tmp/sb_pid_before.txt)"
+          # The baseline must be a *settled* process: the first minutes of a
+          # start can legitimately rewrite the config (auto-pin after the full
+          # probe). Only churn *after* this snapshot is collateral damage.
+          prev_pid=""; prev_md5=""; settled=0
+          for i in $(seq 1 30); do
+            pid=$(docker exec rotate-trial python3 /tmp/pid.py)
+            md5=$(docker exec rotate-trial md5sum /app/singbox-railway.json | awk '{print $1}')
+            if [ -n "$pid" ] && [ "$pid" = "$prev_pid" ] && [ "$md5" = "$prev_md5" ]; then
+              settled=1; break
+            fi
+            prev_pid=$pid; prev_md5=$md5
+            sleep 4
+          done
+          [ "$settled" = 1 ] || { echo "sing-box never settled: pid=$pid md5=$md5"; exit 1; }
+          echo "$pid" > /tmp/sb_pid_before.txt
+          echo "$md5" > /tmp/cfg_before.txt
+          echo "sing-box pid: $(cat /tmp/sb_pid_before.txt) (stable for one 4s sample)"
           echo "config md5: $(cat /tmp/cfg_before.txt)"
           test -n "$(cat /tmp/sb_pid_before.txt)"
-
       - name: Start one quick tunnel to :3000
         run: |
           docker cp rotate-trial:/usr/local/bin/cloudflared /tmp/cloudflared
