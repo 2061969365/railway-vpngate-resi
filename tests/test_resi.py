@@ -808,6 +808,103 @@ class RotateManagerTests(unittest.TestCase):
         rot = [i["tag"] for i in cfg["inbounds"] if i["tag"].startswith("resi-rot-")]
         self.assertEqual(["resi-rot-0", "resi-rot-1", "resi-rot-2", "resi-rot-3"], rot)
 
+    @staticmethod
+    def _fake_backend(tag: str) -> tuple[socket.socket, int]:
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(4)
+
+        def serve() -> None:
+            while True:
+                try:
+                    conn, _ = srv.accept()
+                except OSError:
+                    return
+                try:
+                    # Drain the forwarded request first: closing a socket with
+                    # unread data sends RST, which would discard the reply we
+                    # are about to write.
+                    conn.recv(4096)
+                    conn.sendall(tag.encode("ascii"))
+                except OSError:
+                    pass
+                finally:
+                    try:
+                        conn.close()
+                    except OSError:
+                        pass
+
+        threading.Thread(target=serve, daemon=True).start()
+        return srv, srv.getsockname()[1]
+
+    @staticmethod
+    def _ws_get(port: int, path: str) -> bytes:
+        sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+        with sock:
+            sock.sendall(f"GET {path} HTTP/1.1\r\nHost: x\r\n"
+                         f"Connection: Upgrade\r\nUpgrade: websocket\r\n"
+                         f"Sec-WebSocket-Version: 13\r\n"
+                         f"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+                         .encode())
+            return sock.recv(64)
+
+    def test_catch_all_tunnel_can_serve_the_third_path(self) -> None:
+        # Regression: a Cloudflare catch-all (/* -> $PORT) must carry the third
+        # path too. It used to hit the admin gate and answer 401, which looks
+        # exactly like "the third path is broken while the other two work".
+        srv, backend_port = self._fake_backend("resi-node")
+        manager = self._manager(resi_port=_free_port())
+        manager._set_resi_ports([backend_port])
+        port = manager.start()
+        try:
+            received = self._ws_get(port, "/ws-resi")
+        finally:
+            manager.stop()
+            srv.close()
+            self._cleanup(manager)
+
+        self.assertEqual(b"resi-node", received)
+
+    def test_mux_routes_node_and_chain_paths_too(self) -> None:
+        srv_direct, direct_port = self._fake_backend("direct-node")
+        srv_chain, chain_port = self._fake_backend("chain-node")
+        manager = self._manager(resi_port=_free_port(),
+                                vless_direct_port=direct_port,
+                                vless_chain_port=chain_port)
+        port = manager.start()
+        try:
+            direct = self._ws_get(port, "/ws-node")
+            chain = self._ws_get(port, "/ws-chain")
+        finally:
+            manager.stop()
+            srv_direct.close()
+            srv_chain.close()
+            self._cleanup(manager)
+
+        self.assertEqual(b"direct-node", direct)
+        self.assertEqual(b"chain-node", chain)
+
+    def test_mux_still_rejects_unknown_paths(self) -> None:
+        manager = self._manager(resi_port=_free_port())
+        port = manager.start()
+        try:
+            sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+            with sock:
+                sock.sendall(b"GET /ws-unknown HTTP/1.1\r\nHost: x\r\n"
+                             b"Connection: close\r\n\r\n")
+                received = b""
+                while True:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    received += chunk
+        finally:
+            manager.stop()
+            self._cleanup(manager)
+
+        self.assertIn(b"401", received)
+
     def test_backend_dial_failure_steps_to_the_next_node(self) -> None:
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

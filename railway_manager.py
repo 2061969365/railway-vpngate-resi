@@ -1915,6 +1915,21 @@ class RailwayManager:
         if parsed is None:
             return
         method, path, query, headers, body = parsed
+        if method == "GET":
+            # A Cloudflare Tunnel catch-all (/* -> $PORT) must carry the VLESS
+            # paths too, otherwise adding a path means editing the tunnel
+            # ingress rules - and forgetting that looks exactly like "the
+            # third path is broken while the other two work". Forward by path
+            # before the admin gate: these are public VLESS+WS endpoints
+            # protected by the UUID, not API calls.
+            route = self._vless_path_route(path)
+            if route is not None:
+                kind, port = route
+                if kind == "rotate":
+                    self._handle_resi_client(client, prefix=data, hold_slot=False)
+                else:
+                    self._pipe_to_backend(client, data, port=port)
+                return
         if path == "/healthz" and method == "GET":
             if self._serving_ok():
                 client.sendall(_http_response("200 OK", "text/plain", b"ok"))
@@ -2116,9 +2131,33 @@ class RailwayManager:
             if not alive:
                 return False
         return self._mixed_reachable(timeout=2)
-    def _pipe_to_backend(self, client: socket.socket, peek: bytes) -> None:
+    def _vless_path_route(self, path: str) -> tuple[str, int] | None:
+        """Map a VLESS+WS path to its local origin (``("port", n)`` / ``("rotate", 0)``).
+
+        Why the manager routes these at all: every deployment already points a
+        Cloudflare Tunnel catch-all at ``$PORT``, and the per-path ingress
+        rules for 8080/8082 are easy to forget when a new path appears - which
+        presents as "the third path is broken while the other two work".
+        Serving the paths from ``$PORT`` means one catch-all rule is enough;
+        existing per-path rules pointed at 8080/8082/8084 keep working too.
+        """
+        if not self.vless_uuid:
+            return None
+        if path == self.vless_direct_path:
+            return ("port", self.vless_direct_port)
+        if path == self.vless_chain_path:
+            return ("port", self.vless_chain_port)
+        if path == self.resi_path and self.resi_rotate:
+            return ("rotate", 0)
+        if path == self.resi_path and self.resi:
+            return ("port", self.resi_port)
+        return None
+
+    def _pipe_to_backend(self, client: socket.socket, peek: bytes,
+                         port: int | None = None) -> None:
         try:
-            backend = socket.create_connection(("127.0.0.1", self.mixed_port), timeout=10)
+            backend = socket.create_connection(
+                ("127.0.0.1", self.mixed_port if port is None else port), timeout=10)
         except OSError:
             return
         client.settimeout(PIPE_IDLE_TIMEOUT)
@@ -2129,6 +2168,10 @@ class RailwayManager:
             first = threading.Thread(target=lambda: up.__setitem__(0, _forward(client, backend)), daemon=True)
             second = threading.Thread(target=lambda: down.__setitem__(0, _forward(backend, client)), daemon=True)
             first.start(); second.start(); first.join()
+            # Let bytes already read from the backend reach the client before
+            # tearing the pair down; a WebSocket close right after a data frame
+            # would otherwise be truncated by the shutdown below.
+            second.join(timeout=1.0)
             for sock in (client, backend):
                 try:
                     sock.shutdown(socket.SHUT_RDWR)
@@ -3063,12 +3106,14 @@ class RailwayManager:
                 resi_status["nodes"] = len(ports)
                 if changed:
                     resi_status["cursor"] = 0
-    def _handle_resi_client(self, client: socket.socket) -> None:
+    def _handle_resi_client(self, client: socket.socket, prefix: bytes = b"",
+                            hold_slot: bool = True) -> None:
         held = False
         try:
-            if not self._mux_slots.acquire(blocking=False):
-                return
-            held = True
+            if hold_slot:
+                if not self._mux_slots.acquire(blocking=False):
+                    return
+                held = True
             port = self._resi_next_port()
             if port is None:
                 self._set_resi(state="down", error="no serving endpoints")
@@ -3090,6 +3135,10 @@ class RailwayManager:
                 return
             client.settimeout(PIPE_IDLE_TIMEOUT)
             backend.settimeout(PIPE_IDLE_TIMEOUT)
+            if prefix:
+                # Bytes already consumed by the mux (the VLESS+WS handshake):
+                # replay them to the loopback inbound so nothing is lost.
+                backend.sendall(prefix)
             with self._lock:
                 self._mux_inflight += 1
                 self.status["traffic"]["connections"] += 1
@@ -3102,6 +3151,9 @@ class RailwayManager:
                     target=lambda: down.__setitem__(0, _forward(backend, client)),
                     daemon=True)
                 first.start(); second.start(); first.join()
+                # Same flush grace as _pipe_to_backend: the loopback inbound
+                # may close right after its final frame.
+                second.join(timeout=1.0)
                 for sock in (client, backend):
                     try:
                         sock.shutdown(socket.SHUT_RDWR)
@@ -3109,7 +3161,7 @@ class RailwayManager:
                         pass
                 second.join(timeout=10)
                 with self._lock:
-                    self.status["traffic"]["bytes_up"] += up[0]
+                    self.status["traffic"]["bytes_up"] += up[0] + len(prefix)
                     self.status["traffic"]["bytes_down"] += down[0]
             finally:
                 try:

@@ -55,18 +55,34 @@ CC Switch / 伪装页 / 哪吒探针从 `railway-proxy-combined` 全量搬运
 ## Cloudflare Tunnel 路由（Dashboard 配置）
 
 tunnel 只管把外网域名打到容器端口，token 方式运行，
-ingress 规则在 Cloudflare Dashboard 的 tunnel 配置里加：
+ingress 规则在 Cloudflare Dashboard 的 tunnel 配置里加。
+
+**最省事的配法（推荐）：一条兜底规则就够**
+
+- `node.example.com` + Path `/*` → `http://localhost:3000`
+
+管理器在 `$PORT`（3000）这一个端口上按路径分流三条 VLESS+WS：
+`/ws-node` → 本机 `8080`、`/ws-chain` → 本机 `8082`、`/ws-resi` → 轮换出口
+（轮换模式下由管理器的轮换监听器接）。因此**新增第三路不需要动 ingress**，
+`/ws-node`、`/ws-chain` 也不会因为忘了加规则而失效。
+
+**按端口分流的老配法（也仍然支持，规则必须按顺序）**
 
 - `node.example.com` + Path `/ws-node*` → `http://localhost:8080`
 - 同一 hostname + Path `/ws-chain*` → `http://localhost:8082`
-- 同一 hostname + Path `/ws-resi*` → `http://localhost:8084`（仅启用住宅出口时）
+- 同一 hostname + Path `/ws-resi*` → `http://localhost:8084`
 - 同一 hostname + Path `/*` → `http://localhost:3000`（兜底，必须排在上面几条**之后**）
 
-顺序即优先级：`/ws-node`、`/ws-chain`、`/ws-resi` 先命中走 sing-box，其余一切都落到
-3000 的 manager。manager 剥离 query 后路由：`/ui` 进控制台登录门，
+两种配法可以混用：按端口分流的规则命中后直连 sing-box/轮换监听器，
+没命中的路径落到 3000 再由管理器分流。manager 剥离 query 后路由：`/ui` 进控制台登录门，
 `/api/*` 为数据接口（需 Bearer token），`/` 直接 serve 伪装页文件
 （`start.sh` 注入 UUID 后经 `DISGUISE_PATH` 接线，`start.sh` 幂等，
-容器重启不会残留旧值），其余路径 404。规则一次配完，不用再为伪装页加端口。
+容器重启不会残留旧值），其余路径 404 或 401。
+
+> 如果第三路连不上而前两路正常：先确认 ingress 里有 `/ws-resi` 的规则**或**一条
+> `/*` → `http://localhost:3000` 的兜底规则。用
+> `curl -i https://<域名>/ws-resi` 看返回码即可判断——`401`/`404` 且来自容器
+> 说明请求已到容器（老镜像没有端口分流），`502`/`404` 且带 `cf-ray` 说明隧道规则没放行。
 
 （同一 hostname 配两个 path 也可。）本地都是明文 `http://`，
 TLS 由 Cloudflare 边缘终结。
