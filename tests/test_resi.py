@@ -729,6 +729,26 @@ class RotateManagerTests(unittest.TestCase):
         self.assertIn("chain-rescue-skipped", events)
         apply_cfg.assert_not_called()
 
+    def test_rotation_cannot_starve_the_other_two_paths(self) -> None:
+        # All three paths share one mux slot table; a rotation storm that fills
+        # it makes /ws-node and /ws-chain connections get dropped on arrival,
+        # which looks exactly like "the third path killed the other two".
+        manager = self._manager(max_mux_connections=5)
+        try:
+            cap = manager._resi_mux_cap
+            held = [manager._resi_mux_slots.acquire(blocking=False)
+                    for _ in range(cap + 1)]
+            node_admitted = manager._mux_slots.acquire(blocking=False)
+            reported = manager.status["resi"]["mux_limit"]
+        finally:
+            manager.stop()
+            self._cleanup(manager)
+
+        self.assertEqual(4, cap)   # one of five slots stays reserved
+        self.assertEqual([True] * cap + [False], held)
+        self.assertTrue(node_admitted, "a full rotation queue must not block node/chain")
+        self.assertEqual(cap, reported)
+
     def test_rebuilding_the_table_resets_the_cursor(self) -> None:
         manager = self._manager()
         try:

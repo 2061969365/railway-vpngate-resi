@@ -1846,6 +1846,17 @@ class RailwayManager:
             "resi": resi_status}
         self._full_probe_thread = None; self._single_probe_thread = None; self._verify_thread = None; self._verify_generation = 0; self._refresh_thread = None
         self._stop_event = threading.Event(); self._mux_slots = threading.BoundedSemaphore(max_mux_connections); self._mux_inflight = 0
+        # A fourth-path storm must not starve the first two paths. Every mux
+        # connection (all three paths) takes one global slot and a full table
+        # drops the new connection outright, so without a cap the rotation could
+        # eat all 100 and /ws-node + /ws-chain would look dead - the same
+        # "one dies, two die" symptom from the other direction.
+        self.max_mux_connections = max_mux_connections
+        self._resi_mux_cap = max(1, max_mux_connections - max(1, max_mux_connections // 5))
+        self._resi_mux_slots = threading.BoundedSemaphore(self._resi_mux_cap)
+        self._resi_mux_throttled = 0
+        self.status["resi"]["mux_limit"] = self._resi_mux_cap
+        self.status["resi"]["throttled"] = 0
         self._post_slots = threading.BoundedSemaphore(MAX_POST_CONNECTIONS); self._health_check_interval = health_check_interval
         self._listener = None; self._singbox_proc = None; self._stderr_handle = None; self.bound_port = port
         self.load_settings()
@@ -2047,7 +2058,22 @@ class RailwayManager:
             if route is not None:
                 kind, port = route
                 if kind == "rotate":
-                    self._handle_resi_client(client, prefix=data, hold_slot=False)
+                    if not self._resi_mux_slots.acquire(blocking=False):
+                        with self._lock:
+                            self._resi_mux_throttled += 1
+                            self.status["resi"]["throttled"] = self._resi_mux_throttled
+                        self._record_history(
+                            "resi-mux-throttled",
+                            f"rotation holds {self._resi_mux_cap} mux slots, "
+                            f"{self.max_mux_connections - self._resi_mux_cap} stay reserved for node/chain")
+                        return
+                    try:
+                        self._handle_resi_client(client, prefix=data, hold_slot=False)
+                    finally:
+                        try:
+                            self._resi_mux_slots.release()
+                        except Exception:
+                            pass
                 else:
                     self._pipe_to_backend(client, data, port=port)
                 return
@@ -2477,7 +2503,9 @@ class RailwayManager:
         return self.refresh_seconds
     def _refresh_loop(self) -> None:
         next_run = time.monotonic() + self._effective_interval() + random.uniform(-30, 30)
+        print(f"refresh loop armed: every {self._effective_interval()}s", flush=True)
         while not self._stop_event.wait(max(0.0, next_run - time.monotonic())):
+            print("scheduled refresh firing", flush=True)
             try:
                 self._start_refresh_bg()
             except Exception as exc:
@@ -2584,6 +2612,11 @@ class RailwayManager:
         except Exception:
             return
         if started:
+            # Printed on purpose: a background refresh rewrites the serving
+            # config and therefore restarts sing-box, dropping all three paths.
+            # When that happens the reason has to be in the log, otherwise a
+            # collateral restart is indistinguishable from third-path churn.
+            print(f"refresh triggered: {reason}", flush=True)
             self._record_history("health-trigger-refresh", reason)
     def _fresh_probe_tags(self, cands: list[dict]) -> list[str]:
         """Fresh-handshake filter for rescue targets (bounded, parallel).
@@ -2945,6 +2978,10 @@ class RailwayManager:
         except OSError:
             pass
         if want_singbox:
+            # Only the write path reaches here: an unchanged config returns early
+            # above, so this line always means "sing-box is about to restart".
+            print(f"config rewritten: {len(endpoints)} serving endpoints, restarting sing-box",
+                  flush=True)
             self._restart_singbox()
             # A fresh config (and a fresh process) deserves a fresh chain probe:
             # the first attempt after a restart races the endpoints coming up.
@@ -3111,6 +3148,7 @@ class RailwayManager:
         # the third path's rotation pool picks up the freshly dialed nodes.
         self._republish_config()
         self._record_history("full-probe-done", f"{len(nodes)} nodes dialed")
+        print(f"full probe done: {len(nodes)} nodes dialed, {self.status['full_probe'].get('done')} checked", flush=True)
 
     def _republish_config(self) -> None:
         """Re-apply the serving config from the current node set.

@@ -341,6 +341,10 @@ jobs:
           echo "sing-box pid before=$(cat /tmp/sb_pid_before.txt) after=$SB_PID_AFTER"
           echo "config md5 before=$(cat /tmp/cfg_before.txt) after=$CFG_AFTER"
           echo "chain rescues so far=$RESCUES"
+          echo "--- restarts/refreshes so far ---"
+          docker logs rotate-trial 2>&1 \
+            | grep -E "listening on|refresh loop armed|scheduled refresh firing|refresh triggered|refreshed [0-9]+ endpoints|config rewritten|chain rescue|auto-pin|sing-box not running|serving unreachable|mixed unreachable" \
+            | tail -n 30 || true
           if [ "$(cat /tmp/sb_pid_before.txt)" = "$SB_PID_AFTER" ]; then
             [ "$(cat /tmp/cfg_before.txt)" = "$CFG_AFTER" ] || {
               echo "config was rewritten without a restart"; exit 1; }
@@ -383,12 +387,16 @@ jobs:
       - name: Failure diagnostics
         if: failure()
         run: |
+          echo "=== manager processes (a second manager = crash + supervisor restart) ==="
+          docker exec rotate-trial sh -c 'ps -eo pid,etimes,args | grep -E "railway_manager|sing-box run" | grep -v grep' || true
+          echo "=== manager lifecycle lines ==="
+          docker logs rotate-trial 2>&1 | grep -nE "listening on|refresh loop armed|scheduled refresh firing|refresh triggered|refreshed [0-9]+ endpoints|config rewritten|full probe done|chain rescue|auto-pin|switch|sing-box not running|serving unreachable|mixed unreachable|Traceback|Killed|MemoryError" | tail -n 120 || true
           echo "=== manager events (refresh / pin / restart) ==="
           docker logs rotate-trial 2>&1 | grep -E "refreshed|auto-pin|rescue|switch|restart|supervise|health|config" | tail -n 80 || true
           echo "=== sing-box restarts ==="
           docker logs rotate-trial 2>&1 | grep -c "sing-box started" || true
-          echo "=== container log tail ==="
-          docker logs --tail 200 rotate-trial 2>&1 || true
+          echo "=== last 60 timestamped lines ==="
+          docker logs -t --tail 60 rotate-trial 2>&1 || true
           echo "=== cloudflared ==="
           tail -n 40 /tmp/cf.log 2>/dev/null || true
           for f in /tmp/client-*.log; do echo "=== $f ==="; tail -n 20 "$f" 2>/dev/null || true; done
@@ -409,7 +417,9 @@ jobs:
           print("pin:", s.get("preferred_tag"), "backup:", s.get("backup_tag"),
                 "auto_pinned:", s.get("auto_pinned"))
           print("last_error:", s.get("last_error"))
-          for event in (s.get("history") or [])[-40:]:
+          print("refresh_ok/fail:", s.get("refresh_ok"), s.get("refresh_fail"),
+                "last_refresh:", s.get("last_refresh"))
+          for event in (s.get("refresh_history") or [])[-40:]:
               print("  hist:", json.dumps(event, ensure_ascii=False))
           EOF
 
