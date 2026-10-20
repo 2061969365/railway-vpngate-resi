@@ -55,7 +55,7 @@ jobs:
             -e ADMIN_TOKEN="$ADMIN_TOKEN" \
             -e VLESS_UUID="$TEST_UUID" \
             -e LIMIT="$LIMIT" -e REAL_TOPK="$REAL_TOPK" \
-            -e DIAL_WORKERS=5 -e FULL_PROBE_WORKERS=5 -e PROBE_WORKERS=40 \
+            -e DIAL_WORKERS=5 -e FULL_PROBE_WORKERS=5 -e PROBE_WORKERS=30 \
             -e DIAL_TIMEOUT=8 \
             rotate-trial:trial
           for i in $(seq 1 40); do
