@@ -525,6 +525,71 @@ class RotateManagerTests(unittest.TestCase):
 
         self.assertIsNone(port)
 
+    def test_the_chain_nodes_stay_out_of_the_rotation(self) -> None:
+        # VPNGate gives one OpenVPN session per node, so rotating onto the
+        # chain's own node gets one of the two kicked: the chain looked dead
+        # while /ws-resi worked ("one dead, two dead").
+        manager = self._manager()
+        try:
+            manager._nodes = [
+                {"real_latency_ms": 10, "endpoint": _endpoint("vpngate-a")},
+                {"real_latency_ms": 20, "endpoint": _endpoint("vpngate-b")},
+                {"real_latency_ms": 30, "endpoint": _endpoint("vpngate-c")},
+            ]
+            manager._set_resi_routes([("vpngate-a", RESI_ROTATE_BASE),
+                                      ("vpngate-b", RESI_ROTATE_BASE + 1),
+                                      ("vpngate-c", RESI_ROTATE_BASE + 2)])
+            with manager._lock:
+                manager.preferred_tag = "vpngate-a"
+                manager.backup_tag = "vpngate-c"
+                pool = [tag for tag, _ in manager._resi_pool()]
+                reserved = manager.status["resi"].get("reserved")
+        finally:
+            manager.stop()
+            self._cleanup(manager)
+
+        self.assertEqual(["vpngate-b"], pool)
+        self.assertEqual(2, reserved)
+
+    def test_an_unpinned_node_returns_to_the_rotation(self) -> None:
+        manager = self._manager()
+        try:
+            manager._nodes = [
+                {"real_latency_ms": 10, "endpoint": _endpoint("vpngate-a")},
+                {"real_latency_ms": 20, "endpoint": _endpoint("vpngate-b")},
+            ]
+            manager._set_resi_routes([("vpngate-a", RESI_ROTATE_BASE),
+                                      ("vpngate-b", RESI_ROTATE_BASE + 1)])
+            with manager._lock:
+                manager.preferred_tag = "vpngate-a"
+                pinned_pool = [tag for tag, _ in manager._resi_pool()]
+                manager.preferred_tag = None
+                unpinned_pool = [tag for tag, _ in manager._resi_pool()]
+        finally:
+            manager.stop()
+            self._cleanup(manager)
+
+        self.assertEqual(["vpngate-b"], pinned_pool)
+        self.assertEqual(["vpngate-a", "vpngate-b"], unpinned_pool)
+
+    def test_a_pool_that_only_holds_the_chain_node_is_empty(self) -> None:
+        manager = self._manager()
+        try:
+            manager._nodes = [
+                {"real_latency_ms": 10, "endpoint": _endpoint("vpngate-a")},
+            ]
+            manager._set_resi_routes([("vpngate-a", RESI_ROTATE_BASE)])
+            with manager._lock:
+                manager.preferred_tag = "vpngate-a"
+            route = manager._resi_next_route()
+            pool_size = manager.status["resi"]["pool"]
+        finally:
+            manager.stop()
+            self._cleanup(manager)
+
+        self.assertIsNone(route)
+        self.assertEqual(0, pool_size)
+
     def test_rebuilding_the_table_resets_the_cursor(self) -> None:
         manager = self._manager()
         try:
@@ -859,8 +924,10 @@ class RotateManagerTests(unittest.TestCase):
             manager.stop()
             self._cleanup(manager)
 
-        self.assertEqual(2, before)
-        self.assertEqual(4, after)
+        # 2 verified, but vpngate-0 is the chain's pin and stays out of the
+        # rotation, so the pool starts at 1 and grows to 4-1 after the full pass.
+        self.assertEqual(1, before)
+        self.assertEqual(3, after)
         self.assertEqual(4, inbounds)
         self.assertEqual(cfg_before, cfg_after)
         self.assertEqual(0, restarts)      # a probe result never restarts sing-box

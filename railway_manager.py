@@ -874,7 +874,8 @@ function renderResi(s) {
   const rotate = r.mode === "rotate";
   const mode = rotate
     ? ("节点池 " + (r.pool || 0) + "/" + (r.inbounds || 0) + " 可用 · 每连接轮换" +
-       (r.down ? (" · " + r.down + " 个临时剔除") : ""))
+       (r.down ? (" · " + r.down + " 个临时剔除") : "") +
+       (r.reserved ? (" · " + r.reserved + " 个留给 chain") : ""))
     : (r.mode === "sticky" ? ("粘性 · ttl " + r.sticky_ttl + "s") : "旋转");
   const where = rotate ? ("入口 :" + r.port + r.path) : ("网关 " + r.host + ":" + r.port);
   const state = r.state === "up" ? "正常" : (r.state === "down" ? "不可用" : "未探测");
@@ -2322,6 +2323,7 @@ class RailwayManager:
                 resi["down"] = parked
                 resi["inbounds"] = len(self._resi_routes)
                 resi["nodes"] = usable
+                resi["reserved"] = self.status["resi"].get("reserved", 0)
         return snapshot
     def _record_history(self, event: str, detail: str = "") -> None:
         with self._lock:
@@ -3242,6 +3244,14 @@ class RailwayManager:
         Only nodes that passed a real dial (`real_latency_ms`) are eligible -
         never the whole snapshot. Nodes that keep kicking clients out without
         carrying payload are parked until their down window expires.
+
+        The chain path's own node (``preferred_tag`` / ``backup_tag``) is
+        excluded: VPNGate hands out one OpenVPN session per node, and a rotate
+        endpoint keeps a dial-probe session open on every node it serves, so
+        rotating onto the chain's node gets one of the two kicked
+        ("authentication failed: terminal" in the sing-box log) - the chain
+        path then looks dead while `/ws-resi` works, i.e. one dead, two dead.
+        Rotating never needs the chain's node, so it stays out of the pool.
         """
         routes = self._resi_routes
         if not routes:
@@ -3251,6 +3261,7 @@ class RailwayManager:
             tag = (node.get("endpoint") or {}).get("tag")
             if tag:
                 verified_by_tag[tag] = node.get("real_latency_ms") is not None
+        reserved = {tag for tag in (self.preferred_tag, self.backup_tag) if tag}
         now = time.monotonic()
         eligible: list[tuple[str, int]] = []
         parked: list[tuple[str, int]] = []
@@ -3258,10 +3269,15 @@ class RailwayManager:
             # A tag with no node behind it (legacy port table) is trusted.
             if verified_by_tag.get(tag) is False:
                 continue
+            if tag in reserved:
+                continue
             if self._resi_health_ok_locked(tag, now):
                 eligible.append((tag, port))
             else:
                 parked.append((tag, port))
+        resi_status = self.status.get("resi")
+        if isinstance(resi_status, dict):
+            resi_status["reserved"] = sum(1 for tag, _ in routes if tag in reserved)
         if eligible:
             return len(eligible), len(parked), eligible
         if parked:

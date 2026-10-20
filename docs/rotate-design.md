@@ -398,7 +398,26 @@ UUID 保护的公开端点，不是 API），并把 mux 已经读到的握手字
 - 状态里 `mode=rotate` 不变，但 `pool=0` 且 `error` 写明原因；面板第三路卡片显示
   `池 0/N 可用`，不再误导成"正常"。
 
-### 12.9 不变量（后续改动必须守住）
+### 12.9 D9：轮换抢走了 chain 自己的节点会话（"一个死两个一起死"）
+
+- 症状（云端验收 run 39432025613 实测）：容器池里 5 个有效节点、`/ws-resi` 工作正常，
+  但 `/ws-chain` 连续 90 秒拿不到任何出口 IP（`chain exit=` 为空），基线断言直接失败。
+  容器日志同一时刻刷满 `endpoint/openvpn-client[dial-probe]: client terminated:
+  authentication failed: terminal (auth-retry none)` 和 `dial failed for <节点>:443`。
+- 根因：VPNGate 一个节点只允许**一个** OpenVPN 会话（duplicate-cn 关闭）。轮换模式在
+  **每个** serving 节点上都建了 endpoint 并持续 dial-probe，而 chain 路径的
+  `preferred_tag`/`backup_tag` 也在这批节点里——同一节点两个会话，谁后连谁把对方踢掉。
+  被踢的如果是 chain，chain 看起来"死了"；而 `check_pinned_health` 只做 TCP 握手探测
+  （节点端口还是通的），所以**永远不会触发 rescue**，第三路却一切正常：典型的「一个死、
+  另一个也没了」，而且用户会以为是 chain 坏了。
+- 修法：`_resi_pool_locked()` 把 `preferred_tag`/`backup_tag` 从轮换候选里**排除**，
+  并在 `status.resi.reserved` 里报数（面板显示「N 个留给 chain」）。这只是路由选择层的
+  过滤——那两条 loopback 入站还在配置里，pin 变了立刻回到池子里，不需要重写配置、不重启。
+- 证据：`test_the_chain_nodes_stay_out_of_the_rotation`、`test_an_unpinned_node_returns_to_the_rotation`、
+  `test_a_pool_that_only_holds_the_chain_node_is_empty`。
+- 边界：pin 本身变化（rescue/refresh）仍会重启 sing-box，见 D6；这不是本条的回归。
+
+### 12.10 不变量（后续改动必须守住）
 
 1. **健康/池子决策不得写配置文件、不得重启 sing-box**（`/ws-resi` 的抖动不能影响
    前两路）。回归测试：`test_probe_results_do_not_rewrite_the_config`。
@@ -406,8 +425,10 @@ UUID 保护的公开端点，不是 API），并把 mux 已经读到的握手字
 3. **任一方向的连接结束 ⇒ 另一方向在 5 秒内拆掉**（不得挂到 `PIPE_IDLE_TIMEOUT`）；
    **只有上行没有下行时，`RESI_FIRST_BYTE_TIMEOUT` 内必须砍掉**。
 4. **配置稳定**：同样的节点集合 → 同样的 JSON 字节（顺序按 tag，不带延迟字段）。
+5. **轮换永远不碰 chain 的节点**：`preferred_tag`/`backup_tag` 不在轮换路由里，
+   否则 VPNGate 的单会话限制会让 chain 静默失效。
 
-### 12.10 测试矩阵（`tests/test_resi.py`，76 项全绿）
+### 12.11 测试矩阵（`tests/test_resi.py`，79 项全绿）
 
 | 场景 | 测试 |
 |---|---|
@@ -427,6 +448,7 @@ UUID 保护的公开端点，不是 API），并把 mux 已经读到的握手字
 | 节点吞下请求不回也不关 → 首字节预算砍连接 + 记失败 | `test_a_node_that_swallows_the_request_is_struck`、`test_the_pump_gives_a_silent_node_only_the_first_byte_budget` |
 | 回过了就不算 stall | `test_a_node_that_answered_is_not_struck_for_a_stall` |
 | 握手重放失败也不漏 backend socket | `test_a_failed_handshake_replay_still_closes_the_backend` |
+| chain 的节点不参与轮换 | `test_the_chain_nodes_stay_out_of_the_rotation`、`test_an_unpinned_node_returns_to_the_rotation`、`test_a_pool_that_only_holds_the_chain_node_is_empty` |
 | 拨号失败自动换下一个 | `test_backend_dial_failure_steps_to_the_next_node` |
 | 真连接 round-robin | `test_balancer_round_robins_real_connections` |
 
@@ -439,7 +461,7 @@ ports ok: True [41000, 41001, 41002] ... 41099
 route rules: 100 {'inbound': 'resi-rot-0', 'outbound': 'vpngate-0'} ... 'resi-rot-99'
 ```
 
-### 12.11 已知限制（不打算修）
+### 12.12 已知限制（不打算修）
 
 - **一条 TCP 连接只轮换一次**：mux 的"轮换单位"是一条连接，sing-box 的 VLESS 入站会把
   同一连接上的所有目标复用同一条出站。要按请求轮换，得在最前面挂一个真正的
@@ -450,11 +472,12 @@ route rules: 100 {'inbound': 'resi-rot-0', 'outbound': 'vpngate-0'} ... 'resi-ro
 - 峰值并发仍受 `MAX_CONCURRENT_DIALS=10` 限制：这是 1 进程 400 连接场景下的保护，
   第三路的重连风暴不会把 sing-box 拖死（代价是并发拨号排队）。
 
-### 12.12 上线后自查清单
+### 12.13 上线后自查清单
 
 1. `GET /api/status` → `resi.pool`（可用节点数）、`resi.down`（临时剔除数）、
-   `resi.inbounds`（= serving 节点数）。三者应满足 `pool + down <= inbounds`。
-2. 面板第三路卡片显示 `节点池 24/30 可用 · 每连接轮换 · 3 个临时剔除`；
+   `resi.reserved`（留给 chain 的节点数）、`resi.inbounds`（= serving 节点数）。
+   应满足 `pool + down + reserved <= inbounds`。
+2. 面板第三路卡片显示 `节点池 24/30 可用 · 每连接轮换 · 3 个临时剔除 · 1 个留给 chain`；
    池为 0 时状态是「不可用」并写明 `rotation pool empty` 或 `every rotation node is parked`。
 3. 节点死亡时历史里出现 `resi-node-parked`，`error` 形如
    `vpngate-7 parked for 120s after 3 fast failures`。
@@ -465,3 +488,6 @@ route rules: 100 {'inbound': 'resi-rot-0', 'outbound': 'vpngate-0'} ... 'resi-ro
    重试即落到健康节点。
 6. 每小时的全量真拨把死掉的节点写成 `real_latency_ms=null`，它们会**自动退出池子**
    且不触发重启——面板上 `pool` 会掉、`inbounds` 不变。
+7. **chain 不许被轮换拖死**：`/ws-resi` 在换节点时，`/ws-chain` 仍要能出出口 IP；
+   同一时刻容器日志里不应出现针对 chain 那个节点的
+   `authentication failed: terminal`（说明轮换又在抢它的唯一会话）。

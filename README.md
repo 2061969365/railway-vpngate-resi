@@ -119,6 +119,9 @@ vless://<UUID>@node.example.com:443?security=tls&sni=node.example.com&type=ws&pa
   不会像以前那样卡满 120 秒。
   所有节点都被踢出时会继续试最久没试的那个，
   不会出现「面板有节点、实际全不通」。
+  **chain 正在用的那个节点不会进轮换池**（面板显示「N 个留给 chain」）：VPNGate 一个节点
+  只允许一个 OpenVPN 会话，轮换如果也在上面建会话，会把 chain 挤掉——第三路正常、第二路
+  静默失效，正是「一个死两个一起死」。
   这些健康决策只影响 mux 把连接拨到哪条 loopback 入站，**不会重写配置、不会重启 sing-box**，
   所以第三路节点抖动不会波及 `/ws-node`、`/ws-chain` 的现有连接。
 - **住宅模式**：填了 `RESI_GATEWAY` + 账号密码时，改为连固定的 backconnect 网关，

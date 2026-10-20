@@ -91,7 +91,13 @@ jobs:
           # that is the whole point of §12.1/§12.2.
           assert r.get("inbounds") == len(s["endpoints"]), (r.get("inbounds"), len(s["endpoints"]))
           assert r["pool"] <= r["inbounds"], r
-          print("POOL OK: static inbounds for every serving node, pool = verified only")
+          # The chain's own node is reserved: rotating onto it would steal the one
+          # OpenVPN session VPNGate allows per node and kill /ws-chain (§12.9).
+          assert r["pool"] + r.get("down", 0) + r.get("reserved", 0) <= r["inbounds"], r
+          if s.get("preferred_tag"):
+              assert r.get("reserved", 0) >= 1, f"chain node {s['preferred_tag']} not reserved: {r}"
+          print(f"POOL OK: static inbounds for every serving node, pool = verified only, "
+                f"reserved for chain={r.get('reserved')}")
           EOF
 
       - name: Snapshot sing-box pid and config checksum
@@ -196,7 +202,18 @@ jobs:
             echo ""
           }
           echo "node exit=$(get_ip 18091)" >> /tmp/baseline.txt
-          echo "chain exit=$(get_ip 18092)" >> /tmp/baseline.txt
+          # The chain path pins one VPNGate node. If that node happens to die right
+          # now, the service rescues to another one after ~3 health rounds, but the
+          # rescue restarts sing-box, so give it two full retry rounds before
+          # declaring the second path dead.
+          chain_ip=""
+          for round in 1 2; do
+            chain_ip=$(get_ip 18092)
+            [ -n "$chain_ip" ] && break
+            echo "chain empty in round ${round}, waiting for auto-rescue"
+            sleep 15
+          done
+          echo "chain exit=${chain_ip}" >> /tmp/baseline.txt
           : > /tmp/resi-ips.txt
           for i in $(seq 1 10); do
             ip=$(curl -m 60 -s -x socks5h://127.0.0.1:18093 https://api.ipify.org || true)
