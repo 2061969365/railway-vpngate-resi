@@ -431,7 +431,7 @@ jobs:
           echo "chain rescues so far=$RESCUES"
           echo "--- restarts/refreshes so far ---"
           docker logs rotate-trial 2>&1 \
-            | grep -E "listening on|refresh loop armed|scheduled refresh firing|refresh triggered|refreshed [0-9]+ endpoints|config rewritten|chain rescue|auto-pin|sing-box not running|serving unreachable|mixed unreachable" \
+            | grep -E "listening on|refresh loop armed|scheduled refresh firing|refresh triggered|refreshed [0-9]+ endpoints|config rewritten|full probe done|chain rescue|auto-pin|sing-box not running|serving unreachable|mixed unreachable" \
             | tail -n 30 || true
           if [ "$(cat /tmp/sb_pid_before.txt)" = "$SB_PID_AFTER" ]; then
             [ "$(cat /tmp/cfg_before.txt)" = "$CFG_AFTER" ] || {
@@ -447,11 +447,18 @@ jobs:
             echo "sing-box restarted once for a legitimate chain rescue"
           fi
           HOST=$(cat /tmp/host.txt)
+          # The quick tunnel is flaky (one request can take ~30s), so retry
+          # instead of turning a tunnel hiccup into a product failure.
           for path in /ws-node /ws-chain /ws-resi; do
-            code=$(curl -m 30 --http1.1 -s -o /dev/null -w "%{http_code}" \
-              -H "Connection: Upgrade" -H "Upgrade: websocket" \
-              -H "Sec-WebSocket-Version: 13" \
-              -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" "https://${HOST}${path}")
+            code=""
+            for i in 1 2 3; do
+              code=$(curl -m 25 --http1.1 -s -o /dev/null -w "%{http_code}" \
+                -H "Connection: Upgrade" -H "Upgrade: websocket" \
+                -H "Sec-WebSocket-Version: 13" \
+                -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" "https://${HOST}${path}" || echo 000)
+              [ "$code" = "101" ] && break
+              sleep 2
+            done
             echo "https://${HOST}${path} -> $code"
             [ "$code" = "101" ] || exit 1
           done
