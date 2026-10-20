@@ -11,8 +11,10 @@ from vpngate_to_singbox import (
     _fetch_exit_ip,
     _parse_exit_ip,
     build_singbox_config,
+    endpoint_remotes,
     nodes_to_endpoints,
     ovpn_to_endpoint,
+    probe_endpoint_latency,
     probe_tcp_latency,
     snapshot_to_endpoints,
     snapshot_to_nodes,
@@ -922,6 +924,70 @@ class ExitIpFallbackTests(unittest.TestCase):
 
         self.assertIsNone(got)
         self.assertGreater(fetch.call_count, 1)
+
+
+class MultiRemoteProbeTests(unittest.TestCase):
+    """A VPNGate node can carry several TCP remotes; one dead address is not
+    a dead node (sing-box fails over inside the endpoint)."""
+
+    MULTI = TCP_OVPN.replace(
+        "remote 203.0.113.1 443 tcp\n",
+        "remote 203.0.113.1 443 tcp\nremote 203.0.113.99 1194 tcp\n",
+    )
+
+    def test_endpoint_remotes_lists_server_then_servers_in_order(self) -> None:
+        single = {"server": "203.0.113.1", "server_port": 443}
+        multi = ovpn_to_endpoint(self.MULTI, tag="", username="u", password="p")
+
+        self.assertEqual([("203.0.113.1", 443)], endpoint_remotes(single))
+        self.assertEqual(
+            [("203.0.113.1", 443), ("203.0.113.99", 1194)],
+            endpoint_remotes(multi),
+        )
+
+    def test_probe_endpoint_latency_falls_over_to_a_live_remote(self) -> None:
+        endpoint = ovpn_to_endpoint(self.MULTI, tag="", username="u", password="p")
+        seen: list[str] = []
+
+        def probe(host, port):
+            seen.append(host)
+            return 0 if host == "203.0.113.1" else 77
+
+        self.assertEqual(77, probe_endpoint_latency(endpoint, probe_fn=probe))
+        self.assertEqual(["203.0.113.1", "203.0.113.99"], seen)
+        # A dead everything endpoint is 0, and a raising probe is not fatal.
+        self.assertEqual(0, probe_endpoint_latency(
+            endpoint, probe_fn=lambda host, port: 0))
+        self.assertEqual(0, probe_endpoint_latency(
+            endpoint, probe_fn=mock.Mock(side_effect=OSError("nope"))))
+
+    def test_snapshot_keeps_a_node_when_only_the_failover_remote_answers(self) -> None:
+        csv_text = "\n".join([
+            CSV_HEADER,
+            _snapshot_row_country(
+                "vpn-failover", "203.0.113.1", 100,
+                _b64(self.MULTI), "Japan", "JP"),
+        ]) + "\n"
+
+        nodes = snapshot_to_nodes(
+            csv_text,
+            probe_fn=lambda host, port: 0 if host == "203.0.113.1" else 55,
+        )
+
+        self.assertEqual(1, len(nodes))
+        self.assertEqual(55, nodes[0]["latency_ms"])
+        self.assertEqual("203.0.113.1", nodes[0]["server"])
+
+    def test_snapshot_still_drops_a_node_when_every_remote_is_dead(self) -> None:
+        csv_text = "\n".join([
+            CSV_HEADER,
+            _snapshot_row_country(
+                "vpn-dead", "203.0.113.1", 100,
+                _b64(self.MULTI), "Japan", "JP"),
+        ]) + "\n"
+
+        self.assertEqual([], snapshot_to_nodes(csv_text,
+                                               probe_fn=lambda host, port: 0))
 
 
 if __name__ == "__main__":

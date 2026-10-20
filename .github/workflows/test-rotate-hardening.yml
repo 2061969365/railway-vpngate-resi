@@ -308,8 +308,8 @@ jobs:
           pathlib.Path("/tmp/killed_count.txt").write_text(f"{killed}\n")
           print(f"pool={len(pool)} keep={sorted(keep)} killed_nodes={killed} "
                 f"blocked_addrs={len(lines)}")
-          for ip, tag in lines:
-              print(f"  kill {tag} ({ip})")
+          for line in lines:
+              print(f"  kill {line.split()[1]} ({line.split()[0]})")
           assert killed >= 3, "need enough dead nodes to exercise parking"
           EOF
           docker exec -u 0 rotate-trial sh -c "apt-get update -qq && apt-get install -y -qq --no-install-recommends iptables" >/tmp/apt.log 2>&1 || {

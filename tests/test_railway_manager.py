@@ -5166,6 +5166,96 @@ class DeadPinTests(unittest.TestCase):
         self.assertIn("auto-pin-skipped", events)
 
 
+class MultiRemotePinTests(unittest.TestCase):
+    """A pin with several remotes is dead only when every remote is dead.
+
+    VPNGate ovpn configs often list several TCP remotes for one node and
+    sing-box fails over inside the endpoint, so probing only the first address
+    would either rescue away from a working chain or drop a usable node from
+    the rotation pool.
+    """
+
+    TOKEN = "test-admin-token-0123456789abcdef"
+
+    def _manager(self, tmpdir: str, **kwargs):
+        defaults = dict(port=0, mixed_port=get_free_port(), start_singbox=False,
+                        auto_refresh=False, fetch_on_start=False,
+                        admin_token=self.TOKEN,
+                        config_path=f"{tmpdir}/singbox.json",
+                        nodes_path=f"{tmpdir}/nodes.json",
+                        state_path=f"{tmpdir}/state.json")
+        defaults.update(kwargs)
+        return RailwayManager(**defaults)
+
+    def _seed_multi(self, manager):
+        primary = {"server": "203.0.113.11", "server_port": 443,
+                   "network": "tcp"}
+        failover = {"server": "203.0.113.99", "server_port": 1194,
+                    "network": "tcp"}
+        manager._nodes = [
+            {"server": "203.0.113.11", "server_port": 443,
+             "country": "Japan", "country_short": "JP",
+             "latency_ms": 100, "real_latency_ms": 30, "speed": 1000,
+             "endpoint": {"tag": "vpngate-0", "type": "openvpn-client",
+                          "servers": [primary, failover]}},
+            {"server": "203.0.113.12", "server_port": 443,
+             "country": "Japan", "country_short": "JP",
+             "latency_ms": 200, "real_latency_ms": 40, "speed": 1000,
+             "endpoint": {"tag": "vpngate-1", "server": "203.0.113.12",
+                          "server_port": 443}},
+        ]
+
+    def test_dead_first_remote_keeps_the_pin(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = self._manager(tmpdir)
+            try:
+                self._seed_multi(manager)
+                manager.preferred_tag = "vpngate-0"
+                manager.status["preferred_tag"] = "vpngate-0"
+                manager.backup_tag = "vpngate-1"
+                manager.status["backup_tag"] = "vpngate-1"
+                manager._auto_pinned = True
+                seen: list[str] = []
+
+                def probe(host, port, timeout=5):
+                    seen.append(host)
+                    return 0 if host == "203.0.113.11" else 90
+
+                with _fake_singbox():
+                    result = manager.check_pinned_health(probe_fn=probe)
+            finally:
+                manager.stop()
+
+        self.assertEqual("pinned", result)
+        self.assertEqual("vpngate-0", manager.preferred_tag)
+        self.assertEqual(["203.0.113.11", "203.0.113.99"], seen)
+
+    def test_all_remote_candidates_are_tried_before_a_rescue(self) -> None:
+        """Every remote of the pin is probed before the pin is given up."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = self._manager(tmpdir)
+            try:
+                self._seed_multi(manager)
+                manager.preferred_tag = "vpngate-0"
+                manager.status["preferred_tag"] = "vpngate-0"
+                manager.backup_tag = "vpngate-1"
+                manager.status["backup_tag"] = "vpngate-1"
+                manager._auto_pinned = True
+                seen: list[str] = []
+
+                def probe(host, port, timeout=5):
+                    seen.append(host)
+                    return 0
+
+                with _fake_singbox():
+                    manager.check_pinned_health(probe_fn=probe)
+            finally:
+                manager.stop()
+
+        # 203.0.113.11 (server) then 203.0.113.99 (servers[1]) both probed.
+        self.assertEqual(["203.0.113.11", "203.0.113.99"], seen[:2])
+
+
 class RescueRoundTests(unittest.TestCase):
     """check_pinned_health rescue commits only when no manual switch
     landed after the round started (N3: round-scoped guard, not a bare

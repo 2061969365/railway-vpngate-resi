@@ -21,6 +21,7 @@ from vpngate_to_singbox import (
     DEFAULT_RESI_PORT,
     RESI_ROTATE_BASE,
     build_singbox_config,
+    endpoint_remotes,
     measure_exit_ip,
     measure_real_latency,
     measure_resi_exit_ip,
@@ -2630,11 +2631,17 @@ class RailwayManager:
         alive: dict[str, int] = {}
         alive_lock = threading.Lock()
         def _one(node: dict) -> None:
-            try:
-                host, port = primary_server(node.get("endpoint") or node)
-                ms = probe_tcp_latency(host, port, 5)
-            except Exception:
-                ms = 0
+            endpoint = node.get("endpoint") or node
+            ms = 0
+            # Every remote, not just the first: sing-box fails over inside the
+            # endpoint, so one dead address must not hide a live node.
+            for host, port in endpoint_remotes(endpoint):
+                try:
+                    ms = probe_tcp_latency(host, port, 5)
+                except Exception:
+                    ms = 0
+                if ms and ms > 0:
+                    break
             if ms and ms > 0:
                 with alive_lock:
                     alive[((node.get("endpoint") or {}).get("tag"))] = ms
@@ -2719,11 +2726,19 @@ class RailwayManager:
             round_id = self._rescue_round
         if tag is None or node is None:
             return "no-preferred"
-        host, port = primary_server(node.get("endpoint") or node)
-        try:
-            hand = probe_tcp_latency(host, port, 5)
-        except Exception:
-            hand = 0
+        endpoint = node.get("endpoint") or node
+        probe = probe_fn or (lambda host, port: probe_tcp_latency(host, port, 5))
+        hand = 0
+        # The pin is only dead when *every* remote fails: sing-box fails over
+        # within the endpoint, so probing just the first address would rescue
+        # away from a chain that still carries traffic.
+        for host, port in endpoint_remotes(endpoint):
+            try:
+                hand = probe(host, port)
+            except Exception:
+                hand = 0
+            if hand and hand > 0:
+                break
         alive = hand > 0
         if alive:
             with self._lock:

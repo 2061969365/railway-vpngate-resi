@@ -128,6 +128,38 @@ def primary_server(endpoint: dict) -> tuple[str, int]:
     return first["server"], first["server_port"]
 
 
+def endpoint_remotes(endpoint: dict) -> list[tuple[str, int]]:
+    """Every (server, port) sing-box will try, in failover order.
+
+    VPNGate ovpn configs frequently list several TCP remotes for the same node
+    (a literal IP, another port, a DDNS name), which become ``servers[]``. The
+    first address being unreachable therefore says nothing about the node: a
+    health probe that only looks at primary_server() drops usable nodes from
+    the pool for no reason.
+    """
+    out: list[tuple[str, int]] = []
+    host = endpoint.get("server")
+    if host:
+        out.append((str(host), int(endpoint.get("server_port") or 0)))
+    for item in endpoint.get("servers") or []:
+        if isinstance(item, dict) and item.get("server"):
+            out.append((str(item["server"]), int(item.get("server_port") or 0)))
+    return out
+
+
+def probe_endpoint_latency(endpoint: dict, timeout: int = 5, probe_fn=None) -> int:
+    """Handshake latency of the first working remote, 0 when every one is dead."""
+    probe = probe_fn or (lambda host, port: probe_tcp_latency(host, port, timeout))
+    for host, port in endpoint_remotes(endpoint):
+        try:
+            ms = probe(host, port)
+        except Exception:
+            ms = 0
+        if ms and ms > 0:
+            return int(ms)
+    return 0
+
+
 def render_resi_username(user: str, template: str | None, ttl: int,
                          session_id: str = "") -> str:
     """Render the gateway username for rotation or sticky mode.
@@ -1047,6 +1079,12 @@ def snapshot_to_nodes(
     check = probe_fn if probe_fn is not None else (
         lambda host, port: probe_tcp_latency(host, port, probe_timeout))
 
+    def _probe_endpoint(endpoint):
+        # Try every remote of the endpoint, not just the first: a node whose
+        # first address is down but whose failover address works is still a
+        # perfectly usable node (see endpoint_remotes).
+        return probe_endpoint_latency(endpoint, probe_timeout, probe_fn=check)
+
     def _node(speed, country, country_short, endpoint, latency_ms):
         host, port = primary_server(endpoint)
         return {"server": host, "server_port": port,
@@ -1069,9 +1107,8 @@ def snapshot_to_nodes(
             chunk = ranked[start:start + step]
             latencies: dict[int, int] = {}
             with ThreadPoolExecutor(max_workers=probe_workers) as executor:
-                future_map = {executor.submit(
-                    check, *primary_server(ep)): index
-                    for index, (_, _, _, ep) in enumerate(chunk)}
+                future_map = {executor.submit(_probe_endpoint, ep): index
+                              for index, (_, _, _, ep) in enumerate(chunk)}
                 for future in future_map:
                     try:
                         latencies[future_map[future]] = future.result()
