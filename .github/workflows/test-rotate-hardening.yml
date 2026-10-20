@@ -256,47 +256,121 @@ jobs:
         run: |
           AUTH="Authorization: Bearer $ADMIN_TOKEN"
           curl -m 10 -s -H "$AUTH" http://127.0.0.1:3000/api/status -o /tmp/status.json
+          # A VPNGate ovpn config can list several TCP remotes for the SAME
+          # node; sing-box keeps them in servers[] and fails over in order. So
+          # blocking only the primary address leaves the node fully usable and
+          # the test would report "served from a killed node" for a node that
+          # was never actually killed. Take every address from the live config.
+          docker exec rotate-trial cat /app/singbox-railway.json > /tmp/cfg.json
           python3 - <<'EOF'
-          import json, pathlib
-          s = json.load(open("/tmp/status.json"))
-          pool = [e for e in s["endpoints"] if e.get("real_latency_ms") is not None]
-          keep = {s.get("preferred_tag"), s.get("backup_tag")} - {None}
-          keep.add(pool[0]["tag"])
-          blocked = [(e["server"], e["tag"]) for e in pool if e["tag"] not in keep]
-          pathlib.Path("/tmp/blocked.txt").write_text("\n".join(f"{ip} {tag}" for ip, tag in blocked))
-          print(f"pool={len(pool)} keep={sorted(keep)} blocked={len(blocked)}")
-          for ip, tag in blocked:
+          import json, pathlib, socket
+          status = json.load(open("/tmp/status.json"))
+          cfg = json.load(open("/tmp/cfg.json"))
+          pool = [e for e in status["endpoints"] if e.get("real_latency_ms") is not None]
+          keep = {status.get("preferred_tag"), status.get("backup_tag")} - {None}
+          if pool:
+              keep.add(pool[0]["tag"])
+          endpoints = {ep.get("tag"): ep for ep in (cfg.get("endpoints") or [])
+                       if isinstance(ep, dict)}
+
+          def addrs_of(ep):
+              out = []
+              if ep.get("server"):
+                  out.append(ep["server"])
+              for item in ep.get("servers") or []:
+                  if isinstance(item, dict) and item.get("server"):
+                      out.append(item["server"])
+              return out
+
+          def resolve(host):
+              try:
+                  return sorted({info[4][0] for info in socket.getaddrinfo(host, None)})
+              except OSError:
+                  return [host]
+
+          keep_addrs = set()
+          for tag in keep:
+              for addr in addrs_of(endpoints.get(tag) or {}):
+                  keep_addrs.update(resolve(addr))
+          lines, killed = [], 0
+          for entry in pool:
+              tag = entry["tag"]
+              if tag in keep:
+                  continue
+              killed += 1
+              for addr in addrs_of(endpoints.get(tag) or {}):
+                  for ip in resolve(addr):
+                      if ip in keep_addrs:
+                          continue
+                      lines.append(f"{ip} {tag}")
+          lines = sorted(set(lines))
+          pathlib.Path("/tmp/blocked.txt").write_text("\n".join(lines) + "\n")
+          pathlib.Path("/tmp/killed_count.txt").write_text(f"{killed}\n")
+          print(f"pool={len(pool)} keep={sorted(keep)} killed_nodes={killed} "
+                f"blocked_addrs={len(lines)}")
+          for ip, tag in lines:
               print(f"  kill {tag} ({ip})")
-          assert len(blocked) >= 3, "need enough dead nodes to exercise parking"
+          assert killed >= 3, "need enough dead nodes to exercise parking"
           EOF
           docker exec -u 0 rotate-trial sh -c "apt-get update -qq && apt-get install -y -qq --no-install-recommends iptables" >/tmp/apt.log 2>&1 || {
             tail -n 30 /tmp/apt.log; exit 1; }
           while read -r ip tag; do
-            docker exec -u 0 rotate-trial iptables -A OUTPUT -p tcp -d "$ip" \
-              -j REJECT --reject-with tcp-reset
-            docker exec -u 0 rotate-trial iptables -A OUTPUT -p udp -d "$ip" -j REJECT
+            if [ "${ip#*:}" != "$ip" ]; then
+              docker exec -u 0 rotate-trial ip6tables -A OUTPUT -d "$ip" -j REJECT \
+                || echo "ip6tables unavailable for $ip ($tag)"
+            else
+              docker exec -u 0 rotate-trial iptables -A OUTPUT -p tcp -d "$ip" \
+                -j REJECT --reject-with tcp-reset
+              docker exec -u 0 rotate-trial iptables -A OUTPUT -p udp -d "$ip" -j REJECT
+            fi
           done < /tmp/blocked.txt
-          docker exec -u 0 rotate-trial iptables -S OUTPUT | head -n 30
+          docker exec -u 0 rotate-trial iptables -S OUTPUT | head -n 40
+          # Proof the kill is real: every blocked address must refuse a TCP
+          # connect from inside the container (any port, so this is port-free).
+          docker exec -u 0 -i rotate-trial sh -c 'cat > /tmp/blocked.txt' < /tmp/blocked.txt
+          docker exec -u 0 -i rotate-trial python3 - <<'EOF'
+          import pathlib, socket
+          bad = []
+          for line in pathlib.Path("/tmp/blocked.txt").read_text().splitlines():
+              if not line.strip():
+                  continue
+              ip, tag = line.split()
+              fam = socket.AF_INET6 if ":" in ip else socket.AF_INET
+              sock = socket.socket(fam, socket.SOCK_STREAM)
+              sock.settimeout(2)
+              try:
+                  sock.connect((ip, 443))
+                  bad.append(f"{tag} {ip}")
+              except OSError:
+                  pass
+              finally:
+                  sock.close()
+          print("still reachable after block:", bad or "none")
+          raise SystemExit(1 if bad else 0)
+          EOF
 
       - name: Storm the rotation with dead nodes
         run: |
           AUTH="Authorization: Bearer $ADMIN_TOKEN"
-          N=$(grep -c . /tmp/blocked.txt)
+          N=$(cat /tmp/killed_count.txt)
           ROUNDS=$(( N * 3 + 8 ))
           echo "dead nodes=$N -> $ROUNDS resi connections"
           : > /tmp/storm.txt
           # One connection = one rotation slot. Each attempt tries two echo
           # services (still within the 20s first-byte watchdog plus teardown).
+          # Only an HTTP 200 with a body counts as served: a killed node often
+          # returns curl code 000 while still leaving partial bytes in the
+          # output file, and that must never look like a successful rotation.
           storm_once() {
             local url out code secs ip
             for url in https://icanhazip.com https://api.ipify.org; do
               out=$(curl -m 20 -s -o /tmp/storm-out.txt -w "%{http_code} %{time_total}" \
                 -x socks5h://127.0.0.1:18093 "$url" || true)
               code=${out%% *}; secs=${out##* }
-              ip=$(cat /tmp/storm-out.txt 2>/dev/null || true)
-              [ -n "$ip" ] && { echo "$code $secs $ip"; return 0; }
+              ip=$(tr -d '\r\n' < /tmp/storm-out.txt 2>/dev/null || true)
+              [ "$code" = "200" ] && [ -n "$ip" ] && { echo "200 $secs $ip"; return 0; }
             done
-            echo "${code:-000} ${secs:-60} "
+            echo "${code:-000} ${secs:-60} <none>"
           }
           for i in $(seq 1 $ROUNDS); do
             read -r code secs ip <<< "$(storm_once)"
@@ -309,6 +383,7 @@ jobs:
           s = json.load(open("/tmp/status_after.json"))
           r = s["resi"]
           blocked = {line.split()[0] for line in pathlib.Path("/tmp/blocked.txt").read_text().splitlines() if line.strip()}
+          killed = int(pathlib.Path("/tmp/killed_count.txt").read_text().strip())
           rows = [l for l in pathlib.Path("/tmp/storm.txt").read_text().splitlines() if l.strip()]
           secs = [float(re.search(r"secs=([0-9.]+)", l).group(1)) for l in rows]
           ok = [l for l in rows if "code=200" in l]
@@ -322,7 +397,7 @@ jobs:
           # a rotation connection can still hang past the watchdog.
           assert max(secs) < 35, f"a connection stalled for {max(secs):.1f}s (watchdog is 20s)"
           assert not (set(served) & blocked), f"served from a killed node: {set(served) & blocked}"
-          assert r.get("down", 0) >= min(3, len(blocked)), f"dead nodes were never parked: {r}"
+          assert r.get("down", 0) >= min(3, killed), f"dead nodes were never parked: {r}"
           # A tiny VPNGate pool can also die on its own: assert the service never
           # lies about having nodes, instead of demanding luck from the network.
           if r["pool"] > 0:
