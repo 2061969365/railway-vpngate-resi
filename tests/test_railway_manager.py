@@ -33,6 +33,22 @@ def _fake_singbox():
         yield
 
 
+def _settle_probes(manager) -> None:
+    """Wait for the background probe passes to finish.
+
+    `refresh_once` starts a background full probe, and that probe writes its
+    dial results back into the node dicts: a failed dial clears
+    `real_latency_ms` (railway_manager.py:3517). A test that seeds
+    measurements by hand must let the probe finish first, otherwise both
+    write the same dicts and the verdict depends on who wins the race - which
+    is how a Windows run passed while a Linux CI run failed.
+    """
+    for attr in ("_full_probe_thread", "_single_probe_thread"):
+        thread = getattr(manager, attr, None)
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=30)
+
+
 def get_free_port() -> int:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.bind(("127.0.0.1", 0))
@@ -1158,6 +1174,7 @@ class PinnedHealthTests(unittest.TestCase):
                     with mock.patch("railway_manager.probe_tcp_latency",
                                      return_value=100):
                         self.assertTrue(manager.refresh_once())
+                    _settle_probes(manager)
                     manager.switch(tag="vpngate-0")
                     # The pin has been in place for a while: no warm-up grace.
                     manager._chain_pin_at = time.monotonic() - 3600.0
@@ -1189,6 +1206,7 @@ class PinnedHealthTests(unittest.TestCase):
                             fetcher=lambda url, timeout: _snapshot_csv(
                                 "203.0.113.11", "203.0.113.12",
                                 "203.0.113.13")))
+                    _settle_probes(manager)
                     manager.switch(tag="vpngate-0")
                     # A pin from an earlier round, not a warm-up pin:
                     # otherwise CHAIN_SETTLE_GRACE suppresses the rescue.
@@ -1232,8 +1250,11 @@ class PinnedHealthTests(unittest.TestCase):
                             fetcher=lambda url, timeout: _snapshot_csv(
                                 "203.0.113.11", "203.0.113.12",
                                 "203.0.113.13")))
+                    _settle_probes(manager)
                     manager.switch(tag="vpngate-0")
-                    manager._chain_pin_at = 0.0   # pin is old: no warm-up grace
+                    # A pin from an earlier round, not a warm-up pin: the
+                    # grace must not depend on how long the machine is up.
+                    manager._chain_pin_at = time.monotonic() - 3600.0
                     # Simulate an auto pin (not operator-held).
                     manager._auto_pinned = True
                     by_server = {n["server"]: n for n in manager._nodes}
@@ -1269,6 +1290,7 @@ class PinnedHealthTests(unittest.TestCase):
                     with mock.patch("railway_manager.probe_tcp_latency",
                                      return_value=100):
                         self.assertTrue(manager.refresh_once())
+                    _settle_probes(manager)
                     manager.switch(tag="vpngate-0")
 
                     # Health is dial-only now: a live tunnel dial keeps
@@ -4189,8 +4211,11 @@ class AutoPinFlagTests(unittest.TestCase):
                     self.assertTrue(manager.refresh_once(
                         fetcher=lambda url, timeout: _snapshot_csv(
                             "203.0.113.11", "203.0.113.12")))
+                    _settle_probes(manager)
                     manager.switch(tag="vpngate-0")
-                    manager._chain_pin_at = 0.0   # pin is old: no warm-up grace
+                    # A pin from an earlier round, not a warm-up pin: the
+                    # grace must not depend on how long the machine is up.
+                    manager._chain_pin_at = time.monotonic() - 3600.0
                     by_server = {n["server"]: n for n in manager._nodes}
                     by_server["203.0.113.11"]["real_latency_ms"] = 70
                     by_server["203.0.113.12"]["real_latency_ms"] = 30
@@ -5550,6 +5575,7 @@ class RescueRoundTests(unittest.TestCase):
                     round_at_start = self._round_id(manager)
                     result = manager.check_pinned_health(probe_fn=failing)
                     self.assertEqual("rescued", result)
+                    _settle_probes(manager)
                     manager.switch(tag="vpngate-0")
                     committed = manager._commit_rescue(
                         round_at_start, "vpngate-1", "vpngate-0")
