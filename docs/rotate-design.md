@@ -1012,3 +1012,13 @@ serving 入口测量**（轮换的 loopback inbound，和 `_chain_probe_ok` / `_
 **全量真拨这条路一直漏着**——单测看不出来（本地没有 sing-box、也没有真节点），
 是云端验收用真容器 + 真节点 + 进程级证据才抓到的。
 
+**还剩一个入口：冷启动 refresh 的 REAL_TOPK 真拨**（验收 run 39658679315 的 watcher 抓到
+16 个直拨 VPNGate 节点的 throwaway 客户端）。它占着那个节点唯一的 CN，serving 实例随后
+登录同一节点就被拒 ⇒ 10 个 serving 端点变僵尸。
+
+这一版用**最省事**的办法降低伤害，而不是消灭入口：给 openvpn 端点加
+`"auth-retry": "nointeract"`（sing-box 的默认值是 `none` = 登录被拒即终态，日志里那行
+`(auth-retry none)` 就是它）⇒ serving 端在对方会话消失后**自己重试登录**，节点从尸体
+复活。彻底消灭这个入口要改成"先落 serving 配置、再经 serving 端测量"的两段式发布，
+改动面大得多，留待需要时再做。
+
