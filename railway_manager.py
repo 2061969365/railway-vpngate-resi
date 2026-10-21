@@ -19,6 +19,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from vpngate_to_singbox import (
+    _safe_print,
     DEFAULT_RESI_PATH,
     DEFAULT_RESI_PORT,
     RESI_ROTATE_BASE,
@@ -35,23 +36,6 @@ from vpngate_to_singbox import (
     render_resi_username,
     snapshot_to_nodes,
 )
-
-
-def _safe_print(text: str, flush: bool = True) -> None:
-    """print() that cannot take the process down during shutdown.
-
-    A daemon thread that logs while the interpreter is finalizing hits
-    CPython 3.13's fatal `_enter_buffered_busy` (the stdout lock is already
-    gone) and kills the whole process with SIGABRT. The manager's background
-    threads (refresh, full probe, health monitor) may well outlive the main
-    thread, so every log line goes through here.
-    """
-    if sys.is_finalizing():
-        return
-    try:
-        builtins.print(text, flush=True)
-    except Exception:
-        pass
 
 
 DEFAULT_SNAPSHOT_URL = "https://www.vpngate.net/api/iphone/"

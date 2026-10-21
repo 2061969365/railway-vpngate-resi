@@ -31,4 +31,11 @@ jobs:
       - name: Install pytest
         run: python -m pip install --upgrade pip pytest
       - name: Run the test suite
-        run: python -m pytest tests -q -rs
+        run: python -m pytest tests -q -rs -p no:cacheprovider
+      - name: The suite must not leave files behind
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "the test run polluted the working tree:"
+            git status --porcelain
+            exit 1
+          fi

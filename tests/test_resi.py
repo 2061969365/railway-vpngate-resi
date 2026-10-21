@@ -516,6 +516,17 @@ class ResiManagerTests(unittest.TestCase):
 class RotateManagerTests(unittest.TestCase):
     """Balancer behaviour: per-connection round-robin over the serving nodes."""
 
+    def tearDown(self) -> None:
+        # The config/state files are written next to the source tree (see
+        # _manager): do not leave them behind in the repository.
+        stem = os.path.join(os.getcwd(), f".resi-rot-{id(self)}")
+        for path in (f"{stem}.json", f"{stem}-nodes.json", f"{stem}-state.json",
+                     f"{stem}.json.last-good"):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
     def _manager(self, **kwargs) -> RailwayManager:
         # Write next to the source tree: mkdtemp dirs and /tmp are not
         # writable in every sandbox, and _apply_config must really write.

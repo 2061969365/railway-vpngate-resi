@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import builtins
 import base64
 import csv
 import io
@@ -11,6 +12,7 @@ import socket
 import ssl
 import subprocess
 import tempfile
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -535,6 +537,24 @@ def _free_port() -> int:
         sock.close()
 
 
+def _safe_print(text: str, flush: bool = True) -> None:
+    """print() that cannot take the process down during shutdown.
+
+    A daemon thread that logs while the interpreter is finalizing hits
+    CPython 3.13's fatal `_enter_buffered_busy` (the stdout lock is already
+    gone) and kills the whole process with SIGABRT. The manager's background
+    threads (refresh, full probe, health monitor) and this module's dial /
+    verify probes may well outlive the main thread, so every log line goes
+    through here.
+    """
+    if sys.is_finalizing():
+        return
+    try:
+        builtins.print(text, flush=flush)
+    except Exception:
+        pass
+
+
 def _log_dial_failure(endpoint: dict, err_path: str) -> None:
     """Print the sing-box stderr tail so CI logs show why a dial failed."""
     try:
@@ -543,7 +563,7 @@ def _log_dial_failure(endpoint: dict, err_path: str) -> None:
     except OSError:
         tail = ""
     detail = f"\nsing-box log tail:\n{tail}" if tail else " (no sing-box log captured)"
-    print(f"dial failed for {endpoint.get('server')}:{endpoint.get('server_port')}{detail}",
+    _safe_print(f"dial failed for {endpoint.get('server')}:{endpoint.get('server_port')}{detail}",
           flush=True)
 
 
@@ -592,7 +612,7 @@ def measure_real_latency(endpoint: dict, singbox_bin: str = "sing-box",
                     err_handle.close()
                 except OSError:
                     pass
-            print(f"dial failed for {endpoint.get('server')}:{endpoint.get('server_port')}: "
+            _safe_print(f"dial failed for {endpoint.get('server')}:{endpoint.get('server_port')}: "
                   f"cannot start {singbox_bin}", flush=True)
             return None
         try:
@@ -672,7 +692,7 @@ def measure_exit_ip(endpoint: dict, singbox_bin: str = "sing-box",
                     err_handle.close()
                 except OSError:
                     pass
-            print(f"verify failed for {endpoint.get('server')}:{endpoint.get('server_port')}: "
+            _safe_print(f"verify failed for {endpoint.get('server')}:{endpoint.get('server_port')}: "
                   f"cannot start {singbox_bin}", flush=True)
             return (None, None)
         try:
@@ -770,7 +790,7 @@ def _resi_probe_run(resi: dict, count: int, singbox_bin: str, timeout: int,
                 stdout=subprocess.DEVNULL,
                 stderr=err_handle or subprocess.DEVNULL)
         except OSError:
-            print(f"resi probe failed: cannot start {singbox_bin}", flush=True)
+            _safe_print(f"resi probe failed: cannot start {singbox_bin}", flush=True)
             return None
         deadline = time.monotonic() + timeout
         ips: list[str] = []
@@ -936,7 +956,7 @@ def measure_resi_rotate(vless_uuid: str, port: int, path: str, count: int = 3,
                 stdout=subprocess.DEVNULL,
                 stderr=err_handle or subprocess.DEVNULL)
         except OSError:
-            print(f"resi rotate probe failed: cannot start {singbox_bin}", flush=True)
+            _safe_print(f"resi rotate probe failed: cannot start {singbox_bin}", flush=True)
             return None
         deadline = time.monotonic() + timeout
         ips: list[str] = []
@@ -1445,7 +1465,7 @@ def main(argv: list[str] | None = None) -> int:
             json.dumps(build_singbox_config(endpoints, mixed_listen, mixed_port), indent=2) + "\n",
             encoding="utf-8",
         )
-        print(f"wrote {args.output} with {len(endpoints)} endpoints")
+        _safe_print(f"wrote {args.output} with {len(endpoints)} endpoints")
         return 0
 
     config_text = Path(args.input).read_text(encoding="utf-8")
@@ -1455,7 +1475,7 @@ def main(argv: list[str] | None = None) -> int:
         encoding="utf-8",
     )
     host, port = primary_server(endpoint)
-    print(f"wrote {args.output} with 1 endpoint ({host}:{port})")
+    _safe_print(f"wrote {args.output} with 1 endpoint ({host}:{port})")
     return 0
 
 

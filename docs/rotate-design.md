@@ -750,7 +750,8 @@ route rules: 100 {'inbound': 'resi-rot-0', 'outbound': 'vpngate-0'} ... 'resi-ro
 3. 节点死亡时历史里出现 `resi-node-parked`，`error` 形如
    `vpngate-7 parked for 120s after 3 fast failures`。
 4. 该时段**不应**出现 sing-box 重启 / 配置写入：容器日志里没有新的
-   `wrote config`、`sing-box restarted`，前两路的现有连接不掉。
+   `config rewritten: N serving endpoints, restarting sing-box`（产品实际输出的就是这一行），
+   前两路的现有连接不掉。
 5. 客户端体感：撞到坏节点应在 1~2 秒内失败（被 REJECT/RST 的情况）或最迟二十几秒
    （节点吞包不回，撞 `RESI_FIRST_BYTE_TIMEOUT=20s` 看门狗），**不再是 120 秒**；
    重试即落到健康节点。
@@ -762,11 +763,18 @@ route rules: 100 {'inbound': 'resi-rot-0', 'outbound': 'vpngate-0'} ... 'resi-ro
    同一时刻容器日志里不应出现针对 chain 那个节点的
    `authentication failed: terminal`（说明轮换又在抢它的唯一会话）。
 8. **chain 自己的节点死了要能自己换**（§12.9f D14）：`GET /api/status` 里 `resi.mode ==
-   rotate` 时，配置里 `chain` 应是 `urltest`（`outbounds` = `[pin, backup]`）。pin 的
-   会话死掉后 `/ws-chain` 应在 ≤30 秒内自己恢复（切到 backup，**没有** `config rewritten`
-   行）；两个预留节点都死时，日志应出现 `chain rescue: … -> … backup=…`，且新 pin 是
-   最近真的传过 payload 的节点，而不是延迟数字最小的那个。历史里若出现连续的
-   `chain-rescue` 且 pin 反复回到同一个 tag，说明失败记忆失效（回归）。
+   rotate` 时，配置里 `chain` 应是 `selector`（`outbounds` = `[pin, …]`；rotate 模式下
+   **没有 backup**，见 §12.9f）。pin 的会话死掉后 `/ws-chain` 应在自己恢复
+   （**没有** `config rewritten` 行）；恢复时日志应出现
+   `chain rescue: {原因}: {旧 tag} -> {新 tag}`（rotate 下没有 `backup=…`），
+   且新 pin 是最近真的传过 payload 的节点，而不是延迟数字最小的那个。
+   历史里若出现连续的 `chain-rescue` 且 pin 反复回到同一个 tag，说明失败记忆失效（回归）。
+9. **恢复时间的上限**（别按 ≤30 秒考核）：健康回路每 `HEALTH_CHECK_INTERVAL=20s` 判一次，
+   而刚 pin 上的节点有 `CHAIN_SETTLE_GRACE=45s` 的预热豁免（宽限期内不判死）。
+   ⇒ 握手已死 ⇒ 最坏 ≈45+20 = **65 秒**；握手还活着但隧道死（VPNGate 会话过期的典型形态）
+   ⇒ 还要 `CHAIN_FAIL_THRESHOLD=2` 次连续探针 ⇒ 最坏 ≈ **85 秒**。
+   冷启动（容器刚起、无 pin）时 pin 的是"最近真拨过"的节点，正常几秒内就能出出口 IP；
+   上面是**最坏情况**（恰好 pin 了一个已经死掉的节点）。
 
 ### 12.14 manager 测试契约迁移（16 条历史红灯 → 现行机制，2026-10-21）
 

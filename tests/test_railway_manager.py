@@ -20,7 +20,7 @@ from unittest import mock
 from railway_manager import (UI_HTML, RailwayManager, _cpu_model, _cpu_pct,
                                _cpu_times, _mem_pct, build_config_from_env,
                                classify_first_bytes, default_fetch)
-from vpngate_to_singbox import (build_singbox_config, measure_exit_ip,
+from vpngate_to_singbox import (_safe_print, build_singbox_config, measure_exit_ip,
                                 measure_real_latency, nodes_to_endpoints,
                                 ovpn_to_endpoint, snapshot_to_endpoints,
                                 snapshot_to_nodes)
@@ -46,8 +46,13 @@ def _settle_probes(manager) -> None:
     """
     for attr in ("_full_probe_thread", "_single_probe_thread"):
         thread = getattr(manager, attr, None)
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=30)
+        if thread is None or not thread.is_alive():
+            continue
+        thread.join(timeout=30)
+        # A probe that does not finish would hand the race back silently and
+        # the test would become "whoever writes last" - fail instead.
+        assert not thread.is_alive(), (
+            f"{attr} did not finish within 30s; the test would race it")
 
 
 def get_free_port() -> int:
@@ -5128,6 +5133,29 @@ class DeadPinTests(unittest.TestCase):
         self.assertIsNotNone(chain, "a pinned chain must publish a selector")
         self.assertEqual("vpngate-1", chain["outbounds"][0])
 
+    def test_a_fresh_pin_is_not_judged_dead(self) -> None:
+        """A pin that was just set is inside the warm-up grace: a failed
+        handshake must not move it, because the new node still needs to come
+        up (the grace exists exactly for that)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = self._manager(tmpdir, dial_fn=lambda node: None)
+            try:
+                self._seed_nodes(manager, ("203.0.113.11", 100, 30),
+                                 ("203.0.113.12", 200, 40))
+                manager.preferred_tag = "vpngate-0"
+                manager.status["preferred_tag"] = "vpngate-0"
+                manager._auto_pinned = True
+                # Just pinned: the grace applies.
+                manager._chain_pin_at = time.monotonic()
+                failing = lambda host, port, timeout=5: 0
+                with _fake_singbox():
+                    result = manager.check_pinned_health(probe_fn=failing)
+            finally:
+                manager.stop()
+
+        self.assertEqual("pinned", result)
+        self.assertEqual("vpngate-0", manager.preferred_tag)
+
     def test_a_dead_pin_is_replaced_with_fresh_handshake_evidence(self) -> None:
         """The replacement candidate answers a fresh handshake: the rescue
         records the *evidenced* event, not the stale fallback."""
@@ -5638,6 +5666,45 @@ class LoggingTests(unittest.TestCase):
             finally:
                 manager.stop()
 
+    def test_the_logger_is_silent_while_the_interpreter_finalizes(self) -> None:
+        """Logging during the interpreter shutdown is what aborts the
+        process (CPython 3.13 `_enter_buffered_busy`), so it must be
+        dropped."""
+        buf = io.StringIO()
+        with mock.patch("vpngate_to_singbox.sys.is_finalizing",
+                        return_value=True), \
+             contextlib.redirect_stdout(buf):
+            _safe_print("never seen")
+        self.assertEqual("", buf.getvalue())
+
+    def test_the_logger_survives_a_broken_stdout(self) -> None:
+        """A broken stdout must not take the background thread down."""
+        with mock.patch("builtins.print", side_effect=OSError("broken pipe")):
+            _safe_print("this must not raise")
+
+    def test_the_config_rewrite_line_is_on_stdout(self) -> None:
+        """The cloud acceptance greps this line, so it has to be on stdout
+        while the manager runs - and gone once it stopped."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = RailwayManager(
+                port=0, mixed_port=get_free_port(), start_singbox=True,
+                auto_refresh=False, fetch_on_start=False,
+                config_path=f"{tmpdir}/singbox.json",
+                nodes_path=f"{tmpdir}/nodes.json",
+                state_path=f"{tmpdir}/state.json")
+            try:
+                with _fake_singbox():
+                    buf = io.StringIO()
+                    with contextlib.redirect_stdout(buf):
+                        manager._apply_config(final="auto")
+                    self.assertIn("config rewritten", buf.getvalue())
+                    manager.stop()
+                    buf = io.StringIO()
+                    with contextlib.redirect_stdout(buf):
+                        manager._apply_config(final="auto")
+                    self.assertNotIn("config rewritten", buf.getvalue())
+            finally:
+                manager.stop()
 
 if __name__ == "__main__":
     unittest.main()
