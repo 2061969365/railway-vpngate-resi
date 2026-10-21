@@ -1,5 +1,6 @@
 """Simple Railway VPNGate manager: single-$PORT mux + sing-box supervisor (stdlib only)."""
 from __future__ import annotations
+import builtins
 import json
 import math
 import os
@@ -34,6 +35,23 @@ from vpngate_to_singbox import (
     render_resi_username,
     snapshot_to_nodes,
 )
+def _safe_print(text: str, flush: bool = True) -> None:
+    """print() that cannot take the process down during shutdown.
+
+    A daemon thread that logs while the interpreter is finalizing hits
+    CPython 3.13's fatal `_enter_buffered_busy` (the stdout lock is already
+    gone) and kills the whole process with SIGABRT. The manager's background
+    threads (refresh, full probe, health monitor) may well outlive the main
+    thread, so every log line goes through here.
+    """
+    if sys.is_finalizing():
+        return
+    try:
+        builtins.print(text, flush=True)
+    except Exception:
+        pass
+
+
 DEFAULT_SNAPSHOT_URL = "https://www.vpngate.net/api/iphone/"
 HTTP_METHODS = (b"GET ", b"POST ", b"HEAD ", b"PUT ", b"DELETE ", b"OPTIONS ", b"PATCH ")
 MIN_PROXY_PASS_LEN = 16
@@ -111,13 +129,13 @@ def _int_env(env: dict, name: str, default: int, min_val: int | None = None, max
     try:
         val = int(str(raw).strip() if isinstance(raw, str) else raw)
     except (TypeError, ValueError):
-        print(f"refusing to start: {name} must be an integer, got {raw!r}", flush=True)
+        _safe_print(f"refusing to start: {name} must be an integer, got {raw!r}", flush=True)
         raise SystemExit(2)
     if min_val is not None and val < min_val:
-        print(f"refusing to start: {name}={val} below minimum {min_val}", flush=True)
+        _safe_print(f"refusing to start: {name}={val} below minimum {min_val}", flush=True)
         raise SystemExit(2)
     if max_val is not None and val > max_val:
-        print(f"refusing to start: {name}={val} above maximum {max_val}", flush=True)
+        _safe_print(f"refusing to start: {name}={val} above maximum {max_val}", flush=True)
         raise SystemExit(2)
     return val
 def _env_bool(env: dict, name: str, default: bool) -> bool:
@@ -151,21 +169,21 @@ def _build_resi_from_env(env: dict) -> dict | None:
     except ValueError:
         gateway_port = 0
     if not host or not 0 < gateway_port < 65536:
-        print(f"refusing to start: RESI_GATEWAY must be host:port, got {gateway!r}", flush=True)
+        _safe_print(f"refusing to start: RESI_GATEWAY must be host:port, got {gateway!r}", flush=True)
         raise SystemExit(2)
     user = (env.get("RESI_USER") or "").strip()
     password = env.get("RESI_PASS") or ""
     if not user or not password:
-        print("refusing to start: RESI_GATEWAY needs RESI_USER and RESI_PASS", flush=True)
+        _safe_print("refusing to start: RESI_GATEWAY needs RESI_USER and RESI_PASS", flush=True)
         raise SystemExit(2)
     ttl = _int_env(env, "RESI_SESSION_TTL", 0, 0, 86400)
     template = env.get("RESI_USER_TEMPLATE", "{user}")
     if ttl > 0 and "{session}" not in template:
-        print("warning: RESI_SESSION_TTL>0 but RESI_USER_TEMPLATE has no {session}; staying in rotation mode", flush=True)
+        _safe_print("warning: RESI_SESSION_TTL>0 but RESI_USER_TEMPLATE has no {session}; staying in rotation mode", flush=True)
     try:
         render_resi_username(user, template, ttl, "probe")
     except ValueError as exc:
-        print(f"refusing to start: {exc}", flush=True)
+        _safe_print(f"refusing to start: {exc}", flush=True)
         raise SystemExit(2)
     return {"server": host, "server_port": gateway_port, "username": user,
             "password": password, "template": template, "session_ttl": ttl,
@@ -1474,9 +1492,9 @@ def build_config_from_env(env: dict) -> dict:
     password = env.get("PROXY_PASS", "")
     if not password:
         password = secrets.token_urlsafe(24)
-        print("PROXY_PASS not set, generated a random one", flush=True)
+        _safe_print("PROXY_PASS not set, generated a random one", flush=True)
     elif len(password) < MIN_PROXY_PASS_LEN:
-        print(f"refusing to start: PROXY_PASS must be at least {MIN_PROXY_PASS_LEN} chars", flush=True)
+        _safe_print(f"refusing to start: PROXY_PASS must be at least {MIN_PROXY_PASS_LEN} chars", flush=True)
         raise SystemExit(2)
     snapshot_url = env.get("SNAPSHOT_URL", DEFAULT_SNAPSHOT_URL)
     raw_mirrors = env.get("SNAPSHOT_URLS", "")
@@ -1485,12 +1503,12 @@ def build_config_from_env(env: dict) -> dict:
         snapshot_urls = [snapshot_url]
     for url in snapshot_urls:
         if urllib.parse.urlsplit(url).scheme != "https":
-            print(f"refusing to start: snapshot url must be https: {url}", flush=True)
+            _safe_print(f"refusing to start: snapshot url must be https: {url}", flush=True)
             raise SystemExit(2)
     if "ADMIN_TOKEN" not in env or not env["ADMIN_TOKEN"]:
         admin_token = "vpn"
         generated = False
-        print("ADMIN_TOKEN not set, defaulting to 'vpn'", flush=True)
+        _safe_print("ADMIN_TOKEN not set, defaulting to 'vpn'", flush=True)
     else:
         admin_token = env["ADMIN_TOKEN"]
         generated = False
@@ -1507,26 +1525,26 @@ def build_config_from_env(env: dict) -> dict:
     # serving endpoints. Needs VLESS_UUID because its inbounds are VLESS+WS.
     resi_rotate = resi is None and bool(env.get("VLESS_UUID", ""))
     if vless_direct_port == vless_chain_port:
-        print(f"refusing to start: VLESS ports collide ({vless_direct_port})", flush=True)
+        _safe_print(f"refusing to start: VLESS ports collide ({vless_direct_port})", flush=True)
         raise SystemExit(2)
     if resi is not None and not env.get("VLESS_UUID", ""):
-        print("refusing to start: RESI_GATEWAY needs VLESS_UUID (the resi path is a VLESS+WS inbound)", flush=True)
+        _safe_print("refusing to start: RESI_GATEWAY needs VLESS_UUID (the resi path is a VLESS+WS inbound)", flush=True)
         raise SystemExit(2)
     if resi is not None or resi_rotate:
         if resi_port in {8080, 8081, 8082, 4096, mixed_port, vless_direct_port, vless_chain_port}:
-            print(f"refusing to start: RESI_PORT={resi_port} collides", flush=True)
+            _safe_print(f"refusing to start: RESI_PORT={resi_port} collides", flush=True)
             raise SystemExit(2)
     if mixed_port in {8080, 8081, 8082, 4096, vless_direct_port, vless_chain_port}:
-        print(f"refusing to start: MIXED_PORT={mixed_port} collides", flush=True)
+        _safe_print(f"refusing to start: MIXED_PORT={mixed_port} collides", flush=True)
         raise SystemExit(2)
     reserved = {8080, 8081, 8082, 4096, mixed_port, vless_direct_port, vless_chain_port}
     if resi is not None or resi_rotate:
         reserved.add(resi_port)
     if port in reserved:
-        print(f"refusing to start: PORT={port} collides {sorted(reserved)}; set PORT=3000", flush=True)
+        _safe_print(f"refusing to start: PORT={port} collides {sorted(reserved)}; set PORT=3000", flush=True)
         raise SystemExit(2)
     if port != 3000:
-        print(f"warning: PORT={port} is not 3000", flush=True)
+        _safe_print(f"warning: PORT={port} is not 3000", flush=True)
     return {
         "port": port, "mixed_port": mixed_port,
         "username": env.get("PROXY_USER", "u"), "password": password,
@@ -1930,7 +1948,7 @@ class RailwayManager:
         if self.fetch_on_start:
             threading.Thread(target=self._initial_refresh, daemon=True, name="initial-refresh").start()
         self._start_cloudflared()
-        print(f"listening on 0.0.0.0:{self.bound_port}, backend 127.0.0.1:{self.mixed_port}", flush=True)
+        _safe_print(f"listening on 0.0.0.0:{self.bound_port}, backend 127.0.0.1:{self.mixed_port}", flush=True)
         return self.bound_port
     def _initial_refresh(self) -> None:
         if self._boot_from_last_good():
@@ -1957,6 +1975,19 @@ class RailwayManager:
             time.sleep(0.05)
         with self._lock:
             return self._mux_inflight <= 0
+    def _log(self, text: str, flush: bool = True) -> None:
+        """Log from a background thread, but only while the manager runs.
+
+        A daemon thread that logs after the manager was stopped (or while the
+        interpreter is finalizing) can race the interpreter shutdown for the
+        stdout lock: CPython 3.13 then aborts the whole process with SIGABRT
+        (`_enter_buffered_busy`). `stop()` sets `_stop_event`, so that is
+        the signal to stay quiet.
+        """
+        if self._stop_event.is_set() or sys.is_finalizing():
+            return
+        _safe_print(text, flush=flush)
+
     def stop(self) -> None:
         self._stop_event.set()
         balancer = self._resi_listener
@@ -1975,7 +2006,7 @@ class RailwayManager:
         drained = self._drain()
         with self._lock:
             remaining = self._mux_inflight
-        print(f"shutdown: mux drain {'done' if drained else 'timeout'} ({remaining} in flight)", flush=True)
+        _safe_print(f"shutdown: mux drain {'done' if drained else 'timeout'} ({remaining} in flight)", flush=True)
         self._terminate_singbox()
         self._terminate_cloudflared()
     def _accept_loop(self) -> None:
@@ -2561,20 +2592,20 @@ class RailwayManager:
         return self.refresh_seconds
     def _refresh_loop(self) -> None:
         next_run = time.monotonic() + self._effective_interval() + random.uniform(-30, 30)
-        print(f"refresh loop armed: every {self._effective_interval()}s", flush=True)
+        _safe_print(f"refresh loop armed: every {self._effective_interval()}s", flush=True)
         while not self._stop_event.wait(max(0.0, next_run - time.monotonic())):
-            print("scheduled refresh firing", flush=True)
+            self._log("scheduled refresh firing", flush=True)
             try:
                 self._start_refresh_bg()
             except Exception as exc:
-                print(f"refresh loop error: {type(exc).__name__}: {exc}", flush=True)
+                self._log(f"refresh loop error: {type(exc).__name__}: {exc}", flush=True)
             next_run = time.monotonic() + self._effective_interval() + random.uniform(-30, 30)
     def _supervise_loop(self) -> None:
         while not self._stop_event.wait(SUPERVISE_INTERVAL):
             try:
                 self._supervise_once()
             except Exception as exc:
-                print(f"supervise loop error: {type(exc).__name__}: {exc}", flush=True)
+                self._log(f"supervise loop error: {type(exc).__name__}: {exc}", flush=True)
     def _supervise_once(self) -> None:
         with self._lock:
             if not self.want_singbox:
@@ -2663,7 +2694,7 @@ class RailwayManager:
             try:
                 self.check_pinned_health()
             except Exception as exc:
-                print(f"health monitor error: {type(exc).__name__}: {exc}", flush=True)
+                self._log(f"health monitor error: {type(exc).__name__}: {exc}", flush=True)
     def _trigger_bg_refresh(self, reason: str) -> None:
         try:
             started = self._start_refresh_bg()
@@ -2674,7 +2705,7 @@ class RailwayManager:
             # config and therefore restarts sing-box, dropping all three paths.
             # When that happens the reason has to be in the log, otherwise a
             # collateral restart is indistinguishable from third-path churn.
-            print(f"refresh triggered: {reason}", flush=True)
+            self._log(f"refresh triggered: {reason}", flush=True)
             self._record_history("health-trigger-refresh", reason)
     def _fresh_probe_tags(self, cands: list[dict]) -> list[str]:
         """Fresh-handshake filter for rescue targets (bounded, parallel).
@@ -2834,7 +2865,7 @@ class RailwayManager:
                 self._chain_rescue_attempts += 1
                 self._chain_rescue_at = now
             self._record_history("chain-rescue-skipped", f"{reason}: no tunnel-verified alternative")
-            print(f"chain rescue skipped: {reason}: no tunnel-verified alternative", flush=True)
+            self._log(f"chain rescue skipped: {reason}: no tunnel-verified alternative", flush=True)
             return "pinned"
         hot = self._repin_runtime(best, reason)
         with self._config_lock:
@@ -2854,7 +2885,7 @@ class RailwayManager:
                 self._resi_payload_at.pop(tag, None)
         self._invalidate_verify(f"chain rescue to {best}")
         self._record_history("chain-rescue", f"{reason}: {tag} -> {best}" + (" (hot)" if hot else ""))
-        print(f"chain rescue: {reason}: {tag} -> {best}" + (" (hot switch)" if hot else ""), flush=True)
+        self._log(f"chain rescue: {reason}: {tag} -> {best}" + (" (hot switch)" if hot else ""), flush=True)
         return "rescued"
 
     def check_pinned_health(self, probe_fn=None) -> str:
@@ -3307,7 +3338,7 @@ class RailwayManager:
         if want_singbox:
             # Only the write path reaches here: an unchanged config returns early
             # above, so this line always means "sing-box is about to restart".
-            print(f"config rewritten: {len(endpoints)} serving endpoints, restarting sing-box",
+            self._log(f"config rewritten: {len(endpoints)} serving endpoints, restarting sing-box",
                   flush=True)
             self._restart_singbox()
             # A fresh config (and a fresh process) deserves a fresh chain probe:
@@ -3436,7 +3467,7 @@ class RailwayManager:
         self._persist_nodes(); self._persist_state()
         effective = "chain" if preferred else "auto"
         self._record_history("refresh-ok", f"{len(endpoints)} endpoints, final={effective}")
-        print(f"refreshed {len(endpoints)} endpoints, final={effective}", flush=True)
+        self._log(f"refreshed {len(endpoints)} endpoints, final={effective}", flush=True)
         # Startup/refresh only real-dials REAL_TOPK nodes so the first serving
         # config lands fast. Kick the full pass in the background: it is what
         # turns the handshake-ranked snapshot into a verified node set (the
@@ -3447,7 +3478,7 @@ class RailwayManager:
         with self._lock:
             self.status["last_error"] = reason; self.status["refresh_fail"] += 1; self._fail_streak += 1
         self._record_history("refresh-fail", reason)
-        print(f"refresh failed: {reason}", flush=True)
+        self._log(f"refresh failed: {reason}", flush=True)
         return False
     def _start_full_probe(self) -> bool:
         with self._lock:
@@ -3465,7 +3496,7 @@ class RailwayManager:
         try:
             self._run_full_probe_inner()
         except Exception as exc:
-            print(f"full probe error: {type(exc).__name__}: {exc}", flush=True)
+            self._log(f"full probe error: {type(exc).__name__}: {exc}", flush=True)
         finally:
             with self._lock:
                 if self.status.get("full_probe", {}).get("state") == "running":
@@ -3527,7 +3558,7 @@ class RailwayManager:
         skipped = len(nodes) - len(ordered)
         self._record_history("full-probe-done",
                              f"{len(ordered)} nodes dialed, {skipped} skipped")
-        print(f"full probe done: {len(ordered)} of {len(nodes)} nodes dialed, "
+        self._log(f"full probe done: {len(ordered)} of {len(nodes)} nodes dialed, "
               f"{skipped} skipped (serving or reserved), "
               f"{self.status['full_probe'].get('done')} checked", flush=True)
         # Only now is the pass really over: pinning above may rewrite the config
@@ -3758,7 +3789,7 @@ class RailwayManager:
             listener.listen(128)
             listener.settimeout(1.0)
         except OSError as exc:
-            print(f"resi balancer bind failed on :{self.resi_port}: {exc}", flush=True)
+            self._log(f"resi balancer bind failed on :{self.resi_port}: {exc}", flush=True)
             self._set_resi(state="down", error=f"bind failed: {exc}")
             try:
                 listener.close()
@@ -4076,7 +4107,7 @@ class RailwayManager:
         try:
             username = render_resi_username(self.resi["username"], self.resi.get("template"), ttl, sid)
         except ValueError as exc:
-            print(f"resi template error: {exc}", flush=True)
+            _safe_print(f"resi template error: {exc}", flush=True)
             return None
         return {"server": self.resi["server"], "server_port": self.resi["server_port"],
                 "username": username, "password": self.resi["password"]}
@@ -4186,7 +4217,7 @@ class RailwayManager:
                 try:
                     self._apply_config(final="auto", preferred=self.preferred_tag, backup=self.backup_tag)
                 except Exception as exc:
-                    print(f"config apply failed: {type(exc).__name__}: {exc}", flush=True)
+                    self._log(f"config apply failed: {type(exc).__name__}: {exc}", flush=True)
         threading.Thread(target=_run, daemon=True, name="apply-config").start()
     def _fetch_with_retry(self, fetch) -> str:
         last_exc: Exception | None = None
@@ -4228,7 +4259,7 @@ class RailwayManager:
             try:
                 new_proc = subprocess.Popen([singbox_bin, "run", "-c", config_path], stdout=subprocess.DEVNULL, stderr=new_handle or subprocess.DEVNULL)
             except OSError as exc:
-                print(f"sing-box start failed: {exc}", flush=True)
+                _safe_print(f"sing-box start failed: {exc}", flush=True)
                 new_proc = None
                 if new_handle is not None:
                     try:
@@ -4251,12 +4282,12 @@ class RailwayManager:
         with self._lock:
             if not self.tunnel_token:
                 self.status["tunnel"] = {"state": "no-token"}
-                print("cloudflared skipped: TUNNEL_TOKEN not set", flush=True)
+                _safe_print("cloudflared skipped: TUNNEL_TOKEN not set", flush=True)
                 return False
             binary = shutil.which(self.cloudflared_bin)
             if binary is None:
                 self.status["tunnel"] = {"state": "no-binary", "binary": self.cloudflared_bin}
-                print(f"cloudflared skipped: binary {self.cloudflared_bin!r} not found", flush=True)
+                _safe_print(f"cloudflared skipped: binary {self.cloudflared_bin!r} not found", flush=True)
                 return False
             try:
                 new_proc = subprocess.Popen([binary, "tunnel", "--no-autoupdate", "run", "--token", self.tunnel_token], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -4265,7 +4296,7 @@ class RailwayManager:
                 return False
             old_proc, self._cloudflared_proc = self._cloudflared_proc, new_proc
             self.status["tunnel"] = {"state": "running", "since": _now_iso()}
-            print("cloudflared tunnel started", flush=True)
+            _safe_print("cloudflared tunnel started", flush=True)
         _reap_process(old_proc)
         return True
     def _terminate_cloudflared(self) -> None:
@@ -4289,7 +4320,7 @@ def main() -> int:
     except SystemExit as exc:
         return int(exc.code or 1)
     if cfg["admin_token_generated"]:
-        print(f"generated ADMIN_TOKEN={cfg['admin_token']} (save it to use /ui and /api)", flush=True)
+        _safe_print(f"generated ADMIN_TOKEN={cfg['admin_token']} (save it to use /ui and /api)", flush=True)
     data_dir = cfg["data_dir"]
     os.makedirs(data_dir, exist_ok=True)
     manager = RailwayManager(port=cfg["port"], mixed_port=cfg["mixed_port"], username=cfg["username"], password=cfg["password"],
