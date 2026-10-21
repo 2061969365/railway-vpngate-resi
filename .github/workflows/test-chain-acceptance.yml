@@ -1,0 +1,582 @@
+name: Chain acceptance (rotate cold start + self-heal)
+
+# Temporary cloud end-to-end acceptance for the rotate-mode chain.
+#
+# It proves two things on a real container (real sing-box, real VPNGate
+# nodes, real traffic), both of which the unit tests cannot show:
+#
+#   1. COLD START, no manual intervention: the chain must pin itself to a
+#      node and carry a real exit IP through /ws-chain. The pin must be
+#      adopted WITHOUT a verify-by-dial: verify_fn dials the candidate with
+#      a throwaway sing-box client, i.e. a SECOND VPNGate session, and
+#      duplicate-cn kicks the session the rotation is serving right now
+#      (46c5953, docs/rotate-design.md §12.15).
+#      Evidence, all of it observable:
+#        * /api/status: resi.mode == rotate, preferred_tag set, auto_pinned
+#        * /api/status: backup_tag is None - the rotate pin is `best` alone
+#        * refresh_history: the pin event is `auto-pin-unverified`, never
+#          `auto-pin` (the verify-by-dial signature)
+#        * Clash API /proxies/chain: `now` is the pinned tag
+#        * /ws-chain: a real exit IP, different from the container's own IP
+#        * the container log: no "verify failed for ..." line (that string
+#          is printed by measure_exit_ip, i.e. by a verify-by-dial)
+#        * a process watcher inside the container: no throwaway sing-box
+#          client dialed a VPNGate node while the pin was decided
+#   2. SELF-HEAL: killing the pin must move the chain through the Clash API
+#      (a hot switch), with no config rewrite and no sing-box restart.
+#
+# workflow_dispatch only: one run costs 30-45 minutes of real VPNGate
+# traffic, so a push must never trigger it.
+#
+# Delete this file once the acceptance run has been recorded.
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: chain-acceptance-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  LIMIT: "16"
+  REAL_TOPK: "10"
+  ADMIN_TOKEN: rotate-admin-token-0123456789
+  TEST_UUID: a29738e5-bee1-c0fc-b484-ae7c49cbc828
+
+jobs:
+  chain-acceptance:
+    name: Rotate cold start pins without dialing, and the chain heals itself
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build combined image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          tags: rotate-trial:trial
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run container
+        run: |
+          docker run -d --name rotate-trial \
+            --cap-add=NET_ADMIN \
+            -p 3000:3000 \
+            -e PORT=3000 \
+            -e PROXY_USER=u -e PROXY_PASS=0123456789abcdef \
+            -e ADMIN_TOKEN="$ADMIN_TOKEN" \
+            -e VLESS_UUID="$TEST_UUID" \
+            -e LIMIT="$LIMIT" -e REAL_TOPK="$REAL_TOPK" \
+            -e DIAL_WORKERS=5 -e FULL_PROBE_WORKERS=5 -e PROBE_WORKERS=30 \
+            -e DIAL_TIMEOUT=8 \
+            rotate-trial:trial
+          date +%s > /tmp/t_start.txt
+          sleep 2
+          docker ps --filter name=rotate-trial --format "{{.Names}} {{.Status}}"
+
+      - name: Install the in-container probes
+        run: |
+          cat > /tmp/diag.py <<'PY'
+          import json, os, sys
+          sys.path.insert(0, "/app")
+
+          SECRET = json.load(open("/app/singbox-railway.json"))["experimental"]["clash_api"]["secret"]
+          PORT = 3000
+          UUID = os.environ.get("VLESS_UUID", "")
+
+
+          def clash(path):
+              import urllib.request
+              req = urllib.request.Request("http://127.0.0.1:9090" + path,
+                                           headers={"Authorization": "Bearer " + SECRET})
+              with urllib.request.urlopen(req, timeout=15) as resp:
+                  return json.loads(resp.read().decode())
+
+
+          def selector():
+              try:
+                  now = clash("/proxies/chain").get("now")
+              except Exception as exc:          # noqa: BLE001 - diagnostic only
+                  print("now=%s delay=-" % type(exc).__name__)
+                  return
+              try:
+                  delay = clash("/proxies/" + str(now) + "/delay?url=http%3A%2F%2Fcp.cloudflare.com%2Fgenerate_204&timeout=7000").get("delay")
+              except Exception as exc:          # noqa: BLE001 - diagnostic only
+                  delay = type(exc).__name__
+              print("now=%s delay=%s" % (now, delay))
+
+
+          def probe(path):
+              from vpngate_to_singbox import measure_resi_rotate
+              got = measure_resi_rotate(UUID, PORT, path, count=1, timeout=15)
+              if not got:
+                  print("FAIL")
+                  return
+              print("ips=%s" % ",".join(got["ips"]))
+
+
+          def probe_fast(path):
+              # Same probe, shorter budget: the cold-start baseline polls it
+              # every few seconds, so a long timeout would blur the number.
+              from vpngate_to_singbox import measure_resi_rotate
+              got = measure_resi_rotate(UUID, PORT, path, count=1, timeout=12)
+              if not got:
+                  print("FAIL")
+                  return
+              print("ips=%s" % ",".join(got["ips"]))
+
+
+          if __name__ == "__main__":
+              {"selector": selector,
+               "clash": lambda: print(json.dumps(clash("/proxies/chain"))),
+               "chain": lambda: probe("/ws-chain"),
+               "chainfast": lambda: probe_fast("/ws-chain"),
+               "node": lambda: probe("/ws-node"),
+               "resi": lambda: probe("/ws-resi")}[sys.argv[1]]()
+          PY
+          cat > /tmp/watch.py <<'PY'
+          """Record every throwaway sing-box client that dials a VPNGate node.
+
+          A verify-by-dial (measure_exit_ip) starts a second sing-box client
+          against one VPNGate node: that is the "服务中验证直拨" the rotate
+          cold start must not do any more. The serving instance runs
+          `sing-box run -c /app/singbox-railway.json`; every OTHER sing-box
+          client is a throwaway one, and its config names the node it dials.
+          """
+          import json, os, time, urllib.request
+
+          TOKEN = os.environ.get("ADMIN_TOKEN", "")
+          SERVING = "/app/singbox-railway.json"
+          OUT = "/tmp/dial_events.jsonl"
+          MARK = "/tmp/watch_markers.json"
+          DEADLINE = time.time() + 3600
+
+          def status():
+              req = urllib.request.Request("http://127.0.0.1:3000/api/status",
+                                           headers={"Authorization": "Bearer " + TOKEN})
+              with urllib.request.urlopen(req, timeout=5) as resp:
+                  return json.loads(resp.read().decode())
+
+          def clients():
+              found = []
+              for name in os.listdir("/proc"):
+                  if not name.isdigit():
+                      continue
+                  try:
+                      with open("/proc/%s/cmdline" % name, "rb") as fh:
+                          raw = fh.read()
+                  except OSError:
+                      continue
+                  parts = [p.decode("utf-8", "replace") for p in raw.split(b"\0") if p]
+                  if not parts or "sing-box" not in os.path.basename(parts[0]):
+                      continue
+                  cfg = None
+                  for i, arg in enumerate(parts):
+                      if arg == "-c" and i + 1 < len(parts):
+                          cfg = parts[i + 1]
+                  if not cfg or os.path.realpath(cfg) == os.path.realpath(SERVING):
+                      continue
+                  found.append((name, cfg))
+              return found
+
+          def vpngate_targets(cfg_path):
+              try:
+                  with open(cfg_path, encoding="utf-8") as fh:
+                      cfg = json.load(fh)
+              except (OSError, ValueError):
+                  return []
+              out = []
+              for ep in cfg.get("endpoints") or []:
+                  if ep.get("type") != "openvpn-client":
+                      continue
+                  if ep.get("server"):
+                      out.append([ep.get("server"), ep.get("server_port"), ep.get("tag")])
+                  for item in ep.get("servers") or []:
+                      if isinstance(item, dict) and item.get("server"):
+                          out.append([item.get("server"), item.get("server_port"), ep.get("tag")])
+              return out
+
+          def serving_map():
+              try:
+                  with open(SERVING, encoding="utf-8") as fh:
+                      cfg = json.load(fh)
+              except (OSError, ValueError):
+                  return {}
+              out = {}
+              for ep in cfg.get("endpoints") or []:
+                  if ep.get("server"):
+                      out[ep["server"]] = ep.get("tag")
+                  for item in ep.get("servers") or []:
+                      if isinstance(item, dict) and item.get("server"):
+                          out[item["server"]] = ep.get("tag")
+              return out
+
+          seen = set()
+          markers = {"dialing_done": None, "pin": None, "pin_tag": None}
+          with open(OUT, "a", buffering=1) as sink:
+              while time.time() < DEADLINE:
+                  stamp = time.time()
+                  try:
+                      st = status()
+                  except Exception:
+                      st = None
+                  if st:
+                      fp = st.get("full_probe") or {}
+                      total = fp.get("total") or 0
+                      done = fp.get("done") or 0
+                      if markers["dialing_done"] is None and total > 0 and done >= total:
+                          markers["dialing_done"] = stamp
+                      if markers["pin"] is None and st.get("preferred_tag"):
+                          markers["pin"] = stamp
+                          markers["pin_tag"] = st.get("preferred_tag")
+                      with open(MARK, "w", encoding="utf-8") as fh:
+                          json.dump(markers, fh)
+                  smap = serving_map()
+                  for pid, cfg_path in clients():
+                      for target in vpngate_targets(cfg_path):
+                          key = (pid, tuple(target))
+                          if key in seen:
+                              continue
+                          seen.add(key)
+                          host = target[0]
+                          sink.write(json.dumps({
+                              "t": stamp, "pid": pid, "config": cfg_path,
+                              "target": target, "serving_tag": smap.get(host),
+                          }) + "\n")
+                  time.sleep(0.5)
+          PY
+          docker cp /tmp/diag.py rotate-trial:/tmp/diag.py
+          docker cp /tmp/watch.py rotate-trial:/tmp/watch.py
+          docker exec -e ADMIN_TOKEN="$ADMIN_TOKEN" -d rotate-trial python3 /tmp/watch.py
+          sleep 2
+          docker exec rotate-trial sh -c 'ps -ef | grep -c "[w]atch.py"' || true
+          echo "watcher started"
+
+      - name: Cold start - the chain pins itself, without dialing to pin
+        run: |
+          AUTH="Authorization: Bearer $ADMIN_TOKEN"
+          T_START=$(cat /tmp/t_start.txt)
+          T_READY=0
+          for i in $(seq 1 60); do
+            if curl -m 5 -s http://127.0.0.1:3000/healthz | grep -q "^ok$"; then
+              T_READY=$(date +%s)
+              echo "healthz OK after ~$((i * 5))s (epoch $T_READY)"
+              break
+            fi
+            sleep 5
+          done
+          [ "$T_READY" != "0" ] || { docker logs rotate-trial 2>&1 | tail -n 60; exit 1; }
+          echo "container start epoch $T_START, ready epoch $T_READY"
+          # The chain has to exit with a real IP within 90s of the container
+          # being ready - this is the operational baseline for a cold start
+          # (and it covers "the cold start pinned a node that is already
+          # dead": the health loop swaps it out on its own).
+          T_FIRST=""
+          DEADLINE=$((T_READY + 90))
+          while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+            OUT=$(docker exec rotate-trial python3 /tmp/diag.py chainfast || true)
+            NOW=$(date +%s)
+            echo "exit-ip probe t=$((NOW - T_READY))s after ready ($((NOW - T_START))s after start): $OUT"
+            case "$OUT" in
+              ips=*) T_FIRST=$NOW; break;;
+            esac
+          done
+          if [ -n "$T_FIRST" ]; then
+            echo "FIRST EXIT IP: $((T_FIRST - T_READY))s after ready, $((T_FIRST - T_START))s after container start" | tee /tmp/t_first_ip.txt
+          else
+            echo "FIRST EXIT IP: none within 90s of ready" | tee /tmp/t_first_ip.txt
+            echo "FAIL: /ws-chain returned no exit IP within 90s of the container being ready"
+            exit 1
+          fi
+          [ $((T_FIRST - T_READY)) -le 90 ] || { echo "FAIL: the first exit IP took $((T_FIRST - T_READY))s (limit 90s)"; exit 1; }
+          # No manual intervention anywhere in this workflow: the pin has to
+          # come out of the cold start on its own.
+          T_PIN=""
+          for i in $(seq 1 240); do
+            curl -m 10 -s -H "$AUTH" http://127.0.0.1:3000/api/status -o /tmp/status.json || true
+            if python3 -c "import json;s=json.load(open('/tmp/status.json'));exit(0 if s.get('preferred_tag') else 1)" 2>/dev/null; then
+              T_PIN=$(date +%s)
+              echo "pin appeared $((T_PIN - T_READY))s after ready ($((T_PIN - T_START))s after start), ~$((i * 5))s of polling"
+              break
+            fi
+            sleep 5
+          done
+          echo "$T_PIN" > /tmp/t_pin.txt
+          [ -n "$T_PIN" ] || { echo "FAIL: the chain never pinned itself"; exit 1; }
+          {
+            echo "container_start_epoch=$T_START"
+            echo "ready_epoch=$T_READY"
+            echo "first_exit_ip_epoch=$T_FIRST"
+            echo "first_exit_ip_after_ready_s=$((T_FIRST - T_READY))"
+            echo "first_exit_ip_after_start_s=$((T_FIRST - T_START))"
+            echo "pin_epoch=$T_PIN"
+            echo "pin_after_ready_s=$((T_PIN - T_READY))"
+            echo "pin_after_start_s=$((T_PIN - T_START))"
+          } | tee /tmp/timeline.txt
+          python3 - <<'EOF'
+          import json
+          s = json.load(open("/tmp/status.json"))
+          r = s["resi"]
+          hist = s.get("refresh_history") or []
+          events = [h["event"] for h in hist]
+          print("preferred_tag:", s.get("preferred_tag"), "backup_tag:", s.get("backup_tag"),
+                "auto_pinned:", s.get("auto_pinned"))
+          print("resi:", {k: r.get(k) for k in ("mode", "pool", "inbounds", "down", "reserved", "nodes")})
+          print("chain_switch:", s.get("chain_switch"))
+          print("full_probe:", s.get("full_probe"))
+          print("history:", [(h["event"], h.get("detail")) for h in hist])
+          assert r.get("mode") == "rotate", r
+          assert s.get("preferred_tag"), s
+          assert s.get("auto_pinned") is True, s
+          # The rotate pin is `best` alone: a verified standby would mean the
+          # pin was chosen by dialing the candidates (verify_fn).
+          assert s.get("backup_tag") is None, s
+          assert r.get("reserved") == 1, r
+          # The pin was adopted without an exit-ip verification.
+          assert "auto-pin-unverified" in events, events
+          assert "auto-pin" not in events, events
+          assert s["chain_switch"]["mode"] == "clash", s["chain_switch"]
+          print("COLD START STATUS OK: pin=%s pool=%s" % (s["preferred_tag"], r.get("pool")))
+          EOF
+          echo "--- Clash selector ---"
+          docker exec rotate-trial python3 /tmp/diag.py selector
+          # The pin rewrites the config, so sing-box restarts: give the loopback
+          # Clash API a moment to come back before asking it anything.
+          for i in $(seq 1 20); do
+            if docker exec rotate-trial python3 /tmp/diag.py clash > /tmp/clash.json 2>/dev/null && [ -s /tmp/clash.json ]; then
+              break
+            fi
+            echo "clash API not ready yet ($i)"
+            sleep 3
+          done
+          head -c 400 /tmp/clash.json; echo
+          python3 - <<'EOF'
+          import json
+          s = json.load(open("/tmp/status.json"))
+          clash = json.load(open("/tmp/clash.json"))
+          now = clash.get("now")
+          print("clash now:", now, "pin:", s["preferred_tag"])
+          assert now == s["preferred_tag"], (now, s["preferred_tag"])
+          assert "auto" not in (clash.get("all") or []), clash
+          print("CLASH OK: the selector sits on the pinned node")
+          EOF
+          echo "--- exit IP through /ws-chain ---"
+          CHAIN=""
+          for i in $(seq 1 10); do
+            CHAIN=$(docker exec rotate-trial python3 /tmp/diag.py chain || true)
+            echo "attempt $i: $CHAIN"
+            case "$CHAIN" in ips=*) break;; esac
+            sleep 10
+          done
+          OWN=$(docker exec rotate-trial sh -c 'curl -s --max-time 15 https://api.ipify.org || true')
+          echo "container egress IP: $OWN"
+          echo "$CHAIN" > /tmp/chain_ip.txt
+          echo "$OWN" > /tmp/own_ip.txt
+          python3 - <<'EOF'
+          import pathlib
+          chain = pathlib.Path("/tmp/chain_ip.txt").read_text().strip()
+          own = pathlib.Path("/tmp/own_ip.txt").read_text().strip()
+          print("chain:", chain, "container egress:", own)
+          assert chain.startswith("ips="), chain
+          ips = [ip for ip in chain[len("ips="):].split(",") if ip]
+          assert ips, chain
+          for ip in ips:
+              assert ip.count(".") == 3, ip
+              assert ip != own, ("the chain leaked the container's own egress", ip, own)
+          print("EXIT IP OK: the chain exits through the VPNGate node")
+          EOF
+
+      - name: The cold start never dialed a serving node to choose the pin
+        run: |
+          echo "=== container log: any verify-by-dial? ==="
+          docker logs rotate-trial 2>&1 | grep -n "verify" || echo "(no 'verify' line in the container log)"
+          if docker logs rotate-trial 2>&1 | grep -q "verify failed for"; then
+            echo "FAIL: the cold start ran a verify-by-dial (measure_exit_ip) -"
+            echo "      that opens a second VPNGate session and kicks the serving one."
+            docker logs rotate-trial 2>&1 | grep -n "verify failed for" | head -n 20
+            exit 1
+          fi
+          echo "no 'verify failed for' line: no verify-by-dial ran"
+          docker exec rotate-trial cat /tmp/dial_events.jsonl > /tmp/dial_events.jsonl || true
+          docker exec rotate-trial cat /tmp/watch_markers.json > /tmp/watch_markers.json || true
+          wc -l /tmp/dial_events.jsonl
+          python3 - <<'EOF'
+          import json, pathlib
+          raw = pathlib.Path("/tmp/dial_events.jsonl").read_text().splitlines()
+          events = [json.loads(line) for line in raw if line.strip()]
+          markers = json.loads(pathlib.Path("/tmp/watch_markers.json").read_text())
+          print("markers:", markers)
+          print("throwaway sing-box clients that dialed a VPNGate node:", len(events))
+          for e in events:
+              print("  t=%.1f pid=%s target=%s serving_tag=%s" % (
+                  e["t"], e["pid"], e.get("target"), e.get("serving_tag")))
+          assert events, "the watcher saw no throwaway client at all: no evidence"
+          pin_t = markers.get("pin")
+          assert pin_t, markers
+          done_t = markers.get("dialing_done")
+          if done_t is None:
+              start = pin_t - 15.0
+          else:
+              start = done_t - 10.0
+          end = pin_t + 30.0
+          inside = [e for e in events if start <= e["t"] <= end]
+          print("pin decision window: %.1f .. %.1f" % (start, end))
+          print("throwaway VPNGate dials inside the pin window: %d" % len(inside))
+          for e in inside:
+              print("  VIOLATION t=%.1f target=%s serving_tag=%s" % (
+                  e["t"], e.get("target"), e.get("serving_tag")))
+          assert not inside, ("a throwaway client dialed a VPNGate node while the pin was decided", inside)
+          print("NO DIAL-TO-PIN OK: the cold start pinned without a verify-by-dial")
+          EOF
+
+      - name: Let the pin and sing-box settle before the kill
+        run: |
+          prev=""
+          for i in $(seq 1 60); do
+            pid=$(docker exec rotate-trial sh -c 'for p in /proc/[0-9]*/cmdline; do c=$(tr "\0" " " < "$p" 2>/dev/null); case "$c" in *sing-box*run*/app/singbox-railway.json*) echo "$p" | cut -d/ -f3; break;; esac; done')
+            md5=$(docker exec rotate-trial sh -c 'md5sum /app/singbox-railway.json | cut -d" " -f1')
+            recent=$(docker logs --since 60s rotate-trial 2>&1 | grep -c "config rewritten" || true)
+            cur="$pid/$md5"
+            echo "settle $i: pid=$pid md5=$md5 rewrites_in_last_60s=$recent"
+            if [ "$cur" = "$prev" ] && [ "$recent" = "0" ]; then
+              echo "SETTLED: pin and sing-box are quiet"
+              break
+            fi
+            prev="$cur"
+            sleep 10
+          done
+          [ "$recent" = "0" ] || { echo "config never settled"; exit 1; }
+
+      - name: Kill the pin twice (the chain must hot-switch and heal)
+        run: |
+          AUTH="Authorization: Bearer $ADMIN_TOKEN"
+          docker exec -u 0 rotate-trial sh -c "apt-get update -qq && apt-get install -y -qq --no-install-recommends iptables" >/tmp/apt.log 2>&1 || {
+            tail -n 30 /tmp/apt.log; exit 1; }
+          sb_pid() {
+            docker exec rotate-trial sh -c 'for p in /proc/[0-9]*/cmdline; do
+              c=$(tr "\0" " " < "$p" 2>/dev/null)
+              case "$c" in *sing-box*run*/app/singbox-railway.json*) echo "$p" | cut -d/ -f3; break;; esac
+            done'
+          }
+          cfg_md5() { docker exec rotate-trial sh -c 'md5sum /app/singbox-railway.json | cut -d" " -f1'; }
+          for round in 1 2; do
+            curl -m 10 -s -H "$AUTH" http://127.0.0.1:3000/api/status -o /tmp/pre.json
+            PIN=$(python3 -c "import json;print(json.load(open('/tmp/pre.json'))['preferred_tag'])")
+            SW0=$(python3 -c "import json;print(json.load(open('/tmp/pre.json'))['chain_switch']['switches'])")
+            docker exec rotate-trial cat /app/singbox-railway.json > /tmp/cfg.json
+            python3 - "$PIN" "$round" <<'EOF'
+          import json, socket, sys
+          pin, rnd = sys.argv[1], sys.argv[2]
+          cfg = json.load(open("/tmp/cfg.json"))
+          ep = next(e for e in cfg["endpoints"] if e["tag"] == pin)
+          addrs = [ep["server"]] if ep.get("server") else []
+          addrs += [x["server"] for x in (ep.get("servers") or []) if x.get("server")]
+          ips = sorted({i[4][0] for a in addrs for i in socket.getaddrinfo(a, None)})
+          open(f"/tmp/pin_ips_{rnd}.txt", "w").write("\n".join(ips) + "\n")
+          print(f"round {rnd}: pin {pin}: {ips}")
+          EOF
+            while read -r ip; do
+              [ -n "$ip" ] || continue
+              docker exec -u 0 rotate-trial sh -c "iptables -A OUTPUT -p tcp -d $ip -j REJECT --reject-with tcp-reset; iptables -A OUTPUT -p udp -d $ip -j REJECT" || true
+            done < /tmp/pin_ips_$round.txt
+            PID0=$(sb_pid); MD50=$(cfg_md5)
+            echo "round $round before: pin=$PIN switches=$SW0 pid=$PID0 md5=$MD50"
+            DEADLINE=$((SECONDS + 360))
+            T0=$SECONDS
+            chain=""
+            sel=""
+            now=""
+            while [ $SECONDS -lt $DEADLINE ]; do
+              sel=$(docker exec rotate-trial python3 /tmp/diag.py selector || true)
+              chain=$(docker exec rotate-trial python3 /tmp/diag.py chain || true)
+              now=$(echo "$sel" | sed 's/now=\([^ ]*\).*/\1/')
+              echo "round $round t=$((SECONDS - T0))s $sel chain=$chain"
+              # The chain is only "healed" when it carries traffic again AND the
+              # selector really moved off the killed pin.
+              case "$chain" in
+                ips=*) if [ -n "$now" ] && [ "$now" != "$PIN" ]; then break; fi;;
+              esac
+              sleep 5
+            done
+            PID1=$(sb_pid); MD51=$(cfg_md5)
+            HEAL=$((SECONDS - T0))
+            echo "round $round heal_time=${HEAL}s" | tee -a /tmp/heal_times.txt
+            curl -m 10 -s -H "$AUTH" http://127.0.0.1:3000/api/status -o /tmp/post.json
+            python3 - "$PIN" "$SW0" "$PID0" "$PID1" "$MD50" "$MD51" "$round" "$chain" "$sel" "$HEAL" <<'EOF'
+          import json, sys
+          pin0, sw0, pid0, pid1, md50, md51, rnd, chain, sel, heal = sys.argv[1:11]
+          s = json.load(open("/tmp/post.json"))
+          print(f"round {rnd} after: pin={s['preferred_tag']} switches={s['chain_switch']['switches']} "
+                f"pid={pid1} md5={md51} pool={s['resi']['pool']} selector={sel} heal={heal}s")
+          print(f"round {rnd} events:", [(h["event"], h.get("detail")) for h in s.get("refresh_history", [])][-12:])
+          print(f"round {rnd} md5_changed={md51 != md50} pid_changed={pid1 != pid0} "
+                f"switches_delta={int(s['chain_switch']['switches']) - int(sw0)}")
+          if not chain.startswith("ips="):
+              print("ROUND FAILED: the chain never carried traffic again"); raise SystemExit(3)
+          if int(heal) > 120:
+              print(f"ROUND FAILED: the chain healed only after {heal}s (limit 120s)"); raise SystemExit(8)
+          if md51 != md50:
+              print("ROUND FAILED: the repin rewrote the config"); raise SystemExit(4)
+          if pid1 != pid0:
+              print("ROUND FAILED: the repin restarted sing-box"); raise SystemExit(6)
+          if int(s["chain_switch"]["switches"]) <= int(sw0):
+              print("ROUND FAILED: no hot switch was recorded"); raise SystemExit(5)
+          if s["preferred_tag"] == pin0:
+              print("ROUND FAILED: the pin did not move"); raise SystemExit(7)
+          print(f"ROUND {rnd} OK: the chain came back through a hot switch in {heal}s")
+          EOF
+            sleep 10
+          done
+
+      - name: Dump the evidence
+        if: always()
+        run: |
+          echo "=== cold start timeline ==="; cat /tmp/timeline.txt 2>/dev/null || echo "(none)"
+          echo "=== heal times ==="; cat /tmp/heal_times.txt 2>/dev/null || echo "(none)"
+          echo "=== chain exit IP vs container egress ==="
+          cat /tmp/chain_ip.txt 2>/dev/null || true; cat /tmp/own_ip.txt 2>/dev/null || true
+          echo "=== final status ==="
+          curl -m 10 -s -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:3000/api/status > /tmp/final.json || true
+          python3 - <<'EOF'
+          import json, pathlib
+          try:
+              s = json.load(open("/tmp/final.json"))
+          except Exception as exc:
+              print("no status:", exc)
+          else:
+              print("preferred_tag:", s.get("preferred_tag"), "backup_tag:", s.get("backup_tag"))
+              print("chain_switch:", s.get("chain_switch"))
+              print("resi:", s.get("resi"))
+              print("full_probe:", s.get("full_probe"))
+              print("history:", [(h["event"], h.get("detail")) for h in s.get("refresh_history", [])][-20:])
+          EOF
+          echo "=== selector ==="; docker exec rotate-trial python3 /tmp/diag.py selector || true
+          echo "=== chosen tag log lines ==="
+          NOW=$(docker exec rotate-trial python3 /tmp/diag.py selector 2>/dev/null | sed 's/now=\([^ ]*\).*/\1/' || true)
+          docker exec rotate-trial sh -c "grep -a 'endpoint/openvpn-client\[$NOW\]' /app/singbox-railway.json.stderr.log | tail -n 25" || true
+          echo "=== not ready / terminated ==="
+          docker exec rotate-trial sh -c "grep -aE 'not ready yet|client terminated|client started' /app/singbox-railway.json.stderr.log | tail -n 25" || true
+          echo "=== config rewrites ==="
+          docker logs rotate-trial 2>&1 | grep -n "config rewritten" || echo "(no config rewrite)"
+          echo "=== chain rescues / pins ==="
+          docker logs rotate-trial 2>&1 | grep -aE "chain rescue|auto-pinned|refreshed|full probe done" | tail -n 30 || true
+          echo "=== verify-by-dial lines ==="
+          docker logs rotate-trial 2>&1 | grep -n "verify" || echo "(no verify line)"
+          echo "=== throwaway VPNGate dials ==="
+          docker exec rotate-trial cat /tmp/dial_events.jsonl 2>/dev/null | tail -n 40 || true
+          echo "=== route rules ==="
+          docker exec rotate-trial python3 -c "import json;c=json.load(open('/app/singbox-railway.json'));print(json.dumps(c['route'],indent=1)[:1200])"
+          echo "=== restart / rewrite causes ==="
+          docker logs --since 30m rotate-trial 2>&1 | grep -aE "restart|exited|supervis|config rewritten|rescue" | tail -n 25 || true
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f rotate-trial || true
