@@ -584,9 +584,16 @@ def _dial_probe_config(endpoint: dict, port: int) -> dict:
     (VPN-only) -- right for serving, wrong for measuring: urltest would route
     around the endpoint under test. Probing must exit only
     through the endpoint, like the proven manual dial path.
+
+    The probe keeps `auth_retry: none` even though the serving endpoints use
+    "nointeract": a probe that cannot get the node's single VPNGate session
+    (the serving endpoint holds it) must fail fast, so the caller can skip
+    that node. With "nointeract" the probe would retry the login until its
+    own timeout, which is both slower and exactly backwards.
     """
     probe_endpoint = dict(endpoint)
     probe_endpoint["tag"] = "dial-probe"
+    probe_endpoint["auth_retry"] = "none"
     config = build_singbox_config([probe_endpoint], mixed_listen="127.0.0.1",
                                   mixed_port=port)
     config["route"]["final"] = "dial-probe"

@@ -88,6 +88,24 @@ class ConvertTcpTests(unittest.TestCase):
         # authentication instead.
         self.assertEqual("nointeract", ep["auth_retry"])
 
+    def test_the_probe_does_not_retry_a_rejected_login(self) -> None:
+        """The serving endpoint retries a rejected login; the throwaway probe
+        must not.
+
+        A probe that cannot get the node's single VPNGate session (the
+        serving endpoint holds it) has to fail fast, so the caller can skip
+        that node. With the retry the probe would sit in the login until its
+        own timeout - slower, and exactly backwards.
+        """
+        from vpngate_to_singbox import _dial_probe_config
+        ep = ovpn_to_endpoint(TCP_OVPN, tag="vpngate-0")
+        config = _dial_probe_config(ep, 40000)
+
+        probe = next(e for e in config["endpoints"] if e["tag"] == "dial-probe")
+        self.assertEqual("none", probe["auth_retry"])
+        # the serving endpoint keeps the retry
+        self.assertEqual("nointeract", ep["auth_retry"])
+
     def test_udp_only_config_raises(self) -> None:
         with self.assertRaises(ValueError):
             ovpn_to_endpoint(UDP_ONLY_OVPN, tag="vpngate-x")
