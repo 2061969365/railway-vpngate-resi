@@ -550,6 +550,52 @@ D12 留下的疑点（"第三路相关动作改写了配置"）在这一轮被�
 `test_dead_first_remote_keeps_the_pin`、`test_all_remote_candidates_are_tried_before_a_rescue`、
 `MultiRemoteProbeTests`（转换层 4 项）。
 
+### 12.9f D14：chain 自己的节点死了也不会换到活节点（"resi 可用、chain 挂了"）
+
+现象（用户实测）：长时间运行后 `/ws-resi` 可用，`/ws-chain` 完全不通；**手动切一个
+节点立刻恢复**。三个原因叠加：
+
+1. **`chain` 组是 selector，而 selector 不会自动故障转移**。rotate 模式下
+   `chain = selector[pin, backup, auto]`；pin 的 OpenVPN 会话死了以后 selector 仍然
+   只用第一个 outbound，`backup`/`auto` 只是摆设。所以"节点死了 chain 还不会切"——
+   除非 manager 主动重 pin（写配置 + 重启 sing-box）。
+2. **重 pin 的候选按陈旧的 `real_latency_ms` 排序**。D13 之后 serving 节点的
+   `real_latency_ms` 故意不再刷新（重拨会抢会话），跑几个小时后全表都是旧数字；
+   `_rescue_chain` 按这些数字挑"最优"节点，挑中的往往早就死了。而且失败节点没有任何
+   记忆，`A→B→A` 在两个死节点之间来回跳、冷却时间还翻倍到 5 分钟 ⇒ 表现出来就是
+   "永远不换到活节点"。
+3. **pin 从快照里消失时直接放弃**。`check_pinned_health` 找不到 `preferred_tag`
+   对应的节点就 `return "no-preferred"`，`build_singbox_config` 丢掉未知 pin、把 chain
+   退回 `auto`（全体节点的 urltest）——正好又是和轮换抢同一会话的形态。
+
+修法：
+
+- rotate 模式下 `chain` 改成 **`urltest[pin, backup]`**：两个都是预留节点（轮换永远
+  不拨），pin 死掉由 urltest 在一个探测周期内切到 backup，**不写配置、不重启**；只有
+  两个都死才需要 manager 介入。`_rescue_chain` 现在总是补一个 backup，保证这个
+  "双节点对"永远存在；`_auto_pin_best` 在 rotate 模式下也用 dial-verified 的次优节点
+  当 standby（不再因为出口 IP 没验过就留空）。
+- `_chain_candidates_locked()`：按**活证据**排序——① 最近 15 分钟真的从它传过 payload
+  的节点（`_resi_payload_at`：轮换侧的成功流量就是最新鲜的"活着"证明）② 未被 park 的
+  已验证节点（按 `real_latency_ms`）③ 被 park 的节点（按 `down_until`，和轮换自己的
+  兜底顺序一致）。pin/backup 和 `_chain_dead_until` 里的节点一律排除。
+- `_chain_dead_until` 失败记忆（15 分钟）：刚被判死的 pin 不会被下一次 rescue 再选中，
+  连续 rescue 会**逐个走完池子**而不是原地打转；某节点重新真的传过 payload
+  （`_resi_proven`）或 chain 探针成功时立刻清掉记忆。
+- pin 从快照消失 ⇒ 直接重 pin，不再留在 `auto` urltest 上。
+- 冷却 30s 起、上限 120s（原来 45s→300s），配合失败记忆，恢复时间是"一个健康节点被
+  找到为止"，最坏情况随池子大小线性增长而不是无限。
+- TCP 握手就死的那条分支同样改用证据排序，并且优先把预留 standby 提为 pin。
+
+证据：`test_chain_group_fails_over_between_the_two_reserved_nodes`、
+`test_rotate_without_a_backup_keeps_the_selector`、
+`test_chain_rescue_prefers_the_node_that_carries_rotation_traffic`、
+`test_chain_rescue_walks_the_pool_instead_of_bouncing`、
+`test_chain_rescue_skips_a_node_the_rotation_parked`、
+`test_a_pin_that_left_the_snapshot_gets_repinned`；`sing-box check` 对两种形态
+（urltest 双节点对 / 单 pin selector 兜底）都通过；本地复现脚本（陈旧延迟 + pin 隧道死）
+在修复前 `A→B→A` 永不恢复，修复后第 2 个健康周期就切到轮换证明活着的节点。
+
 ### 12.10 不变量（后续改动必须守住）
 
 1. **健康/池子决策不得写配置文件、不得重启 sing-box**（`/ws-resi` 的抖动不能影响
@@ -571,7 +617,7 @@ D12 留下的疑点（"第三路相关动作改写了配置"）在这一轮被�
 10. **轮换的连接预算不得吃满 mux 槽位**：前两路必须保留独立额度，否则第三路的风暴
     会以"新连接被丢弃"的形式掐死另外两路（D12）。
 
-### 12.11 测试矩阵（`tests/test_resi.py`，90 项全绿）
+### 12.11 测试矩阵（`tests/test_resi.py`，96 项全绿）
 
 | 场景 | 测试 |
 |---|---|
@@ -609,6 +655,11 @@ D12 留下的疑点（"第三路相关动作改写了配置"）在这一轮被�
 | parked 节点可以被真拨救活 | `test_full_probe_may_dial_a_parked_node` |
 | 多远端节点：一个地址死、另一个活 ⇒ 仍然算活（pin 不换） | `test_dead_first_remote_keeps_the_pin`、`test_all_remote_candidates_are_tried_before_a_rescue` |
 | 多远端节点：全部 remote 都试过才判死 | `MultiRemoteProbeTests`（`tests/test_vpngate_to_singbox.py`，4 项） |
+| rotate 的 chain 是 urltest 双节点对（pin 死自动切 backup） | `test_chain_group_fails_over_between_the_two_reserved_nodes`、`test_rotate_without_a_backup_keeps_the_selector` |
+| 重 pin 优先选"刚传过 payload"的节点，而不是陈旧延迟最优的 | `test_chain_rescue_prefers_the_node_that_carries_rotation_traffic` |
+| 连续 rescue 逐个走池子、绝不在两个死节点间来回跳 | `test_chain_rescue_walks_the_pool_instead_of_bouncing` |
+| rescue 跳过轮换已经 park 的节点 | `test_chain_rescue_skips_a_node_the_rotation_parked` |
+| pin 从快照消失 → 直接重 pin，不退回全体 urltest | `test_a_pin_that_left_the_snapshot_gets_repinned` |
 
 另外用真 sing-box 1.14.0 校验了 100 节点静态入站的配置（不是 mock）：
 
@@ -651,3 +702,10 @@ route rules: 100 {'inbound': 'resi-rot-0', 'outbound': 'vpngate-0'} ... 'resi-ro
 7. **chain 不许被轮换拖死**：`/ws-resi` 在换节点时，`/ws-chain` 仍要能出出口 IP；
    同一时刻容器日志里不应出现针对 chain 那个节点的
    `authentication failed: terminal`（说明轮换又在抢它的唯一会话）。
+8. **chain 自己的节点死了要能自己换**（§12.9f D14）：`GET /api/status` 里 `resi.mode ==
+   rotate` 时，配置里 `chain` 应是 `urltest`（`outbounds` = `[pin, backup]`）。pin 的
+   会话死掉后 `/ws-chain` 应在 ≤30 秒内自己恢复（切到 backup，**没有** `config rewritten`
+   行）；两个预留节点都死时，日志应出现 `chain rescue: … -> … backup=…`，且新 pin 是
+   最近真的传过 payload 的节点，而不是延迟数字最小的那个。历史里若出现连续的
+   `chain-rescue` 且 pin 反复回到同一个 tag，说明失败记忆失效（回归）。
+

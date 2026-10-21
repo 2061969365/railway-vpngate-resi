@@ -253,6 +253,26 @@ class RotateConfigTests(unittest.TestCase):
 
         self.assertEqual("/ws-home", inbound["transport"]["path"])
 
+    def test_chain_group_fails_over_between_the_two_reserved_nodes(self) -> None:
+        # A selector never fails over by itself: a dead pin left the chain dead
+        # until the manager repinned it, while /ws-resi (which skips parked
+        # nodes) kept working. The rotate chain is an urltest over the two
+        # reserved nodes, so a pin death is absorbed within one probe cycle
+        # without a config rewrite - and neither node is dialed by the rotation.
+        chain = next(o for o in self._cfg(3, preferred="vpngate-0",
+                                          backup="vpngate-1")["outbounds"]
+                     if o["tag"] == "chain")
+
+        self.assertEqual("urltest", chain["type"])
+        self.assertEqual(["vpngate-0", "vpngate-1"], chain["outbounds"])
+
+    def test_rotate_without_a_backup_keeps_the_selector(self) -> None:
+        chain = next(o for o in self._cfg(2, preferred="vpngate-0")["outbounds"]
+                     if o["tag"] == "chain")
+
+        self.assertEqual("selector", chain["type"])
+        self.assertEqual(["vpngate-0", "auto"], chain["outbounds"])
+
     def test_rotate_without_vless_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
             build_singbox_config([_endpoint()], vless_uuid=None, resi_rotate=True)
@@ -730,8 +750,10 @@ class RotateManagerTests(unittest.TestCase):
             self._cleanup(manager)
 
         self.assertEqual("vpngate-a", pinned)
-        self.assertIsNone(backup)   # an unverified node never becomes standby
-        self.assertEqual(["vpngate-b", "vpngate-c"], pool)
+        # A dial-verified node is a legitimate standby: the chain urltest pair
+        # needs two reserved nodes so a dead pin fails over without a restart.
+        self.assertEqual("vpngate-b", backup)
+        self.assertEqual(["vpngate-c"], pool)
 
     def test_rotate_mode_never_unpins_a_dead_chain_node(self) -> None:
         # Dropping the pin would hand the chain to urltest, which is exactly the
@@ -786,8 +808,135 @@ class RotateManagerTests(unittest.TestCase):
 
         self.assertEqual(["pinned", "rescued"], states)
         self.assertEqual("vpngate-b", pinned)
-        self.assertIsNone(backup)
+        # The rescue always reserves a standby too, otherwise the chain urltest
+        # group would be back to a single node and the next pin death is a
+        # multi-minute outage again.
+        self.assertEqual("vpngate-c", backup)
         self.assertIn("chain-rescue", events)
+
+    def test_chain_rescue_prefers_the_node_that_carries_rotation_traffic(self) -> None:
+        # real_latency_ms is written once when a node is dialed and, in rotate
+        # mode, never refreshed for serving nodes (re-dialing them steals their
+        # VPNGate session). After hours every number is stale, so ranking by it
+        # kept pinning long-dead nodes: /ws-resi worked, /ws-chain stayed dead,
+        # and only a manual switch fixed it. Fresh payload proof wins instead.
+        manager = self._manager()
+        try:
+            manager._nodes = [
+                {"real_latency_ms": 10, "endpoint": _endpoint("vpngate-a")},
+                {"real_latency_ms": 5, "endpoint": _endpoint("vpngate-b")},
+                {"real_latency_ms": 8, "endpoint": _endpoint("vpngate-c")},
+                {"real_latency_ms": 900, "endpoint": _endpoint("vpngate-d")},
+            ]
+            with manager._lock:
+                manager.preferred_tag = "vpngate-a"
+                manager.status["preferred_tag"] = "vpngate-a"
+                manager._resi_payload_at["vpngate-d"] = time.monotonic()
+            with mock.patch("railway_manager.probe_tcp_latency", return_value=25), \
+                    mock.patch.object(RailwayManager, "_chain_probe_ok", return_value=False), \
+                    mock.patch.object(RailwayManager, "_apply_config", return_value=True), \
+                    mock.patch.object(RailwayManager, "_invalidate_verify"):
+                manager.check_pinned_health()
+                state = manager.check_pinned_health()
+            pinned = manager.preferred_tag
+            backup = manager.backup_tag
+        finally:
+            manager.stop()
+            self._cleanup(manager)
+
+        self.assertEqual("rescued", state)
+        self.assertEqual("vpngate-d", pinned)
+        self.assertEqual("vpngate-b", backup)
+
+    def test_chain_rescue_walks_the_pool_instead_of_bouncing(self) -> None:
+        # Two dead nodes on top of the stale ranking made the rescue bounce
+        # A -> B -> A while the cooldown doubled to five minutes: the chain
+        # never came back even though live nodes existed further down.
+        manager = self._manager()
+        pins = []
+        try:
+            manager._nodes = [
+                {"real_latency_ms": 10, "endpoint": _endpoint("vpngate-a")},
+                {"real_latency_ms": 5, "endpoint": _endpoint("vpngate-b")},
+                {"real_latency_ms": 8, "endpoint": _endpoint("vpngate-c")},
+                {"real_latency_ms": 9, "endpoint": _endpoint("vpngate-d")},
+            ]
+            with manager._lock:
+                manager.preferred_tag = "vpngate-a"
+                manager.status["preferred_tag"] = "vpngate-a"
+            with mock.patch("railway_manager.probe_tcp_latency", return_value=25), \
+                    mock.patch.object(RailwayManager, "_chain_probe_ok", return_value=False), \
+                    mock.patch.object(RailwayManager, "_apply_config", return_value=True), \
+                    mock.patch.object(RailwayManager, "_invalidate_verify"):
+                for _ in range(3):
+                    manager._chain_rescue_at -= 10 ** 6   # let the cooldown expire
+                    manager.check_pinned_health()
+                    manager.check_pinned_health()
+                    pins.append(manager.preferred_tag)
+            dead = dict(manager._chain_dead_until)
+        finally:
+            manager.stop()
+            self._cleanup(manager)
+
+        self.assertEqual("vpngate-b", pins[0])
+        self.assertNotIn("vpngate-a", pins)          # never back to the dead pin
+        self.assertEqual(3, len(set(pins)))          # every rescue is a new node
+        self.assertIn("vpngate-a", dead)
+        self.assertIn("vpngate-b", dead)
+
+    def test_chain_rescue_skips_a_node_the_rotation_parked(self) -> None:
+        # The rotation already has passive proof that b is dead; the chain must
+        # not waste a restart pinning it just because its old latency is best.
+        manager = self._manager()
+        try:
+            manager._nodes = [
+                {"real_latency_ms": 10, "endpoint": _endpoint("vpngate-a")},
+                {"real_latency_ms": 5, "endpoint": _endpoint("vpngate-b")},
+                {"real_latency_ms": 8, "endpoint": _endpoint("vpngate-c")},
+            ]
+            with manager._lock:
+                manager.preferred_tag = "vpngate-a"
+                manager.status["preferred_tag"] = "vpngate-a"
+                manager._resi_health["vpngate-b"] = {
+                    "strikes": 0, "downs": 1, "down_until": time.monotonic() + 600}
+            with mock.patch("railway_manager.probe_tcp_latency", return_value=25), \
+                    mock.patch.object(RailwayManager, "_chain_probe_ok", return_value=False), \
+                    mock.patch.object(RailwayManager, "_apply_config", return_value=True), \
+                    mock.patch.object(RailwayManager, "_invalidate_verify"):
+                manager.check_pinned_health()
+                manager.check_pinned_health()
+            pinned = manager.preferred_tag
+        finally:
+            manager.stop()
+            self._cleanup(manager)
+
+        self.assertEqual("vpngate-c", pinned)
+
+    def test_a_pin_that_left_the_snapshot_gets_repinned(self) -> None:
+        # build_singbox_config silently drops an unknown pin and routes the
+        # chain through the all-nodes urltest group, which competes with the
+        # rotation for VPNGate's single session per node.
+        manager = self._manager()
+        try:
+            manager._nodes = [
+                {"real_latency_ms": 10, "endpoint": _endpoint("vpngate-b")},
+                {"real_latency_ms": 20, "endpoint": _endpoint("vpngate-c")},
+            ]
+            with manager._lock:
+                manager.preferred_tag = "vpngate-gone"
+                manager.status["preferred_tag"] = "vpngate-gone"
+            with mock.patch.object(RailwayManager, "_apply_config", return_value=True), \
+                    mock.patch.object(RailwayManager, "_invalidate_verify"):
+                state = manager.check_pinned_health()
+            pinned = manager.preferred_tag
+            backup = manager.backup_tag
+        finally:
+            manager.stop()
+            self._cleanup(manager)
+
+        self.assertEqual("rescued", state)
+        self.assertEqual("vpngate-b", pinned)
+        self.assertEqual("vpngate-c", backup)
 
     def test_rotate_mode_keeps_the_pin_while_the_chain_carries_traffic(self) -> None:
         manager = self._manager()

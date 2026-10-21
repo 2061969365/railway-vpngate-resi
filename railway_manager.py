@@ -49,12 +49,20 @@ PINNED_FAIL_THRESHOLD = 3
 # drop the OpenVPN session, so a handshake-only health check stays green while
 # /ws-chain exits nowhere - and, because rotate mode never unpins, the chain sat
 # dead on that node forever. Two failed end-to-end probes in a row rescue the
-# pin to the next tunnel-verified node; the cooldown doubles up to the cap so a
+# pin to a node with *live evidence*; the cooldown doubles up to the cap so a
 # genuinely broken pool cannot turn into a config-restart storm.
 CHAIN_FAIL_THRESHOLD = 2
-CHAIN_RESCUE_COOLDOWN = 45.0
-CHAIN_RESCUE_COOLDOWN_MAX = 300.0
+CHAIN_RESCUE_COOLDOWN = 30.0
+CHAIN_RESCUE_COOLDOWN_MAX = 120.0
 CHAIN_PROBE_TIMEOUT = 8.0
+# A pin that just failed the end-to-end probe must not be picked again for a
+# while: with two dead nodes at the top of the ranking the rescue used to
+# bounce A -> B -> A forever while the cooldown grew to five minutes, i.e. the
+# chain never came back even though the pool still had live nodes.
+CHAIN_DEAD_MEMORY = 900.0
+# How long real payload through a rotation node counts as "this tunnel works
+# right now" evidence for the chain rescue.
+CHAIN_ALIVE_WINDOW = 900.0
 SUPERVISE_INTERVAL = 10
 EXIT_VERIFY_CAP = 3
 REFRESH_PROBE_GRACE = 30.0
@@ -1823,6 +1831,12 @@ class RailwayManager:
         self._cpu_model = _cpu_model(); self._cpu_cores = os.cpu_count(); self._cpu_last = None
         self._fail_streak = 0; self._pinned_fail_streak = 0; self._rescue_round = 0; self._crash_streak = 0; self._retry_after = 0.0; self._mixed_fail_streak = 0; self._mixed_retry_after = 0.0; self._health_mixed_streak = 0; self._refresh_generation = 0
         self._chain_fail_streak = 0; self._chain_rescue_at = 0.0; self._chain_rescue_attempts = 0
+        # Chain rescue evidence. `_resi_payload_at` = last time real payload
+        # came through a rotation node (proof its tunnel works right now);
+        # `_chain_dead_until` = nodes that just failed the chain probe and must
+        # not be re-pinned while the memory lasts (see _rescue_chain).
+        self._resi_payload_at: dict[str, float] = {}
+        self._chain_dead_until: dict[str, float] = {}
         self._lock = threading.RLock(); self._refresh_lock = threading.Lock(); self._config_lock = threading.Lock()
         if resi:
             resi_status = {"enabled": True, "mode": ("sticky" if self.resi_session_ttl > 0 else "rotation"),
@@ -2669,13 +2683,65 @@ class RailwayManager:
             result = None
         return bool(result and result.get("ips"))
 
+    def _chain_candidates_locked(self, now: float) -> list[dict]:
+        """Nodes the chain may be pinned to, best evidence first.
+
+        Ranking by `real_latency_ms` alone is a trap in rotate mode: the value
+        is written when a node was dialed and deliberately never refreshed for
+        serving nodes (re-dialing them would steal their only VPNGate session,
+        §12.9e D13). After hours the pool is full of stale numbers, so the
+        rescue kept pinning nodes that died long ago - the chain stayed dead
+        while /ws-resi (which skips parked nodes) kept working, and only a
+        manual switch fixed it. Evidence order:
+
+        1. nodes that just carried rotation payload: the tunnel demonstrably
+           works right now, whatever the old latency number says;
+        2. verified nodes the rotation has not parked, by real latency;
+        3. parked nodes, soonest to come back first (last resort, exactly how
+           the rotation itself falls back).
+
+        Nodes that already failed the chain probe are skipped while their
+        dead-memory lasts, so a rescue always moves to a *new* candidate.
+        """
+        reserved = {self.preferred_tag, self.backup_tag}
+        proven: list[dict] = []
+        fresh: list[dict] = []
+        parked: list[dict] = []
+        for node in self._nodes:
+            tag = (node.get("endpoint") or {}).get("tag")
+            if not tag or tag in reserved:
+                continue
+            if node.get("real_latency_ms") is None:
+                continue
+            if self._chain_dead_until.get(tag, 0.0) > now:
+                continue
+            entry = self._resi_health.get(tag) or {}
+            down_until = float(entry.get("down_until", 0.0))
+            proof = self._resi_payload_at.get(tag, 0.0)
+            if down_until > now:
+                parked.append(node)
+            elif proof and now - proof <= CHAIN_ALIVE_WINDOW:
+                proven.append(node)
+            else:
+                fresh.append(node)
+        proven.sort(key=lambda n: (-self._resi_payload_at.get(
+            (n.get("endpoint") or {}).get("tag") or "", 0.0), n["real_latency_ms"]))
+        fresh.sort(key=lambda n: (n["real_latency_ms"],
+                                  (n.get("endpoint") or {}).get("tag") or ""))
+        parked.sort(key=lambda n: (
+            float((self._resi_health.get((n.get("endpoint") or {}).get("tag") or "") or {})
+                  .get("down_until", 0.0)), n["real_latency_ms"]))
+        return proven + fresh + parked
+
     def _rescue_chain(self, reason: str, round_id: int) -> str:
         """Repin the chain when the tunnel behind a TCP-alive pin is dead.
 
         Rotate mode must not unpin (an unpinned chain turns the urltest group
         into a second client of the very nodes the rotation dials), so the only
-        safe move is another single pin. Candidate ranking is real_latency only:
-        those are the nodes that were tunnel-verified, not merely reachable.
+        safe move is another pin - but a pin that is *live now*, and with a
+        second reserved node so the chain keeps a hot standby. The failing pin
+        goes into the dead-memory so consecutive rescues walk through the pool
+        instead of bouncing between the same two corpses.
         """
         now = time.monotonic()
         with self._lock:
@@ -2684,30 +2750,36 @@ class RailwayManager:
                     CHAIN_RESCUE_COOLDOWN * (2 ** max(0, self._chain_rescue_attempts - 1))):
                 return "pinned"
             tag = self.preferred_tag
-            cands = [n for n in self._nodes
-                     if n.get("real_latency_ms") is not None
-                     and (n.get("endpoint") or {}).get("tag") not in (self.preferred_tag, self.backup_tag)]
-            cands.sort(key=lambda n: (n["real_latency_ms"], (n.get("endpoint") or {}).get("tag") or ""))
-            best = (cands[0].get("endpoint") or {}).get("tag") if cands else None
-        if best is None:
+            cands = self._chain_candidates_locked(now)
+            pair = [(n.get("endpoint") or {}).get("tag") for n in cands[:2]]
+        pair = [t for t in pair if t]
+        if not pair:
             with self._lock:
                 self._chain_rescue_attempts += 1
                 self._chain_rescue_at = now
             self._record_history("chain-rescue-skipped", f"{reason}: no tunnel-verified alternative")
             print(f"chain rescue skipped: {reason}: no tunnel-verified alternative", flush=True)
             return "pinned"
+        best = pair[0]
+        second = pair[1] if len(pair) > 1 else None
         with self._config_lock:
-            if not self._apply_config(final="auto", preferred=best, backup=None):
+            if not self._apply_config(final="auto", preferred=best, backup=second):
                 return "pinned"
-            if not self._commit_rescue(round_id, best, None):
+            if not self._commit_rescue(round_id, best, second):
                 return "pinned"
             with self._lock:
                 self._chain_rescue_attempts += 1
                 self._chain_rescue_at = now
                 self._chain_fail_streak = 0
+                if tag and tag != best:
+                    # It just failed an end-to-end probe: keep it out of the
+                    # next rescue's ranking (A->B->A loops never recover).
+                    self._chain_dead_until[tag] = now + CHAIN_DEAD_MEMORY
+                    self._resi_payload_at.pop(tag, None)
         self._invalidate_verify(f"chain rescue to {best}")
         self._record_history("chain-rescue", f"{reason}: {tag} -> {best}")
-        print(f"chain rescue: {reason}: {tag} -> {best}", flush=True)
+        print(f"chain rescue: {reason}: {tag} -> {best}"
+              + (f" backup={second}" if second else ""), flush=True)
         return "rescued"
 
     def check_pinned_health(self, probe_fn=None) -> str:
@@ -2724,8 +2796,15 @@ class RailwayManager:
             node = next((n for n in self._nodes if n.get("endpoint", {}).get("tag") == tag), None) if tag else None
             self._rescue_round += 1
             round_id = self._rescue_round
-        if tag is None or node is None:
+        if tag is None:
             return "no-preferred"
+        if node is None:
+            # The pinned node fell out of the snapshot. Leaving the pin dangling
+            # makes build_singbox_config drop it and route the chain through the
+            # all-nodes urltest group, which then competes with the rotation for
+            # VPNGate's single session per node ("one dead, two dead"). Repin to
+            # a live node instead of waiting for the next hourly repin.
+            return self._rescue_chain(f"pin {tag} left the snapshot", round_id)
         endpoint = node.get("endpoint") or node
         probe = probe_fn or (lambda host, port: probe_tcp_latency(host, port, 5))
         hand = 0
@@ -2758,6 +2837,8 @@ class RailwayManager:
                     recovered = self._chain_fail_streak > 0
                     self._chain_fail_streak = 0
                     self._chain_rescue_attempts = 0
+                    # This node carries the chain again: it is not dead.
+                    self._chain_dead_until.pop(tag, None)
                 else:
                     self._chain_fail_streak += 1
                     chain_streak = self._chain_fail_streak
@@ -2776,10 +2857,28 @@ class RailwayManager:
             if not self.auto_rescue:
                 cands = []
             else:
-                cands = sorted((n for n in self._nodes if (n.get("endpoint") or {}).get("tag") != tag and n.get("real_latency_ms") is not None),
-                    key=lambda n: (n["real_latency_ms"], (n.get("endpoint") or {}).get("tag") or ""))
-                if not cands and self._nodes:
-                    cands = sorted((n for n in self._nodes if (n.get("endpoint") or {}).get("tag") != tag and n.get("latency_ms") is not None),
+                # Evidence-first ranking, exactly like the chain rescue: live
+                # payload proof, then unparked verified nodes, then parked ones.
+                now = time.monotonic()
+                cands = self._chain_candidates_locked(now)
+                # The reserved standby is a free promotion when the pin's
+                # handshake is dead (it is already in the config and, being
+                # reserved, never competes with the rotation).
+                if self.backup_tag and self.backup_tag != tag:
+                    standby = next((n for n in self._nodes
+                                    if (n.get("endpoint") or {}).get("tag") == self.backup_tag), None)
+                    if (standby is not None
+                            and self._chain_dead_until.get(self.backup_tag, 0.0) <= now):
+                        cands.insert(0, standby)
+                if not cands:
+                    # Nothing is tunnel-verified yet (cold start): handshake
+                    # verification is enough to move the pin off a dead node.
+                    cands = sorted(
+                        (n for n in self._nodes
+                         if (n.get("endpoint") or {}).get("tag") not in (tag, self.backup_tag)
+                         and n.get("latency_ms") is not None
+                         and self._chain_dead_until.get(
+                             (n.get("endpoint") or {}).get("tag") or "", 0.0) <= now),
                         key=lambda n: (n.get("latency_ms") or 10**9,))
         if not cands:
             if streak < PINNED_FAIL_THRESHOLD:
@@ -3283,7 +3382,10 @@ class RailwayManager:
                 # per node. Pin the best *dial-verified* node even without an
                 # exit probe; the pin is what lets the rotation exclude it.
                 pinned = best
-                pinned_second = None    # never invent an unverified standby
+                # Rotate mode wants a reserved standby so the chain urltest
+                # pair exists even without exit-IP verification (a dial-verified
+                # node already carries a tunnel; urltest probes it anyway).
+                pinned_second = second if (self.resi_rotate and second != pinned) else None
                 with self._config_lock:
                     if not self._apply_config(final="auto", preferred=pinned, backup=pinned_second):
                         self._record_history("auto-pin-failed", pinned)
@@ -3460,6 +3562,10 @@ class RailwayManager:
             live = {tag for tag, _ in routes}
             for tag in [t for t in self._resi_health if t not in live]:
                 del self._resi_health[tag]
+            for tag in [t for t in self._resi_payload_at if t not in live]:
+                del self._resi_payload_at[tag]
+            for tag in [t for t in self._chain_dead_until if t not in live]:
+                del self._chain_dead_until[tag]
             if changed:
                 self._resi_cursor = 0
             resi_status = self.status.get("resi")
@@ -3560,6 +3666,20 @@ class RailwayManager:
             if entry:
                 self._resi_health.pop(tag, None)
 
+    def _resi_proven(self, tag: str) -> None:
+        """Real payload came through: this node's tunnel works right now.
+
+        Recorded as evidence for the chain rescue: after hours in the pool the
+        `real_latency_ms` of every serving node is stale, so "the rotation is
+        carrying traffic through this node" is the only fresh proof that a pin
+        candidate is alive.
+        """
+        with self._lock:
+            now = time.monotonic()
+            self._resi_payload_at[tag] = now
+            self._resi_health.pop(tag, None)
+            self._chain_dead_until.pop(tag, None)
+
     def _resi_mark_fail(self, tag: str) -> None:
         """One failure: park the node once the strike limit is reached."""
         with self._lock:
@@ -3599,7 +3719,7 @@ class RailwayManager:
         """
         payload = down_bytes >= RESI_PAYLOAD_BYTES
         if payload:
-            self._resi_mark_ok(tag)
+            self._resi_proven(tag)
             self._set_resi(state="up", error=None)
             return
         if up_bytes <= 0:

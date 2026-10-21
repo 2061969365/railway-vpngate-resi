@@ -126,6 +126,11 @@ vless://<UUID>@node.example.com:443?security=tls&sni=node.example.com&type=ws&pa
   静默失效，正是「一个死两个一起死」。
   这些健康决策只影响 mux 把连接拨到哪条 loopback 入站，**不会重写配置、不会重启 sing-box**，
   所以第三路节点抖动不会波及 `/ws-node`、`/ws-chain` 的现有连接。
+  **chain 自己有主备两个预留节点**：rotate 模式下 `chain` 是一个 `urltest[主, 备]` 组，
+  主节点的会话死掉后会在一个探测周期内自动切到备节点——不写配置、不重启；只有两个都死
+  才由健康检查重 pin（日志 `chain rescue: … -> …`），而且重 pin 优先选"最近真的从它传过
+  payload"的节点，而不是延迟数字最小但可能早已死掉的那个。所以不会再出现「`/ws-resi`
+  可用、`/ws-chain` 挂了、只能手动切节点」的情况（见 `docs/rotate-design.md` §12.9f D14）。
 - **住宅模式**：填了 `RESI_GATEWAY` + 账号密码时，改为连固定的 backconnect 网关，
   真实家宽 IP 由网关按连接分配，本服务永远不知道也不需要知道它。
 

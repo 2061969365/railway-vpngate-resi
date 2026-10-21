@@ -1257,13 +1257,17 @@ def build_singbox_config(
     when preferred). Route rules split by inbound tag, so the
     two paths never mix. Requires the mixed inbound (the $PORT mux target).
 
-    When preferred names one of the endpoint tags, a "chain" selector
-    ([preferred, "auto"]) becomes route.final instead of the bare tag, so a
-    pinned node keeps hot-standby failover: preferred first, urltest group
-    the instant it goes unhealthy. No serving config ever pins route.final
-    to a single endpoint. Pass backup (a second endpoint tag, distinct from
-    preferred) to insert it between preferred and "auto": the chain then
-    serves best first, second as the guaranteed backup, urltest last.
+    When preferred names one of the endpoint tags, a "chain" group becomes
+    route.final instead of the bare tag. In rotate mode (resi_rotate) the group
+    is a *urltest* over [preferred, backup]: a selector never fails over by
+    itself, so a dead pinned node used to leave the chain dead until the
+    manager repinned it - minutes of downtime, and only if the rescue happened
+    to pick a live node. urltest keeps the two reserved nodes as a hot standby
+    pair (both are excluded from the rotation, so failing over cannot create
+    the duplicate-VPNGate-session collision that killed the chain before).
+    In every other mode the group stays a selector ([preferred, backup?,
+    "auto"]), where the all-nodes urltest can be the last resort without
+    competing with a rotation.
 
     When resi ({"server","server_port","username","password"}) is given, a
     third path is added: a "resi" socks outbound plus a "vless-resi" WS
@@ -1301,10 +1305,18 @@ def build_singbox_config(
         "route": {"final": route_final, "auto_detect_interface": True},
     }
     if preferred:
-        config["outbounds"].append(
-            {"type": "selector", "tag": "chain",
-             "outbounds": ([preferred] + ([backup] if backup else [])
-                           + ["auto"])})
+        failover = [preferred] + ([backup] if backup else [])
+        if resi_rotate and backup:
+            # Two reserved nodes and a real health-based switch: the chain
+            # survives its pin dying without a config rewrite, and the rotation
+            # never dials either of them (see the docstring above).
+            config["outbounds"].append(
+                {"type": "urltest", "tag": "chain", "outbounds": failover,
+                 "interval": "15s", "tolerance": 50})
+        else:
+            config["outbounds"].append(
+                {"type": "selector", "tag": "chain",
+                 "outbounds": failover + ["auto"]})
     if mixed_listen is not None and mixed_port is not None:
         inbound: dict = {"type": "mixed", "tag": "mixed-in",
                          "listen": mixed_listen, "listen_port": mixed_port}
