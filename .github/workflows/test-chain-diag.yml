@@ -21,8 +21,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
-      LIMIT: 8
-      REAL_TOPK: 0
+      LIMIT: 16
+      REAL_TOPK: 10
       ADMIN_TOKEN: rotate-admin-token-0123456789
       TEST_UUID: a29738e5-bee1-c0fc-b484-ae7c49cbc828
     steps:
@@ -49,7 +49,7 @@ jobs:
             -e ADMIN_TOKEN="$ADMIN_TOKEN" \
             -e VLESS_UUID="$TEST_UUID" \
             -e LIMIT="$LIMIT" -e REAL_TOPK="$REAL_TOPK" \
-            -e DIAL_WORKERS=3 -e FULL_PROBE_WORKERS=3 -e PROBE_WORKERS=20 \
+            -e DIAL_WORKERS=5 -e FULL_PROBE_WORKERS=5 -e PROBE_WORKERS=30 \
             -e DIAL_TIMEOUT=8 \
             rotate-trial:trial
           for i in $(seq 1 40); do
@@ -156,52 +156,70 @@ jobs:
           echo "node  : $(docker exec rotate-trial python3 /tmp/diag.py node)"
           echo "resi  : $(docker exec rotate-trial python3 /tmp/diag.py resi)"
 
-      - name: Kill the pin and watch
+      - name: Kill the pin twice (hot switch must repeat)
         run: |
           AUTH="Authorization: Bearer $ADMIN_TOKEN"
           docker exec -u 0 rotate-trial sh -c "apt-get update -qq && apt-get install -y -qq --no-install-recommends iptables" >/tmp/apt.log 2>&1 || {
             tail -n 30 /tmp/apt.log; exit 1; }
-          curl -m 10 -s -H "$AUTH" http://127.0.0.1:3000/api/status -o /tmp/pre.json
-          PIN=$(python3 -c "import json;print(json.load(open('/tmp/pre.json'))['preferred_tag'])")
-          docker exec rotate-trial cat /app/singbox-railway.json > /tmp/cfg.json
-          python3 - "$PIN" <<'EOF'
+          sb_pid() {
+            docker exec rotate-trial sh -c 'for p in /proc/[0-9]*/cmdline; do
+              c=$(tr "\0" " " < "$p" 2>/dev/null)
+              case "$c" in *sing-box*run*/app/singbox-railway.json*) echo "$p" | cut -d/ -f3; break;; esac
+            done'
+          }
+          cfg_md5() { docker exec rotate-trial sh -c 'md5sum /app/singbox-railway.json | cut -d" " -f1'; }
+          round=0
+          for round in 1 2; do
+            curl -m 10 -s -H "$AUTH" http://127.0.0.1:3000/api/status -o /tmp/pre.json
+            PIN=$(python3 -c "import json;print(json.load(open('/tmp/pre.json'))['preferred_tag'])")
+            SW0=$(python3 -c "import json;print(json.load(open('/tmp/pre.json'))['chain_switch']['switches'])")
+            docker exec rotate-trial cat /app/singbox-railway.json > /tmp/cfg.json
+            python3 - "$PIN" "$round" <<'EOF'
           import json, socket, sys
-          pin = sys.argv[1]
+          pin, rnd = sys.argv[1], sys.argv[2]
           cfg = json.load(open("/tmp/cfg.json"))
           ep = next(e for e in cfg["endpoints"] if e["tag"] == pin)
-          addrs = [ep["server"]] + [s["server"] for s in (ep.get("servers") or []) if s.get("server")]
+          addrs = [ep["server"]] + [x["server"] for x in (ep.get("servers") or []) if x.get("server")]
           ips = sorted({i[4][0] for a in addrs for i in socket.getaddrinfo(a, None)})
-          open("/tmp/pin_ips.txt", "w").write("\n".join(ips) + "\n")
-          print(f"pin {pin}: {ips}")
+          open(f"/tmp/pin_ips_{rnd}.txt", "w").write("\n".join(ips) + "\n")
+          print(f"round {rnd}: pin {pin}: {ips}")
           EOF
-          while read -r ip; do
-            docker exec -u 0 rotate-trial sh -c "iptables -A OUTPUT -p tcp -d $ip -j REJECT --reject-with tcp-reset; iptables -A OUTPUT -p udp -d $ip -j REJECT" || true
-          done < /tmp/pin_ips.txt
-          docker exec rotate-trial sh -c 'iptables -L OUTPUT -n | head -n 6'
-          SB_PID0=$(docker exec rotate-trial sh -c 'for p in /proc/[0-9]*/cmdline; do c=$(tr "\0" " " < "$p" 2>/dev/null); case "$c" in *sing-box*run*/app/singbox-railway.json*) echo "$p" | cut -d/ -f3; break;; esac; done')
-          MD50=$(docker exec rotate-trial sh -c 'md5sum /app/singbox-railway.json | cut -d" " -f1')
-          echo "before: pin=$PIN pid=$SB_PID0 md5=$MD50"
-          DEADLINE=$((SECONDS + 300))
-          while [ $SECONDS -lt $DEADLINE ]; do
-            sel=$(docker exec rotate-trial python3 /tmp/diag.py selector)
-            chain=$(docker exec rotate-trial python3 /tmp/diag.py chain)
-            node=$(docker exec rotate-trial python3 /tmp/diag.py node)
-            echo "t=${SECONDS}s $sel chain=$chain node=$node"
-            case "$chain" in ips=*) echo "CHAIN RECOVERED"; break;; esac
-            sleep 8
-          done
-          SB_PID1=$(docker exec rotate-trial sh -c 'for p in /proc/[0-9]*/cmdline; do c=$(tr "\0" " " < "$p" 2>/dev/null); case "$c" in *sing-box*run*/app/singbox-railway.json*) echo "$p" | cut -d/ -f3; break;; esac; done')
-          MD51=$(docker exec rotate-trial sh -c 'md5sum /app/singbox-railway.json | cut -d" " -f1')
-          curl -m 10 -s -H "$AUTH" http://127.0.0.1:3000/api/status -o /tmp/post.json
-          python3 - "$SB_PID0" "$SB_PID1" "$MD50" "$MD51" <<'EOF'
+            while read -r ip; do
+              docker exec -u 0 rotate-trial sh -c "iptables -A OUTPUT -p tcp -d $ip -j REJECT --reject-with tcp-reset; iptables -A OUTPUT -p udp -d $ip -j REJECT" || true
+            done < /tmp/pin_ips_$round.txt
+            PID0=$(sb_pid); MD50=$(cfg_md5)
+            echo "round $round before: pin=$PIN switches=$SW0 pid=$PID0 md5=$MD50"
+            DEADLINE=$((SECONDS + 240))
+            chain=""
+            while [ $SECONDS -lt $DEADLINE ]; do
+              sel=$(docker exec rotate-trial python3 /tmp/diag.py selector)
+              chain=$(docker exec rotate-trial python3 /tmp/diag.py chain)
+              node=$(docker exec rotate-trial python3 /tmp/diag.py node)
+              echo "round $round t=${SECONDS}s $sel chain=$chain node=$node"
+              case "$chain" in ips=*) break;; esac
+              sleep 8
+            done
+            PID1=$(sb_pid); MD51=$(cfg_md5)
+            curl -m 10 -s -H "$AUTH" http://127.0.0.1:3000/api/status -o /tmp/post.json
+            python3 - "$PIN" "$SW0" "$PID0" "$PID1" "$MD50" "$MD51" "$round" "$chain" <<'EOF' || true
           import json, sys
-          pid0, pid1, md50, md51 = sys.argv[1:5]
+          pin0, sw0, pid0, pid1, md50, md51, rnd, chain = sys.argv[1:9]
           s = json.load(open("/tmp/post.json"))
-          print(f"after: pin={s['preferred_tag']} switches={s['chain_switch']['switches']} "
+          print(f"round {rnd} after: pin={s['preferred_tag']} switches={s['chain_switch']['switches']} "
                 f"pid={pid1} md5={md51} pool={s['resi']['pool']}")
-          print("events:", [h["event"] for h in s.get("refresh_history", [])][-14:])
-          print(f"pid_changed={pid1 != pid0} md5_changed={md51 != md50}")
+          print(f"round {rnd} events:", [h["event"] for h in s.get("refresh_history", [])][-10:])
+          print(f"round {rnd} md5_changed={md51 != md50} pid_changed={pid1 != pid0} "
+                f"switches_delta={int(s['chain_switch']['switches']) - int(sw0)}")
+          if not chain.startswith("ips="):
+              print("ROUND FAILED: chain never carried traffic again"); raise SystemExit(3)
+          if md51 != md50:
+              print("ROUND FAILED: the repin rewrote the config"); raise SystemExit(4)
+          if int(s["chain_switch"]["switches"]) <= int(sw0):
+              print("ROUND FAILED: no hot switch was recorded"); raise SystemExit(5)
+          print(f"ROUND {rnd} OK: chain came back through a hot switch")
           EOF
+            sleep 10
+          done
 
       - name: Dump what sing-box says about the selected endpoint
         if: always()
@@ -214,6 +232,8 @@ jobs:
           docker exec rotate-trial sh -c "grep -aE 'not ready yet|client terminated|client started' /app/singbox-railway.json.stderr.log | tail -n 25" || true
           echo "=== route rules ==="
           docker exec rotate-trial python3 -c "import json;c=json.load(open('/app/singbox-railway.json'));print(json.dumps(c['route'],indent=1)[:1200])"
+          echo "=== restart / rewrite causes ==="
+          docker logs --since 15m rotate-trial 2>&1 | grep -aE "restart|exited|supervis|config rewritten|rescue" | tail -n 25 || true
           echo "=== manager events ==="
           curl -m 10 -s -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:3000/api/status | python3 -c "import json,sys;s=json.load(sys.stdin);print([h['event'] for h in s.get('refresh_history',[])][-20:])" || true
 
