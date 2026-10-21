@@ -82,7 +82,11 @@ jobs:
 
 
           def selector():
-              now = clash("/proxies/chain").get("now")
+              try:
+                  now = clash("/proxies/chain").get("now")
+              except Exception as exc:          # noqa: BLE001 - diagnostic only
+                  print("now=%s delay=-" % type(exc).__name__)
+                  return
               try:
                   delay = clash("/proxies/" + str(now) + "/delay?url=http%3A%2F%2Fcp.cloudflare.com%2Fgenerate_204&timeout=7000").get("delay")
               except Exception as exc:          # noqa: BLE001 - diagnostic only
@@ -106,7 +110,7 @@ jobs:
                "resi": lambda: probe("/ws-resi")}[sys.argv[1]]()
           PY
           docker cp /tmp/diag.py rotate-trial:/tmp/diag.py
-          docker exec rotate-trial python3 /tmp/diag.py selector
+          docker exec rotate-trial python3 /tmp/diag.py selector || true
 
       - name: Wait for a pinned chain
         run: |
