@@ -181,7 +181,9 @@ toast = ((orig) => (msg, isErr) => { toastLog.push(String(msg)); return orig(msg
   renderAll(lastStatus);
   assert.strictEqual(
     document.getElementById("verify-result").textContent,
-    "已切换节点，出口待重新验证",
+    // Wording owned by renderVerify() in railway_manager.py: since 6ef76f2
+    // the hint covers both a stale verify and a node switch.
+    "验证已过期或已切换，出口待重新验证",
     "stale IP must be replaced by re-verify hint");
   assert.ok(!document.getElementById("verify-result").textContent.includes("9.9.9.11"),
     "old exit IP must not be displayed");

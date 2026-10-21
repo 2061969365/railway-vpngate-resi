@@ -768,3 +768,44 @@ route rules: 100 {'inbound': 'resi-rot-0', 'outbound': 'vpngate-0'} ... 'resi-ro
    最近真的传过 payload 的节点，而不是延迟数字最小的那个。历史里若出现连续的
    `chain-rescue` 且 pin 反复回到同一个 tag，说明失败记忆失效（回归）。
 
+### 12.14 manager 测试契约迁移（16 条历史红灯 → 现行机制，2026-10-21）
+
+`0627d74`（"rewrite simpler manager"）把 manager 简化之后，`tests/test_railway_manager.py`
+里有 16 条用例**一直是红的**：它们断言的是**已经被删掉的老机制**
+（`_healthy`、`MAX_CRASH_STREAK`、全量探测的 tie-keep、探针失败后真拨 pin 节点、刷新等本轮探测落定），
+不是产品行为变坏。本次逐条把断言迁到现行机制——**没有 skip、没有 xfail、没有把断言删掉**——
+并让每一条守住**等价或更强**的保证。迁移后全量：**564 passed / 2 skipped / 0 failed**
+（`tests/test_resi.py` 单独跑仍是 106 passed）。
+
+| 老契约（已移除） | 现行机制 | 迁移后的用例 | 现在守住的保证 |
+|---|---|---|---|
+| `_healthy()` | `_serving_ok()` | `ColdStartTests::test_serves_last_good_while_refresh_in_flight`、`test_no_last_good_no_endpoints_stays_not_ready` | 有服务端点就算"在服务"；没有端点就不算 |
+| `MAX_CRASH_STREAK` 硬上限 | `CRASH_BACKOFFS` 钳制（取最后一项） | `SuperviseBackoffTests::test_supervise_retries_beyond_max_streak` | 崩溃阶梯只增不减，到顶之后仍然会重启 sing-box |
+| 全量探测 tie-keep（`preferred == best` 就跳过） | 有 pin 时 `_auto_pin_best` 直接早退；死 pin 归 `check_pinned_health` 管 | `DeadPinTests::test_a_dead_pin_is_replaced_even_with_nothing_measured` | **死 pin 必须被换掉**，哪怕没有更快的候选、哪怕它自己从没被测过 |
+| 同上 | 同上 | `DeadPinTests::test_an_existing_pin_is_never_re_verified` | 有 pin 时**一次 verify 都不许发**：另起客户端会开第二个 VPNGate 会话，duplicate-cn 踢掉正在服务的那条（§12.9f） |
+| 同上 | 同上 | `DeadPinTests::test_no_exit_ip_anywhere_pins_nothing` | 冷启动拿不到出口 IP 就**不瞎 pin**、不重写配置 |
+| 同上 | 同上 | `DeadPinTests::test_full_probe_never_repins_over_an_existing_pin` | 全量探测**不许**覆盖已有 pin |
+| 同上 | 同上 | `DeadPinTests::test_a_healthy_pin_is_left_alone_by_the_probe` | 健康 pin 只记一次 skip，不重写配置 |
+| 探针失败→真拨 pin 节点 | 判活只用握手 + `_chain_probe_ok`（走 mux） | `DeadPinTests::test_health_failure_never_dials_and_fast_rescues` | 首次失败即换（不等三振），且**全程零真拨** |
+| 同上 | 同上 | `DeadPinTests::test_handshake_alive_but_tunnel_dead_rescues` | 握手活着但隧道死 ⇒ 连续两次探针（`CHAIN_FAIL_THRESHOLD`）才换 |
+| 同上 | 同上 | `DeadPinTests::test_tunnel_alive_stays_pinned` | 隧道还在跑 ⇒ pin 不动，握手只探一次 |
+| 刷新必须等本轮探测落定 | 刷新不参与 pin 决策（§12.9e D13：绝不重拨正在服务的节点） | `RefreshGateTests::test_refresh_never_hands_the_pin_to_a_stale_measurement` | 刷新返回时 pin 不变；真正换人的只有健康回路 |
+| 同上 | 同上 | `RefreshGateTests::test_refresh_is_not_blocked_by_a_wedged_full_probe` | 全量探测在后台线程，探测卡死**不能**卡住刷新 |
+| 手动切换要抢在救援前面 | 救援在 `_config_lock` 里提交，手动切换走热路径（`_repin_runtime`） | `DeadPinTests::test_rescue_yields_to_manual_switch_mid_run` | 回合中途的手动切换**赢**；没有中途切换的救援照常发生 |
+| 事件名 `auto-rescue` | 没有新鲜证据时事件是 `auto-rescue-stale` | `PinnedHealthTests::test_manual_pin_rescued_without_mid_round_switch` | 救援确实发生了（事件前缀匹配） |
+| `_republish_config` 不写配置 | 同一组 pin 也会 `_apply_config`（内容不变 ⇒ 不重启） | `AutoPinTests::test_tie_keeps_current_without_flap` | 写回的必须是**同一组 pin**（`preferred=vpngate-1, backup=vpngate-0`） |
+
+另外四处同样属于"过期契约"的修正（与 manager 逻辑无关）：
+
+1. `scripts/verify_attribution_stub.js`：控制台文案在 `6ef76f2`（2026-09-20）从"已切换节点，出口待重新验证"
+   改成"验证已过期或已切换，出口待重新验证"（新增"验证过期"语义），stub 的期望文案没跟上 ⇒
+   断言改成产品现行文案。语义不变：**旧出口 IP 必须被"待重新验证"提示取代**。
+2. 测试里 63 处 `f"/tmp/railway-…"` 改成 `f"{_TMP}/railway-…"`（`_TMP = tempfile.gettempdir()`）：
+   POSIX 上仍是 `/tmp`，Windows 上落到 `%TEMP%`（盘符根目录的 `/tmp` 在 Windows 上不存在也不可写）。
+3. 三个跑子进程的用例（`test_served_js_parses`、`test_served_attribution_flow`、
+   `test_help_works_from_repo_root`）把 stdout/stderr 改成写文件再读回：受限进程不能把管道交给子进程，
+   断言用的标记一个没少。
+4. `DeadPinTests::test_auto_pin_no_exit_ip_anywhere_keeps_pin` 拆成两条
+   （"有 pin 绝不重新 verify" + "无出口 IP 就不 pin"），因为它原来同时断言两件互相独立的事；
+   拆分后两条各自都能独立失败、互不遮蔽。
+

@@ -69,6 +69,10 @@ def _snapshot_csv(*ips: str) -> str:
     return header + "\n" + "\n".join(rows) + "\n"
 
 
+# Per-test config/state files live in the platform temp dir: drive-root
+# /tmp does not exist/writable on Windows, and POSIX still gets /tmp.
+_TMP = tempfile.gettempdir()
+
 class ClassifyTests(unittest.TestCase):
     def test_socks5_greeting(self) -> None:
         self.assertEqual("socks5", classify_first_bytes(b"\x05\x01\x00"))
@@ -252,9 +256,9 @@ class RefreshTests(unittest.TestCase):
     def _manager(self, **kwargs):
         defaults = dict(port=0, mixed_port=get_free_port(), start_singbox=False,
                         auto_refresh=False, fetch_on_start=False,
-                        config_path=f"/tmp/railway-test-{id(self)}.json",
-                        nodes_path=f"/tmp/railway-test-{id(self)}-nodes.json",
-                        state_path=f"/tmp/railway-test-{id(self)}-state.json")
+                        config_path=f"{_TMP}/railway-test-{id(self)}.json",
+                        nodes_path=f"{_TMP}/railway-test-{id(self)}-nodes.json",
+                        state_path=f"{_TMP}/railway-test-{id(self)}-state.json")
         defaults.update(kwargs)
         return RailwayManager(**defaults)
 
@@ -421,9 +425,9 @@ class FullProbeTests(unittest.TestCase):
         defaults = dict(port=0, mixed_port=get_free_port(), start_singbox=False,
                         auto_refresh=False, fetch_on_start=False,
                         admin_token=self.TOKEN,
-                        config_path=f"/tmp/railway-probe-{id(self)}.json",
-                        nodes_path=f"/tmp/railway-probe-{id(self)}-nodes.json",
-                        state_path=f"/tmp/railway-probe-{id(self)}-state.json")
+                        config_path=f"{_TMP}/railway-probe-{id(self)}.json",
+                        nodes_path=f"{_TMP}/railway-probe-{id(self)}-nodes.json",
+                        state_path=f"{_TMP}/railway-probe-{id(self)}-state.json")
         defaults.update(kwargs)
         return RailwayManager(**defaults)
 
@@ -526,9 +530,9 @@ class FullProbeWorkersTests(unittest.TestCase):
         defaults = dict(port=0, mixed_port=get_free_port(), start_singbox=False,
                         auto_refresh=False, fetch_on_start=False,
                         admin_token=self.TOKEN,
-                        config_path=f"/tmp/railway-fpw-{id(self)}.json",
-                        nodes_path=f"/tmp/railway-fpw-{id(self)}-nodes.json",
-                        state_path=f"/tmp/railway-fpw-{id(self)}-state.json")
+                        config_path=f"{_TMP}/railway-fpw-{id(self)}.json",
+                        nodes_path=f"{_TMP}/railway-fpw-{id(self)}-nodes.json",
+                        state_path=f"{_TMP}/railway-fpw-{id(self)}-state.json")
         defaults.update(kwargs)
         return RailwayManager(**defaults)
 
@@ -613,9 +617,9 @@ class SingleProbeTests(unittest.TestCase):
         defaults = dict(port=0, mixed_port=get_free_port(), start_singbox=False,
                         auto_refresh=False, fetch_on_start=False,
                         admin_token=self.TOKEN,
-                        config_path=f"/tmp/railway-single-{id(self)}.json",
-                        nodes_path=f"/tmp/railway-single-{id(self)}-nodes.json",
-                        state_path=f"/tmp/railway-single-{id(self)}-state.json")
+                        config_path=f"{_TMP}/railway-single-{id(self)}.json",
+                        nodes_path=f"{_TMP}/railway-single-{id(self)}-nodes.json",
+                        state_path=f"{_TMP}/railway-single-{id(self)}-state.json")
         defaults.update(kwargs)
         return RailwayManager(**defaults)
 
@@ -953,9 +957,9 @@ class DialWorkersPlumbingTests(unittest.TestCase):
             port=0, mixed_port=get_free_port(), start_singbox=False,
             auto_refresh=False, fetch_on_start=False,
             admin_token=self.TOKEN, dial_workers=10,
-            config_path=f"/tmp/railway-dw-{id(self)}.json",
-            nodes_path=f"/tmp/railway-dw-{id(self)}-nodes.json",
-            state_path=f"/tmp/railway-dw-{id(self)}-state.json")
+            config_path=f"{_TMP}/railway-dw-{id(self)}.json",
+            nodes_path=f"{_TMP}/railway-dw-{id(self)}-nodes.json",
+            state_path=f"{_TMP}/railway-dw-{id(self)}-state.json")
         try:
             with mock.patch("railway_manager.snapshot_to_nodes",
                             side_effect=lambda *a, **k: seen.update(k) or []):
@@ -1186,6 +1190,9 @@ class PinnedHealthTests(unittest.TestCase):
                                 "203.0.113.11", "203.0.113.12",
                                 "203.0.113.13")))
                     manager.switch(tag="vpngate-0")
+                    # A pin from an earlier round, not a warm-up pin:
+                    # otherwise CHAIN_SETTLE_GRACE suppresses the rescue.
+                    manager._chain_pin_at = 0.0
                     by_server = {n["server"]: n for n in manager._nodes}
                     by_server["203.0.113.11"]["real_latency_ms"] = 70
                     by_server["203.0.113.12"]["real_latency_ms"] = 30
@@ -1205,7 +1212,10 @@ class PinnedHealthTests(unittest.TestCase):
                 self.assertEqual("vpngate-1", manager.preferred_tag)
                 self.assertTrue(manager._auto_pinned)
                 events = [e["event"] for e in manager.status["refresh_history"]]
-                self.assertIn("auto-rescue", events)
+                # No candidate had a fresh proof, so the rescue is
+                # recorded as auto-rescue-stale: still a rescue.
+                self.assertTrue(any(e.startswith("auto-rescue")
+                                    for e in events))
             finally:
                 manager.stop()
 
@@ -1413,6 +1423,8 @@ class ColdStartTests(unittest.TestCase):
             self.assertEqual(["boot", "refresh"], calls)
 
     def test_serves_last_good_while_refresh_in_flight(self) -> None:
+        """Last-good is served as soon as boot succeeds; the refresh runs on a
+        background thread, so serving is never gated by a slow fetch."""
         with tempfile.TemporaryDirectory() as tmpdir:
             self._seed_last_good(tmpdir)
             manager = RailwayManager(
@@ -1431,8 +1443,11 @@ class ColdStartTests(unittest.TestCase):
                 with mock.patch.object(RailwayManager, "refresh_once",
                                        side_effect=slow_refresh):
                     thread = threading.Thread(target=manager._initial_refresh,
-                                              daemon=True)
+                                               daemon=True)
                     thread.start()
+                    thread.join(timeout=10)
+                    self.assertFalse(thread.is_alive(),
+                                     "boot must not block on the fetch")
                     self.assertTrue(entered.wait(10))
                     deadline = time.monotonic() + 10
                     while not manager.status["endpoints"] \
@@ -1440,9 +1455,11 @@ class ColdStartTests(unittest.TestCase):
                         time.sleep(0.1)
                     self.assertTrue(manager.status["endpoints"],
                                     "last-good not served while refresh in flight")
-                    self.assertTrue(manager._healthy())
-                    self.assertTrue(thread.is_alive(),
-                                    "refresh should still be running")
+                    self.assertTrue(manager._serving_ok())
+                    bg = manager._refresh_thread
+                    self.assertIsNotNone(bg, "refresh must run in the background")
+                    self.assertTrue(bg.is_alive(),
+                                    "refresh should still be gated on the fetch")
             finally:
                 gate.set()
 
@@ -1455,7 +1472,7 @@ class ColdStartTests(unittest.TestCase):
             with mock.patch.object(RailwayManager, "refresh_once",
                                    return_value=False):
                 manager._initial_refresh()
-            self.assertFalse(manager._healthy())
+            self.assertFalse(manager._serving_ok())
             self.assertEqual([], manager.status["endpoints"])
 
 
@@ -1610,14 +1627,25 @@ class GlassUiTests(unittest.TestCase):
                                              encoding="utf-8") as handle:
                 handle.write(block)
                 path = handle.name
+            # The child writes into files instead of pipes: a confined test
+            # process cannot hand a pipe to a child process, and the
+            # assertion reads the very same output.
+            log_path = path + ".log"
             try:
-                result = subprocess.run([node, "--check", path],
-                                        capture_output=True, text=True,
-                                        timeout=60)
+                with open(log_path, "w", encoding="utf-8") as log:
+                    result = subprocess.run([node, "--check", path],
+                                            stdout=log, stderr=log,
+                                            text=True, timeout=60)
+                message = ""
+                if os.path.exists(log_path):
+                    with open(log_path, encoding="utf-8",
+                              errors="replace") as log:
+                        message = log.read()
             finally:
-                os.unlink(path)
-            self.assertEqual(0, result.returncode, result.stderr)
-
+                for tmp_path in (path, log_path):
+                    if os.path.exists(tmp_path):
+                        os.unlink(tmp_path)
+            self.assertEqual(0, result.returncode, message)
 
 class UiPolishTests(unittest.TestCase):
     """T1-T5 interaction polish: debounce, abortable polls, bench guards,
@@ -1690,9 +1718,9 @@ class VerifyApiTests(unittest.TestCase):
         defaults = dict(port=0, mixed_port=get_free_port(), start_singbox=False,
                         auto_refresh=False, fetch_on_start=False,
                         admin_token=self.TOKEN,
-                        config_path=f"/tmp/railway-verify-{id(self)}.json",
-                        nodes_path=f"/tmp/railway-verify-{id(self)}-nodes.json",
-                        state_path=f"/tmp/railway-verify-{id(self)}-state.json")
+                        config_path=f"{_TMP}/railway-verify-{id(self)}.json",
+                        nodes_path=f"{_TMP}/railway-verify-{id(self)}-nodes.json",
+                        state_path=f"{_TMP}/railway-verify-{id(self)}-state.json")
         defaults.update(kwargs)
         return RailwayManager(**defaults)
 
@@ -1770,9 +1798,9 @@ class ProcessHygieneTests(unittest.TestCase):
         defaults = dict(port=0, mixed_port=get_free_port(), start_singbox=False,
                         auto_refresh=False, fetch_on_start=False,
                         admin_token=self.TOKEN,
-                        config_path=f"/tmp/railway-hyg-{id(self)}.json",
-                        nodes_path=f"/tmp/railway-hyg-{id(self)}-nodes.json",
-                        state_path=f"/tmp/railway-hyg-{id(self)}-state.json")
+                        config_path=f"{_TMP}/railway-hyg-{id(self)}.json",
+                        nodes_path=f"{_TMP}/railway-hyg-{id(self)}-nodes.json",
+                        state_path=f"{_TMP}/railway-hyg-{id(self)}-state.json")
         defaults.update(kwargs)
         return RailwayManager(**defaults)
 
@@ -1914,9 +1942,9 @@ class HalfPacketTests(unittest.TestCase):
             port=0, mixed_port=get_free_port(), start_singbox=False,
             auto_refresh=False, fetch_on_start=False,
             admin_token="test-admin-token-0123456789abcdef",
-            config_path=f"/tmp/railway-half-{id(self)}.json",
-            nodes_path=f"/tmp/railway-half-{id(self)}-nodes.json",
-            state_path=f"/tmp/railway-half-{id(self)}-state.json")
+            config_path=f"{_TMP}/railway-half-{id(self)}.json",
+            nodes_path=f"{_TMP}/railway-half-{id(self)}-nodes.json",
+            state_path=f"{_TMP}/railway-half-{id(self)}-state.json")
 
     def test_split_get_reaches_http(self) -> None:
         manager = self._manager()
@@ -1992,9 +2020,9 @@ class RefreshMutexTests(unittest.TestCase):
             port=0, mixed_port=get_free_port(), start_singbox=False,
             auto_refresh=False, fetch_on_start=False,
             admin_token="test-admin-token-0123456789abcdef",
-            config_path=f"/tmp/railway-mtx-{id(self)}.json",
-            nodes_path=f"/tmp/railway-mtx-{id(self)}-nodes.json",
-            state_path=f"/tmp/railway-mtx-{id(self)}-state.json")
+            config_path=f"{_TMP}/railway-mtx-{id(self)}.json",
+            nodes_path=f"{_TMP}/railway-mtx-{id(self)}-nodes.json",
+            state_path=f"{_TMP}/railway-mtx-{id(self)}-state.json")
         manager.retry_delays = ()
         try:
             worker = threading.Thread(
@@ -2028,9 +2056,9 @@ class LoopSurvivalTests(unittest.TestCase):
         defaults = dict(port=0, mixed_port=get_free_port(), start_singbox=False,
                         auto_refresh=False, fetch_on_start=False,
                         admin_token=self.TOKEN,
-                        config_path=f"/tmp/railway-loop-{id(self)}.json",
-                        nodes_path=f"/tmp/railway-loop-{id(self)}-nodes.json",
-                        state_path=f"/tmp/railway-loop-{id(self)}-state.json")
+                        config_path=f"{_TMP}/railway-loop-{id(self)}.json",
+                        nodes_path=f"{_TMP}/railway-loop-{id(self)}-nodes.json",
+                        state_path=f"{_TMP}/railway-loop-{id(self)}-state.json")
         defaults.update(kwargs)
         return RailwayManager(**defaults)
 
@@ -2207,7 +2235,8 @@ class SuperviseBackoffTests(unittest.TestCase):
         # DeadProc (poll()=exited) skips the config-file branch without
         # touching the filesystem, so this also runs in a file sandbox.
         manager._singbox_proc = self._dead_proc()
-        manager._crash_streak = manager_mod.MAX_CRASH_STREAK
+        # The crash ladder is a clamp now: its last entry is the cap.
+        manager._crash_streak = len(manager_mod.CRASH_BACKOFFS) - 1
         manager._retry_after = 0.0
         try:
             with mock.patch.object(manager, "_restart_singbox") as restart:
@@ -3183,9 +3212,9 @@ class FullProbeOrderTests(unittest.TestCase):
         defaults = dict(port=0, mixed_port=get_free_port(), start_singbox=False,
                         auto_refresh=False, fetch_on_start=False,
                         admin_token=self.TOKEN,
-                        config_path=f"/tmp/railway-ord-{id(self)}.json",
-                        nodes_path=f"/tmp/railway-ord-{id(self)}-nodes.json",
-                        state_path=f"/tmp/railway-ord-{id(self)}-state.json")
+                        config_path=f"{_TMP}/railway-ord-{id(self)}.json",
+                        nodes_path=f"{_TMP}/railway-ord-{id(self)}-nodes.json",
+                        state_path=f"{_TMP}/railway-ord-{id(self)}-state.json")
         defaults.update(kwargs)
         return RailwayManager(**defaults)
 
@@ -3245,9 +3274,9 @@ class RefreshAutoProbeTests(unittest.TestCase):
     def _manager(self, **kwargs):
         defaults = dict(port=0, mixed_port=get_free_port(), start_singbox=False,
                         auto_refresh=False, fetch_on_start=False,
-                        config_path=f"/tmp/railway-rap-{id(self)}.json",
-                        nodes_path=f"/tmp/railway-rap-{id(self)}-nodes.json",
-                        state_path=f"/tmp/railway-rap-{id(self)}-state.json")
+                        config_path=f"{_TMP}/railway-rap-{id(self)}.json",
+                        nodes_path=f"{_TMP}/railway-rap-{id(self)}-nodes.json",
+                        state_path=f"{_TMP}/railway-rap-{id(self)}-state.json")
         defaults.update(kwargs)
         return RailwayManager(**defaults)
 
@@ -3298,24 +3327,23 @@ class RefreshGateTests(unittest.TestCase):
     def _manager(self, **kwargs):
         defaults = dict(port=0, mixed_port=get_free_port(), start_singbox=False,
                         auto_refresh=False, fetch_on_start=False,
-                        config_path=f"/tmp/railway-rgate-{id(self)}.json",
-                        nodes_path=f"/tmp/railway-rgate-{id(self)}-nodes.json",
-                        state_path=f"/tmp/railway-rgate-{id(self)}-state.json")
+                        config_path=f"{_TMP}/railway-rgate-{id(self)}.json",
+                        nodes_path=f"{_TMP}/railway-rgate-{id(self)}-nodes.json",
+                        state_path=f"{_TMP}/railway-rgate-{id(self)}-state.json")
         defaults.update(kwargs)
         return RailwayManager(**defaults)
 
-    def test_refresh_waits_for_this_round_probe_before_pin(self) -> None:
-        """Stale real_latency 10 on vpngate-0, but this round it dials
-        None while vpngate-1 dials 40: the served pin must be vpngate-1,
-        never the stale vpngate-0.
+    def test_refresh_never_hands_the_pin_to_a_stale_measurement(self) -> None:
+        """A refresh must not re-pick the pin from this round's dials.
 
-        real_topk=0 so the refresh-stage TopK dial cannot reveal the
-        death: only this round's full probe measures it. Without the
-        gate, refresh serves the stale vpngate-0 pin immediately (the
-        background probe only fixes it minutes later).
+        Rotate mode never re-dials a serving node (a second session would kick
+        the live one), so the "stale measurement" problem is solved by keeping
+        the refresh out of the pin decision entirely: the health loop, which
+        rides the served chain, is the judge.
 
-        Asserted the moment refresh_once returns (no join): the gate
-        must have waited for this round's probe to land."""
+        real_topk=0 so the refresh-stage dial cannot reveal the death either
+        way; assertions are made the moment refresh_once returns (no join).
+        """
         manager = self._manager(
             real_topk=0,
             dial_fn=lambda node: None
@@ -3338,6 +3366,7 @@ class RefreshGateTests(unittest.TestCase):
             manager.preferred_tag = "vpngate-0"
             manager.status["preferred_tag"] = "vpngate-0"
             manager._auto_pinned = True
+            manager._chain_pin_at = 0.0
             with _fake_singbox(), \
                  mock.patch("railway_manager.probe_tcp_latency",
                             return_value=100), \
@@ -3347,22 +3376,26 @@ class RefreshGateTests(unittest.TestCase):
                     fetcher=lambda url, timeout: _snapshot_csv(
                         "203.0.113.11", "203.0.113.12"))
                 pin_at_return = manager.preferred_tag
+                # The pin only moves when its chain stops carrying traffic.
+                rescued = manager.check_pinned_health(
+                    probe_fn=lambda host, port, timeout=5: 0)
+                pin_after_health = manager.preferred_tag
             if manager._full_probe_thread is not None:
                 manager._full_probe_thread.join(timeout=60)
         finally:
             manager.stop()
 
         self.assertTrue(ok)
-        self.assertEqual("vpngate-1", pin_at_return)
+        self.assertEqual("vpngate-0", pin_at_return)
+        self.assertEqual("rescued", rescued)
+        self.assertEqual("vpngate-1", pin_after_health)
 
-    def test_refresh_probe_timeout_keeps_previous_pin(self) -> None:
-        """A wedged full probe must not wedge refresh forever: after the
-        bounded wait refresh keeps serving the previous pin.
-
-        Budget = ceil(1/5)*20 dial + 5*20 verify head + 60 grace = 180s;
-        the dial wedges 300s so the gate must time out first."""
+    def test_refresh_is_not_blocked_by_a_wedged_full_probe(self) -> None:
+        """The full probe runs in the background: a wedged dial must not wedge
+        refresh, and the previous pin is kept (refresh never re-picks it)."""
         gate = threading.Event()
         manager = self._manager(
+            real_topk=0,
             dial_fn=lambda node: gate.wait(timeout=300) or 50)
         try:
             manager._nodes = [{"server": "203.0.113.11", "server_port": 443,
@@ -3371,17 +3404,25 @@ class RefreshGateTests(unittest.TestCase):
                                "speed": 9000,
                                "endpoint": {"tag": "vpngate-0",
                                             "server": "203.0.113.11",
+                                            "server_port": 443}},
+                              {"server": "203.0.113.12", "server_port": 443,
+                               "country": "Japan", "country_short": "JP",
+                               "latency_ms": 300, "real_latency_ms": None,
+                               "speed": 100,
+                               "endpoint": {"tag": "vpngate-1",
+                                            "server": "203.0.113.12",
                                             "server_port": 443}}]
             manager.preferred_tag = "vpngate-0"
             manager.status["preferred_tag"] = "vpngate-0"
             manager._auto_pinned = True
+            manager._chain_pin_at = 0.0
             with _fake_singbox(), \
                  mock.patch("railway_manager.probe_tcp_latency",
                             return_value=100):
                 t0 = time.monotonic()
                 ok = manager.refresh_once(
                     fetcher=lambda url, timeout: _snapshot_csv(
-                        "203.0.113.11"))
+                        "203.0.113.11", "203.0.113.12"))
                 dt = time.monotonic() - t0
             gate.set()
             if manager._full_probe_thread is not None:
@@ -3392,10 +3433,9 @@ class RefreshGateTests(unittest.TestCase):
 
         self.assertTrue(ok)
         self.assertEqual("vpngate-0", manager.preferred_tag)
-        # Bounded: must return on the ~180s gate budget, well before the
-        # 300s dial wedge releases.
-        self.assertLess(dt, 260)
-
+        # The probe target (vpngate-1) wedges for 300s; refresh returned at
+        # once because the full pass is a background thread.
+        self.assertLess(dt, 30)
 
 class AutoPinTests(unittest.TestCase):
     """Full-probe completion pins best + backup with guards."""
@@ -3406,9 +3446,9 @@ class AutoPinTests(unittest.TestCase):
         defaults = dict(port=0, mixed_port=get_free_port(), start_singbox=False,
                         auto_refresh=False, fetch_on_start=False,
                         admin_token=self.TOKEN,
-                        config_path=f"/tmp/railway-ap-{id(self)}.json",
-                        nodes_path=f"/tmp/railway-ap-{id(self)}-nodes.json",
-                        state_path=f"/tmp/railway-ap-{id(self)}-state.json")
+                        config_path=f"{_TMP}/railway-ap-{id(self)}.json",
+                        nodes_path=f"{_TMP}/railway-ap-{id(self)}-nodes.json",
+                        state_path=f"{_TMP}/railway-ap-{id(self)}-state.json")
         defaults.update(kwargs)
         return RailwayManager(**defaults)
 
@@ -3522,7 +3562,13 @@ class AutoPinTests(unittest.TestCase):
         self.assertEqual("vpngate-1", manager.preferred_tag)
         self.assertEqual("vpngate-0", manager.backup_tag)
         self.assertIn("auto-pin-skipped", events)
-        apply_mock.assert_not_called()
+        # `_run_full_probe_inner` ends with `_republish_config()`, which
+        # re-applies the *same* pins; `_apply_config` short-circuits on an
+        # unchanged file, so this is not a flap. What must never happen is
+        # a different pin being written or a verify dial opening.
+        apply_mock.assert_called_once_with(final="auto",
+                                          preferred="vpngate-1",
+                                          backup="vpngate-0")
         verify_mock.assert_not_called()
 
     @unittest.skip("auto-pin repin path was dropped in the simpler-manager rewrite; AUTO_REPIN is no longer wired from env")
@@ -3601,9 +3647,9 @@ class ProgressivePinTests(unittest.TestCase):
         defaults = dict(port=0, mixed_port=get_free_port(), start_singbox=False,
                         auto_refresh=False, fetch_on_start=False,
                         admin_token=self.TOKEN,
-                        config_path=f"/tmp/railway-pp-{id(self)}.json",
-                        nodes_path=f"/tmp/railway-pp-{id(self)}-nodes.json",
-                        state_path=f"/tmp/railway-pp-{id(self)}-state.json")
+                        config_path=f"{_TMP}/railway-pp-{id(self)}.json",
+                        nodes_path=f"{_TMP}/railway-pp-{id(self)}-nodes.json",
+                        state_path=f"{_TMP}/railway-pp-{id(self)}-state.json")
         defaults.update(kwargs)
         return RailwayManager(**defaults)
 
@@ -3943,9 +3989,9 @@ class DialTimeoutPlumbingTests(unittest.TestCase):
     def _manager(self, **kwargs):
         defaults = dict(port=0, mixed_port=get_free_port(), start_singbox=False,
                         auto_refresh=False, fetch_on_start=False,
-                        config_path=f"/tmp/railway-dtp-{id(self)}.json",
-                        nodes_path=f"/tmp/railway-dtp-{id(self)}-nodes.json",
-                        state_path=f"/tmp/railway-dtp-{id(self)}-state.json")
+                        config_path=f"{_TMP}/railway-dtp-{id(self)}.json",
+                        nodes_path=f"{_TMP}/railway-dtp-{id(self)}-nodes.json",
+                        state_path=f"{_TMP}/railway-dtp-{id(self)}-state.json")
         defaults.update(kwargs)
         return RailwayManager(**defaults)
 
@@ -4008,9 +4054,9 @@ class AutoPinFlagTests(unittest.TestCase):
         defaults = dict(port=0, mixed_port=get_free_port(), start_singbox=False,
                         auto_refresh=False, fetch_on_start=False,
                         admin_token=self.TOKEN,
-                        config_path=f"/tmp/railway-apf-{id(self)}.json",
-                        nodes_path=f"/tmp/railway-apf-{id(self)}-nodes.json",
-                        state_path=f"/tmp/railway-apf-{id(self)}-state.json")
+                        config_path=f"{_TMP}/railway-apf-{id(self)}.json",
+                        nodes_path=f"{_TMP}/railway-apf-{id(self)}-nodes.json",
+                        state_path=f"{_TMP}/railway-apf-{id(self)}-state.json")
         defaults.update(kwargs)
         return RailwayManager(**defaults)
 
@@ -4122,9 +4168,9 @@ class VerifyAttributionTests(unittest.TestCase):
         defaults = dict(port=0, mixed_port=get_free_port(), start_singbox=False,
                         auto_refresh=False, fetch_on_start=False,
                         admin_token=self.TOKEN,
-                        config_path=f"/tmp/railway-verifyattr-{id(self)}.json",
-                        nodes_path=f"/tmp/railway-verifyattr-{id(self)}-nodes.json",
-                        state_path=f"/tmp/railway-verifyattr-{id(self)}-state.json")
+                        config_path=f"{_TMP}/railway-verifyattr-{id(self)}.json",
+                        nodes_path=f"{_TMP}/railway-verifyattr-{id(self)}-nodes.json",
+                        state_path=f"{_TMP}/railway-verifyattr-{id(self)}-state.json")
         defaults.update(kwargs)
         return RailwayManager(**defaults)
 
@@ -4334,18 +4380,29 @@ class VerifyAttributionHarnessTests(unittest.TestCase):
                                          encoding="utf-8") as handle:
             handle.write(mains[0])
             page_path = handle.name
+        # The harness output goes to a file instead of a pipe: a confined
+        # test process cannot hand a pipe to a child process, and the
+        # assertions need the very same PASS markers either way.
+        log_path = os.path.join(tempfile.gettempdir(),
+                                f"verifyattr-{os.getpid()}.log")
         try:
-            result = subprocess.run([node, str(stub), page_path],
-                                    capture_output=True, text=True,
-                                    timeout=120)
+            with open(log_path, "w", encoding="utf-8") as log:
+                result = subprocess.run([node, str(stub), page_path],
+                                        stdout=log, stderr=subprocess.STDOUT,
+                                        text=True, timeout=120)
+            output = ""
+            if os.path.exists(log_path):
+                with open(log_path, encoding="utf-8",
+                          errors="replace") as log:
+                    output = log.read()
         finally:
-            os.unlink(page_path)
-        self.assertEqual(0, result.returncode,
-                         result.stdout + result.stderr)
+            for path in (page_path, log_path):
+                if os.path.exists(path):
+                    os.unlink(path)
+        self.assertEqual(0, result.returncode, output)
         for marker in ("PASS A1:", "PASS A2:", "PASS B:", "PASS C:",
                        "PASS D:", "ALL PASS"):
-            self.assertIn(marker, result.stdout)
-
+            self.assertIn(marker, output)
 
 class VerifyAttributionHttpTests(unittest.TestCase):
     """Purpose over real HTTP: stale IP cleared on switch, races never
@@ -4507,9 +4564,9 @@ class ConcurrentStartTests(unittest.TestCase):
         defaults = dict(port=0, mixed_port=get_free_port(), start_singbox=False,
                         auto_refresh=False, fetch_on_start=False,
                         admin_token=self.TOKEN,
-                        config_path=f"/tmp/railway-race-{id(self)}.json",
-                        nodes_path=f"/tmp/railway-race-{id(self)}-nodes.json",
-                        state_path=f"/tmp/railway-race-{id(self)}-state.json")
+                        config_path=f"{_TMP}/railway-race-{id(self)}.json",
+                        nodes_path=f"{_TMP}/railway-race-{id(self)}-nodes.json",
+                        state_path=f"{_TMP}/railway-race-{id(self)}-state.json")
         defaults.update(kwargs)
         return RailwayManager(**defaults)
 
@@ -4628,9 +4685,9 @@ class SingleProbeWritebackTests(unittest.TestCase):
         defaults = dict(port=0, mixed_port=get_free_port(), start_singbox=False,
                         auto_refresh=False, fetch_on_start=False,
                         admin_token=self.TOKEN,
-                        config_path=f"/tmp/railway-spw-{id(self)}.json",
-                        nodes_path=f"/tmp/railway-spw-{id(self)}-nodes.json",
-                        state_path=f"/tmp/railway-spw-{id(self)}-state.json")
+                        config_path=f"{_TMP}/railway-spw-{id(self)}.json",
+                        nodes_path=f"{_TMP}/railway-spw-{id(self)}-nodes.json",
+                        state_path=f"{_TMP}/railway-spw-{id(self)}-state.json")
         defaults.update(kwargs)
         return RailwayManager(**defaults)
 
@@ -4749,9 +4806,9 @@ class ProbeWritebackFollowupsTests(unittest.TestCase):
         defaults = dict(port=0, mixed_port=get_free_port(), start_singbox=False,
                         auto_refresh=False, fetch_on_start=False,
                         admin_token=self.TOKEN,
-                        config_path=f"/tmp/railway-pwf-{id(self)}.json",
-                        nodes_path=f"/tmp/railway-pwf-{id(self)}-nodes.json",
-                        state_path=f"/tmp/railway-pwf-{id(self)}-state.json")
+                        config_path=f"{_TMP}/railway-pwf-{id(self)}.json",
+                        nodes_path=f"{_TMP}/railway-pwf-{id(self)}-nodes.json",
+                        state_path=f"{_TMP}/railway-pwf-{id(self)}-state.json")
         defaults.update(kwargs)
         return RailwayManager(**defaults)
 
@@ -4921,38 +4978,44 @@ class DeadPinTests(unittest.TestCase):
                                         "server_port": 443}}
                           for i, (ip, hand, real) in enumerate(specs)]
 
-    def test_tie_keep_requires_alive_best(self) -> None:
-        """preferred == best but best measured None this round: must NOT
-        skip; the dead pin must be replaced by the alive node."""
+    def test_a_dead_pin_is_replaced_even_with_nothing_measured(self) -> None:
+        """The pin died and has no fresh latency of its own: the health loop
+        still moves the chain onto a handshake-verified node.
+
+        The old full-probe tie-keep used to do this; after the simpler-manager
+        rewrite `_auto_pin_best` never touches an existing pin, so
+        `check_pinned_health` owns the guarantee."""
+        dial_calls: list[str] = []
         with tempfile.TemporaryDirectory() as tmpdir:
             manager = self._manager(
-                tmpdir, verify_fn=lambda ep: ("9.9.9.9", 11))
+                tmpdir,
+                dial_fn=lambda node: dial_calls.append(node["server"]) or None)
             try:
+                # The pin was never dialed (real_latency_ms=None); the only
+                # replacement candidate can only be ranked by its handshake.
                 self._seed_nodes(manager, ("203.0.113.11", 100, None),
                                  ("203.0.113.12", 200, 40))
                 manager.preferred_tag = "vpngate-0"
                 manager.status["preferred_tag"] = "vpngate-0"
-                manager.backup_tag = "vpngate-1"
-                manager.status["backup_tag"] = "vpngate-1"
                 manager._auto_pinned = True
-                with _fake_singbox(), \
-                     mock.patch.object(manager, "_apply_config",
-                                       return_value=True) as apply_mock:
-                    manager._auto_pin_best(manager._nodes, "vpngate-0")
-                    events = [e["event"]
+                manager._chain_pin_at = 0.0     # old pin: no warm-up grace
+                failing = lambda host, port, timeout=5: 0
+                with _fake_singbox():
+                    result = manager.check_pinned_health(probe_fn=failing)
+                    events = [(e["event"], e.get("detail", ""))
                               for e in manager.status["refresh_history"]]
             finally:
                 manager.stop()
 
+        self.assertEqual("rescued", result)
         self.assertEqual("vpngate-1", manager.preferred_tag)
-        apply_mock.assert_called_once()
-        self.assertFalse(any(e["event"] == "auto-pin-skipped" and
-                             "pins unchanged" in e.get("detail", "")
-                             for e in manager.status["refresh_history"]))
+        self.assertEqual([], dial_calls, "a real dial would open a second session")
+        self.assertTrue(any(ev.startswith("auto-rescue") for ev, _ in events))
 
-    def test_health_failure_triggers_dial_and_fast_rescue(self) -> None:
-        """First failed dial rescues to the alive backup immediately
-        (no 3-strike wait)."""
+    def test_health_failure_never_dials_and_fast_rescues(self) -> None:
+        """First failed handshake rescues to the alive node immediately (no
+        3-strike wait) and never real-dials the pin: a second VPNGate session
+        would kick the one the chain is riding (duplicate-cn)."""
         dial_calls: list[str] = []
         with tempfile.TemporaryDirectory() as tmpdir:
             manager = self._manager(
@@ -4963,9 +5026,8 @@ class DeadPinTests(unittest.TestCase):
                                  ("203.0.113.12", 200, 40))
                 manager.preferred_tag = "vpngate-0"
                 manager.status["preferred_tag"] = "vpngate-0"
-                manager.backup_tag = "vpngate-1"
-                manager.status["backup_tag"] = "vpngate-1"
                 manager._auto_pinned = True
+                manager._chain_pin_at = 0.0
                 failing = lambda host, port, timeout=5: 0
                 with _fake_singbox():
                     result = manager.check_pinned_health(probe_fn=failing)
@@ -4974,38 +5036,43 @@ class DeadPinTests(unittest.TestCase):
 
         self.assertEqual("rescued", result)
         self.assertEqual("vpngate-1", manager.preferred_tag)
-        self.assertIn("203.0.113.11", dial_calls)
+        # Health judgement is handshake + mux probe only: no real dial.
+        self.assertEqual([], dial_calls)
 
     def test_handshake_alive_but_tunnel_dead_rescues(self) -> None:
-        """TCP handshake passes but the real tunnel dial fails: the pin
-        must still be rescued (handshake alone never means alive)."""
-        dial_calls: list[str] = []
+        """TCP handshake passes but the chain still carries nothing: two
+        end-to-end probes (CHAIN_FAIL_THRESHOLD) must move the pin.
+
+        The tunnel check rides the mux (`_chain_probe_ok`); stubbing it is the
+        same signal a dead tunnel produces, without opening a second VPNGate
+        session."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            manager = self._manager(
-                tmpdir,
-                dial_fn=lambda node: dial_calls.append(node["server"]) or None)
+            manager = self._manager(tmpdir, dial_fn=lambda node: None)
             try:
                 self._seed_nodes(manager, ("203.0.113.11", 100, 30),
                                  ("203.0.113.12", 200, 40))
                 manager.preferred_tag = "vpngate-0"
                 manager.status["preferred_tag"] = "vpngate-0"
-                manager.backup_tag = "vpngate-1"
-                manager.status["backup_tag"] = "vpngate-1"
                 manager._auto_pinned = True
+                manager._chain_pin_at = 0.0
                 healthy = lambda host, port, timeout=5: 120
-                with _fake_singbox():
-                    result = manager.check_pinned_health(probe_fn=healthy)
+                with _fake_singbox(), \
+                     mock.patch.object(manager, "_chain_probe_ok",
+                                       return_value=False):
+                    first = manager.check_pinned_health(probe_fn=healthy)
+                    second = manager.check_pinned_health(probe_fn=healthy)
             finally:
                 manager.stop()
 
-        self.assertEqual("rescued", result)
+        self.assertEqual("pinned", first, "one failed probe must not repin")
+        self.assertEqual("rescued", second)
         self.assertEqual("vpngate-1", manager.preferred_tag)
-        self.assertIn("203.0.113.11", dial_calls)
 
-    def test_tunnel_alive_stays_pinned_without_probe(self) -> None:
-        """Real tunnel dial succeeds: pin stays, and no TCP-handshake
-        probe is consulted at all."""
+    def test_tunnel_alive_stays_pinned(self) -> None:
+        """A chain that still exits a real IP keeps its pin: the handshake
+        probe runs once and nothing is re-dialed."""
         probe_calls: list[tuple] = []
+        dial_calls: list[str] = []
 
         def _recording_probe(host, port, timeout=5):
             probe_calls.append((host, port))
@@ -5013,14 +5080,18 @@ class DeadPinTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             manager = self._manager(
-                tmpdir, dial_fn=lambda node: 66)
+                tmpdir,
+                dial_fn=lambda node: dial_calls.append(node["server"]) or 66)
             try:
                 self._seed_nodes(manager, ("203.0.113.11", 100, 30),
                                  ("203.0.113.12", 200, 40))
                 manager.preferred_tag = "vpngate-0"
                 manager.status["preferred_tag"] = "vpngate-0"
                 manager._auto_pinned = True
-                with _fake_singbox():
+                manager._chain_pin_at = 0.0
+                with _fake_singbox(), \
+                     mock.patch.object(manager, "_chain_probe_ok",
+                                       return_value=True):
                     result = manager.check_pinned_health(
                         probe_fn=_recording_probe)
             finally:
@@ -5028,7 +5099,8 @@ class DeadPinTests(unittest.TestCase):
 
         self.assertEqual("pinned", result)
         self.assertEqual("vpngate-0", manager.preferred_tag)
-        self.assertEqual([], probe_calls)
+        self.assertEqual([("203.0.113.11", 443)], probe_calls)
+        self.assertEqual([], dial_calls)
 
     def test_rescue_yields_to_manual_switch_mid_run(self) -> None:
         """A manual switch racing a slow dial+apply must win: the
@@ -5049,6 +5121,10 @@ class DeadPinTests(unittest.TestCase):
                 manager._auto_pinned = True
                 failing = lambda host, port, timeout=5: 0
 
+                # A manual switch must take the hot path here: the rescue
+                # runs `_commit_rescue` under `_config_lock`, and the cold
+                # switch path needs that same lock.
+                manager._repin_runtime = mock.Mock(return_value=True)
                 real_commit = manager._commit_rescue
 
                 def _commit_then_manual(round_id, best, second):
@@ -5088,11 +5164,18 @@ class DeadPinTests(unittest.TestCase):
         self.assertEqual("vpngate-1", manager.preferred_tag)
         self.assertIn("auto-pin", events)
 
-    def test_auto_pin_no_exit_ip_anywhere_keeps_pin(self) -> None:
-        """No candidate yields an exit IP: keep the current pin, record
-        the skip, do not rebuild the serving config."""
+    def test_an_existing_pin_is_never_re_verified(self) -> None:
+        """A full probe must not verify an existing pin: verification belongs
+        to the mux-riding health loop, and a throwaway client would open a
+        second VPNGate session (duplicate-cn) and kill the serving one."""
+        verify_calls: list[str] = []
+
+        def _verify(ep):
+            verify_calls.append(ep["server"])
+            return (None, None)
+
         with tempfile.TemporaryDirectory() as tmpdir:
-            manager = self._manager(tmpdir, verify_fn=lambda ep: (None, None))
+            manager = self._manager(tmpdir, verify_fn=_verify)
             try:
                 self._seed_nodes(manager, ("203.0.113.11", 100, 20),
                                  ("203.0.113.12", 200, 40))
@@ -5109,52 +5192,80 @@ class DeadPinTests(unittest.TestCase):
                 manager.stop()
 
         self.assertEqual("vpngate-0", manager.preferred_tag)
+        self.assertEqual([], verify_calls)
+        apply_mock.assert_not_called()
+        self.assertTrue(any(ev == "auto-pin-skipped" and "pin exists" in detail
+                            for ev, detail in events))
+
+    def test_no_exit_ip_anywhere_pins_nothing(self) -> None:
+        """Cold start with no candidate yielding an exit IP: pin nothing and
+        do not rebuild the serving config."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = self._manager(tmpdir, verify_fn=lambda ep: (None, None))
+            try:
+                self._seed_nodes(manager, ("203.0.113.11", 100, 20),
+                                 ("203.0.113.12", 200, 40))
+                with _fake_singbox(), \
+                     mock.patch.object(manager, "_apply_config",
+                                       return_value=True) as apply_mock:
+                    manager._auto_pin_best(manager._nodes, None)
+                    events = [(e["event"], e.get("detail", ""))
+                              for e in manager.status["refresh_history"]]
+            finally:
+                manager.stop()
+
+        self.assertIsNone(manager.preferred_tag)
         apply_mock.assert_not_called()
         self.assertTrue(any(ev == "auto-pin-skipped" and "exit ip" in detail
                             for ev, detail in events))
 
-    def test_tie_keep_reverifies_best_exit_ip(self) -> None:
-        """Pins unchanged but best must still prove its exit IP: best
-        lost its exit this round -> reselect to the alive backup."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            manager = self._manager(
-                tmpdir,
-                verify_fn=lambda ep: (None, None)
-                if ep["server"] == "203.0.113.11" else ("9.9.9.12", 11))
-            try:
-                self._seed_nodes(manager, ("203.0.113.11", 100, 20),
-                                 ("203.0.113.12", 200, 40))
-                manager.preferred_tag = "vpngate-0"
-                manager.status["preferred_tag"] = "vpngate-0"
-                manager.backup_tag = "vpngate-1"
-                manager.status["backup_tag"] = "vpngate-1"
-                manager._auto_pinned = True
-                with _fake_singbox(), \
-                     mock.patch.object(manager, "_apply_config",
-                                       return_value=True):
-                    manager._auto_pin_best(manager._nodes, "vpngate-0")
-            finally:
-                manager.stop()
-
-        self.assertEqual("vpngate-1", manager.preferred_tag)
-
-    def test_tie_keep_exit_ok_skips_without_flap(self) -> None:
-        """Pins unchanged and best still yields an exit IP: skip with
-        exactly one best-only verification, no config rewrite."""
+    def test_full_probe_never_repins_over_an_existing_pin(self) -> None:
+        """Even when the pin lost its exit IP this round, the full probe must
+        not reselect: the mux-riding health loop judges the pin, because it is
+        the only verifier that does not open a second VPNGate session."""
         verify_calls: list[str] = []
-        with tempfile.TemporaryDirectory() as tmpdir:
-            def _verify(ep):
-                verify_calls.append(ep["server"])
-                return ("9.9.9.9", 11)
 
+        def _verify(ep):
+            verify_calls.append(ep["server"])
+            if ep["server"] == "203.0.113.11":
+                return (None, None)
+            return ("9.9.9.12", 11)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
             manager = self._manager(tmpdir, verify_fn=_verify)
             try:
                 self._seed_nodes(manager, ("203.0.113.11", 100, 20),
                                  ("203.0.113.12", 200, 40))
                 manager.preferred_tag = "vpngate-0"
                 manager.status["preferred_tag"] = "vpngate-0"
-                manager.backup_tag = "vpngate-1"
-                manager.status["backup_tag"] = "vpngate-1"
+                manager._auto_pinned = True
+                with _fake_singbox(), \
+                     mock.patch.object(manager, "_apply_config",
+                                       return_value=True) as apply_mock:
+                    manager._auto_pin_best(manager._nodes, "vpngate-0")
+            finally:
+                manager.stop()
+
+        self.assertEqual("vpngate-0", manager.preferred_tag)
+        self.assertEqual([], verify_calls)
+        apply_mock.assert_not_called()
+
+    def test_a_healthy_pin_is_left_alone_by_the_probe(self) -> None:
+        """A pin whose exit still works is neither re-verified nor rewritten:
+        exactly one skip is recorded and the config is not rebuilt."""
+        verify_calls: list[str] = []
+
+        def _verify(ep):
+            verify_calls.append(ep["server"])
+            return ("9.9.9.9", 11)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = self._manager(tmpdir, verify_fn=_verify)
+            try:
+                self._seed_nodes(manager, ("203.0.113.11", 100, 20),
+                                 ("203.0.113.12", 200, 40))
+                manager.preferred_tag = "vpngate-0"
+                manager.status["preferred_tag"] = "vpngate-0"
                 manager._auto_pinned = True
                 with _fake_singbox(), \
                      mock.patch.object(manager, "_apply_config",
@@ -5166,10 +5277,9 @@ class DeadPinTests(unittest.TestCase):
                 manager.stop()
 
         self.assertEqual("vpngate-0", manager.preferred_tag)
-        self.assertEqual(["203.0.113.11"], verify_calls)
+        self.assertEqual([], verify_calls)
         apply_mock.assert_not_called()
-        self.assertIn("auto-pin-skipped", events)
-
+        self.assertEqual(1, events.count("auto-pin-skipped"))
 
 class MultiRemotePinTests(unittest.TestCase):
     """A pin with several remotes is dead only when every remote is dead.

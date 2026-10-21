@@ -133,13 +133,23 @@ class ScriptEntryTests(unittest.TestCase):
 
     def test_help_works_from_repo_root(self) -> None:
         repo = Path(__file__).resolve().parent.parent
-        proc = subprocess.run(
-            [sys.executable, "scripts/measure_dial_times.py", "--help"],
-            cwd=repo, capture_output=True, text=True, timeout=60)
+        # File-backed output: a confined test process cannot hand a pipe to a
+        # child process; the assertions read the same stdout/stderr.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_path = os.path.join(tmpdir, "help.out")
+            err_path = os.path.join(tmpdir, "help.err")
+            with open(out_path, "w", encoding="utf-8") as out, \
+                    open(err_path, "w", encoding="utf-8") as err:
+                proc = subprocess.run(
+                    [sys.executable, "scripts/measure_dial_times.py", "--help"],
+                    cwd=repo, stdout=out, stderr=err, text=True, timeout=60)
+            stdout = Path(out_path).read_text(encoding="utf-8",
+                                             errors="replace")
+            stderr = Path(err_path).read_text(encoding="utf-8",
+                                              errors="replace")
 
-        self.assertEqual(0, proc.returncode, proc.stderr)
-        self.assertIn("--csv", proc.stdout)
-
+        self.assertEqual(0, proc.returncode, stderr)
+        self.assertIn("--csv", stdout)
 
 if __name__ == "__main__":
     unittest.main()
