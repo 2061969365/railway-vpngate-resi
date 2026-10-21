@@ -3,6 +3,11 @@ name: Unit tests
 # The suite is timing sensitive (background probes, health loops, the 45s
 # warm-up grace), so every push runs it several times per interpreter: a
 # green run that only holds once is not green.
+#
+# The second job checks a generated config with the REAL sing-box: the unit
+# tests only see the config as a dict, so a field sing-box does not know
+# (a typo like "auth-retry" instead of "auth_retry") passes every test and
+# then makes the manager refuse to start in production.
 
 on:
   push:
@@ -39,3 +44,43 @@ jobs:
             git status --porcelain
             exit 1
           fi
+
+  singbox-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    name: sing-box accepts a generated config
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install sing-box ${{ env.SINGBOX_VERSION }}
+        env:
+          SINGBOX_VERSION: "1.14.0"
+        run: |
+          curl -fsSL -o /tmp/sing-box.tar.gz \
+            "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/sing-box-${SINGBOX_VERSION}-linux-amd64.tar.gz"
+          tar -xzf /tmp/sing-box.tar.gz -C /tmp
+          sudo install -m 755 "/tmp/sing-box-${SINGBOX_VERSION}-linux-amd64/sing-box" /usr/local/bin/sing-box
+          sing-box version
+      - name: Build a rotate config and let sing-box check it
+        run: |
+          python - <<'PY'
+          import json, sys
+          sys.path.insert(0, "tests")
+          from test_vpngate_to_singbox import TCP_OVPN
+          from vpngate_to_singbox import build_singbox_config, ovpn_to_endpoint
+          ep = ovpn_to_endpoint(TCP_OVPN, tag="vpngate-0")
+          cfg = build_singbox_config(
+              [ep], "127.0.0.1", 40000, mixed_users=[("u", "p")],
+              final="auto", preferred="vpngate-0", backup=None,
+              vless_uuid="u-u-i-d", vless_direct_port=8080,
+              vless_chain_port=8082, resi=None, resi_port=5180,
+              resi_path="/ws-resi", resi_rotate=True,
+              resi_rotate_tags=["vpngate-0"])
+          with open("/tmp/rotate.json", "w", encoding="utf-8") as handle:
+              json.dump(cfg, handle, indent=2)
+          print("endpoints:", [e["tag"] for e in cfg["endpoints"]])
+          print("outbounds:", [o.get("tag") for o in cfg["outbounds"]])
+          PY
+          sing-box check -c /tmp/rotate.json

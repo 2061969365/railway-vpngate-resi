@@ -86,7 +86,7 @@ class ConvertTcpTests(unittest.TestCase):
         # session rejected. With the default "none" that rejection is final
         # and the serving endpoint stays dead; the endpoint must retry the
         # authentication instead.
-        self.assertEqual("nointeract", ep["auth-retry"])
+        self.assertEqual("nointeract", ep["auth_retry"])
 
     def test_udp_only_config_raises(self) -> None:
         with self.assertRaises(ValueError):

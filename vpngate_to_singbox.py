@@ -267,7 +267,7 @@ def ovpn_to_endpoint(
         # healthy node turns into a corpse the chain has to walk past.
         # "nointeract" retries the authentication instead, so the endpoint
         # recovers as soon as the other session is gone.
-        "auth-retry": "nointeract",
+        "auth_retry": "nointeract",
         **_keepalive_fields(config_text),
         **({"remote_random": True} if _REMOTE_RANDOM_RE.search(config_text) else {}),
         "system": False,
