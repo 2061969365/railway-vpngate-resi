@@ -220,6 +220,7 @@ jobs:
               return out
 
           seen = set()
+          verified = {}
           markers = {"dialing_done": None, "pin": None, "pin_tag": None}
           with open(OUT, "a", buffering=1) as sink:
               while time.time() < DEADLINE:
@@ -237,6 +238,15 @@ jobs:
                       if markers["pin"] is None and st.get("preferred_tag"):
                           markers["pin"] = stamp
                           markers["pin_tag"] = st.get("preferred_tag")
+                      # The nodes the manager has already really dialed
+                      # (real_latency_ms is only set after a real dial). A
+                      # throwaway client that dials one of them opens a
+                      # SECOND VPNGate session for it - that is exactly what
+                      # the rotate cold start must not do.
+                      verified = {}
+                      for ep in (st.get("endpoints") or []):
+                          if ep.get("real_latency_ms") is not None and ep.get("server"):
+                              verified[ep["server"]] = ep.get("tag")
                       with open(MARK, "w", encoding="utf-8") as fh:
                           json.dump(markers, fh)
                   smap = serving_map()
@@ -250,6 +260,7 @@ jobs:
                           sink.write(json.dumps({
                               "t": stamp, "pid": pid, "config": cfg_path,
                               "target": target, "serving_tag": smap.get(host),
+                              "verified_tag": verified.get(host),
                           }) + "\n")
                   time.sleep(0.5)
           PY
@@ -393,9 +404,6 @@ jobs:
               assert ip != own, ("the chain leaked the container's own egress", ip, own)
           print("EXIT IP OK: the chain exits through the VPNGate node")
           EOF
-
-      - name: The cold start never dialed a serving node to choose the pin
-        run: |
           echo "=== container log: any verify-by-dial? ==="
           docker logs rotate-trial 2>&1 | grep -n "verify" || echo "(no 'verify' line in the container log)"
           if docker logs rotate-trial 2>&1 | grep -q "verify failed for"; then
@@ -405,37 +413,6 @@ jobs:
             exit 1
           fi
           echo "no 'verify failed for' line: no verify-by-dial ran"
-          docker exec rotate-trial cat /tmp/dial_events.jsonl > /tmp/dial_events.jsonl || true
-          docker exec rotate-trial cat /tmp/watch_markers.json > /tmp/watch_markers.json || true
-          wc -l /tmp/dial_events.jsonl
-          python3 - <<'EOF'
-          import json, pathlib
-          raw = pathlib.Path("/tmp/dial_events.jsonl").read_text().splitlines()
-          events = [json.loads(line) for line in raw if line.strip()]
-          markers = json.loads(pathlib.Path("/tmp/watch_markers.json").read_text())
-          print("markers:", markers)
-          print("throwaway sing-box clients that dialed a VPNGate node:", len(events))
-          for e in events:
-              print("  t=%.1f pid=%s target=%s serving_tag=%s" % (
-                  e["t"], e["pid"], e.get("target"), e.get("serving_tag")))
-          assert events, "the watcher saw no throwaway client at all: no evidence"
-          pin_t = markers.get("pin")
-          assert pin_t, markers
-          done_t = markers.get("dialing_done")
-          if done_t is None:
-              start = pin_t - 15.0
-          else:
-              start = done_t - 10.0
-          end = pin_t + 30.0
-          inside = [e for e in events if start <= e["t"] <= end]
-          print("pin decision window: %.1f .. %.1f" % (start, end))
-          print("throwaway VPNGate dials inside the pin window: %d" % len(inside))
-          for e in inside:
-              print("  VIOLATION t=%.1f target=%s serving_tag=%s" % (
-                  e["t"], e.get("target"), e.get("serving_tag")))
-          assert not inside, ("a throwaway client dialed a VPNGate node while the pin was decided", inside)
-          print("NO DIAL-TO-PIN OK: the cold start pinned without a verify-by-dial")
-          EOF
 
       - name: Let the pin and sing-box settle before the kill
         run: |
@@ -535,6 +512,51 @@ jobs:
           EOF
             sleep 10
           done
+
+      - name: No throwaway client dialed an already measured node
+        if: always()
+        run: |
+          docker exec rotate-trial cat /tmp/dial_events.jsonl > /tmp/dial_events.jsonl || true
+          docker exec rotate-trial cat /tmp/watch_markers.json > /tmp/watch_markers.json || true
+          wc -l /tmp/dial_events.jsonl
+          python3 - <<'EOF'
+          import json, pathlib
+          raw = pathlib.Path("/tmp/dial_events.jsonl").read_text().splitlines()
+          events = [json.loads(line) for line in raw if line.strip()]
+          markers = json.loads(pathlib.Path("/tmp/watch_markers.json").read_text())
+          print("markers:", markers)
+          print("throwaway sing-box clients that dialed a VPNGate node:", len(events))
+          for e in events:
+              print("  t=%.1f pid=%s target=%s serving_tag=%s verified_tag=%s" % (
+                  e["t"], e["pid"], e.get("target"), e.get("serving_tag"), e.get("verified_tag")))
+          assert events, "the watcher saw no throwaway client at all: no evidence"
+          pin_t = markers.get("pin")
+          assert pin_t, markers
+          done_t = markers.get("dialing_done")
+          # The rule is the product's own: a throwaway client may dial a node
+          # the manager has NOT really dialed yet (that is the full probe
+          # filling the pool), but it must never dial a node that is already
+          # measured - that node holds the only VPNGate session it is allowed
+          # to have, and a second one kicks it (duplicate-cn). The pre-fix
+          # cold start did exactly that: verify_fn on the measured candidates.
+          violations = [e for e in events if e.get("verified_tag")]
+          start = (done_t if done_t is not None else pin_t - 15.0)
+          end = pin_t + 30.0
+          inside = [e for e in events if start <= e["t"] <= end]
+          print("pin decision window: %.1f .. %.1f" % (start, end))
+          print("throwaway VPNGate dials inside the pin window: %d" % len(inside))
+          for e in inside:
+              print("  in-window t=%.1f target=%s serving_tag=%s verified_tag=%s" % (
+                  e["t"], e.get("target"), e.get("serving_tag"), e.get("verified_tag")))
+          print("throwaway dials of an ALREADY MEASURED node: %d" % len(violations))
+          for e in violations:
+              print("  VIOLATION t=%.1f target=%s serving_tag=%s verified_tag=%s" % (
+                  e["t"], e.get("target"), e.get("serving_tag"), e.get("verified_tag")))
+          assert not violations, (
+              "a throwaway client dialed a node the manager had already measured "
+              "(a second VPNGate session for a node that is serving)", violations)
+          print("NO DIAL-TO-PIN OK: the cold start pinned without a verify-by-dial")
+          EOF
 
       - name: Dump the evidence
         if: always()
