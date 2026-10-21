@@ -463,10 +463,9 @@ jobs:
           done
           [ -n "$chain_ip" ] || { echo "chain never recovered after both reserved nodes died"; docker logs rotate-trial 2>&1 | tail -n 80; exit 1; }
           RESCUES=$(docker logs rotate-trial 2>&1 | grep -c "chain rescue:" || true)
-          echo "chain rescues now: $RESCUES"
-          echo "--- chain rescue log ---"
+          echo "chain rescue log lines: $RESCUES"
+          echo "--- chain/repin log ---"
           docker logs rotate-trial 2>&1 | grep -E "chain rescue|chain rescue skipped|config rewritten|full probe done" | tail -n 20 || true
-          docker logs rotate-trial 2>&1 | grep -E "chain rescue:" > /tmp/rescue.log || true
           curl -m 10 -s -H "Authorization: Bearer $ADMIN_TOKEN" \
             http://127.0.0.1:3000/api/status -o /tmp/status_after.json
           python3 - <<'EOF'
@@ -481,13 +480,21 @@ jobs:
                       killed.add(line.split()[1])
           pin, backup = status.get("preferred_tag"), status.get("backup_tag")
           print(f"pin {pin_before} -> {pin}, backup {backup_before} -> {backup}, killed={sorted(killed)}")
+          # Some rescue, no matter which branch triggered it: the chain-probe
+          # rescue records `chain-rescue`, the dead-handshake fast rescue records
+          # `auto-rescue`/`auto-rescue-stale`. Both must move off the killed pair.
+          history = status.get("refresh_history") or []
+          events = [h["event"] for h in history]
+          print("recent events:", events[-10:])
+          rescues = [e for e in events
+                     if e in ("chain-rescue", "auto-rescue", "auto-rescue-stale")]
+          assert rescues, f"no rescue was recorded: {events}"
+          assert len(rescues) <= 3, f"rescue looped {len(rescues)} times: {events}"
           assert pin not in (None, pin_before, backup_before), (pin, pin_before, backup_before)
           assert backup and backup not in (pin, pin_before, backup_before), (pin, backup)
           assert pin not in killed and backup not in killed, killed
-          rescues = len(pathlib.Path("/tmp/rescue.log").read_text().splitlines())
-          assert 1 <= rescues <= 2, f"chain rescue looped {rescues} times"
           r = status["resi"]
-          print(f"resi after: pool={r['pool']} down={r.get('down')}")
+          print(f"resi after: pool={r['pool']} down={r.get('down')} events={rescues}")
           print("RESCUE OK: both reserved nodes were dead and the chain moved to a new pair")
           EOF
 
