@@ -620,6 +620,19 @@ VPNGate 一个节点只允许一个会话，预留即意味着轮换永远不能
   OpenVPN 会话，宽限期内探针失败不算数。没有这条时每次切换都在"新节点还没连上"时被判死，
   于是整池逐个走一遍、chain 永远不收敛（云端验收第一次就是这么挂的）。
 - chain 探针超时从 8s 提到 12s，给首包留余量。
+- **服务中验证必须走 mux，不能另起客户端拨 pin**（`_served_exit_ip`）。验证一个"已服务"节点
+  的正确做法是像 `_chain_probe_ok` 那样开一条客户端连接打自己的 mux，复用它已有的会话；
+  用 `measure_exit_ip` 另起进程直拨该节点会开**第二个 VPNGate 会话**，服务端 duplicate-cn
+  会把正在服务的那条踢掉——"验证"本身把链接杀了，于是验证循环变成"每次验证 chain 就死"。
+  这条以前也埋在 D13 里（旧代码把 pin 当验证目标直拨），与"手动切一下就好了"吻合。
+
+**云端实测（16 节点 / REAL_TOPK=10，连杀两轮 pin）**：
+
+```
+round 1  杀 vpngate-0(47.188.79.92)  96s 后 chain=ips=36.12.175.158  now=vpngate-1 switches=1 md5 不变 pool=13
+round 2  杀 vpngate-1(36.12.175.158) 90s 后 chain=ips=219.100.37.238 now=vpngate-2 switches=2 md5 不变 pool=13
+         /ws-node 全程 172.215.211.49 不变；每轮 pid 有变（supervisor 重启），但配置 md5 一个字节没变
+```
 - 重启后 pin 的恢复：sing-box 起在配置里的 `default` 上，`_reapply_pin_when_ready()`
   在 API 就绪后把运行时 pin 重新选回去。
 - 预留数回到 1 ⇒ 轮换池与 D13 完全一致；`backup_tag` 在 rotate 模式下恒为 `None`

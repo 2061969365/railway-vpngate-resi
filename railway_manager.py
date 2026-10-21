@@ -1822,6 +1822,7 @@ class RailwayManager:
         self.dial_fn = (dial_fn if dial_fn is not None else (lambda node: measure_real_latency(node["endpoint"], self.singbox_bin, self.dial_timeout)))
         self.dial_workers = dial_workers; self.full_probe_workers = max(1, full_probe_workers); self.probe_workers = probe_workers
         self.dial_timeout = dial_timeout; self.auto_repin = auto_repin; self.auto_rescue = auto_rescue
+        self._verify_custom = verify_fn is not None
         self.verify_fn = (verify_fn if verify_fn is not None else (lambda endpoint: measure_exit_ip(endpoint, self.singbox_bin, self.dial_timeout)))
         self.config_path = config_path; self.nodes_path = nodes_path; self.state_path = state_path; self.settings_path = settings_path
         self.last_good_path = f"{config_path}.last-good"; self.singbox_bin = singbox_bin
@@ -2724,6 +2725,29 @@ class RailwayManager:
         except Exception:
             result = None
         return bool(result and result.get("ips"))
+
+    def _served_exit_ip(self) -> tuple[str | None, int | None]:
+        """Exit IP of the chain exactly as served, measured through our mux.
+
+        Verifying the pin with a throwaway client (`measure_exit_ip`) opens a
+        SECOND VPNGate session for that node. duplicate-cn is off server side,
+        so the login kicks the session the chain is using: the verification
+        itself kills the thing it was meant to check, and a verification loop
+        turns into "chain dies every time it gets verified". Riding the mux
+        reuses the session the chain already holds.
+        """
+        if not (self.resi_rotate and self.vless_uuid):
+            return None, None
+        try:
+            got = measure_resi_rotate(
+                self.vless_uuid, self.port, self.vless_chain_path,
+                count=1, singbox_bin=self.singbox_bin,
+                timeout=CHAIN_PROBE_TIMEOUT)
+        except Exception:
+            got = None
+        if not got or not got.get("ips"):
+            return None, None
+        return got["ips"][0], got.get("first_ms")
 
     def _chain_candidates_locked(self, now: float) -> list[dict]:
         """Nodes the chain may be pinned to, best evidence first.
@@ -3688,8 +3712,14 @@ class RailwayManager:
         tag = node.get("endpoint", {}).get("tag")
         endpoint = node.get("endpoint") or node
         try:
-            result = self.verify_fn(endpoint)
-            exit_ip, ms = result if result else (None, None)
+            if self.resi_rotate and not self._verify_custom:
+                # Rotate mode: never dial the pinned node with a throwaway
+                # client (it would kick the live session). Measure the served
+                # chain through the mux instead.
+                exit_ip, ms = self._served_exit_ip()
+            else:
+                result = self.verify_fn(endpoint)
+                exit_ip, ms = result if result else (None, None)
             error = None if exit_ip else "no exit ip measured"
         except Exception as exc:
             exit_ip, ms = None, None

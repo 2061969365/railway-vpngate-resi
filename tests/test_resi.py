@@ -892,6 +892,31 @@ class RotateManagerTests(unittest.TestCase):
 
         self.assertEqual("vpngate-c", pinned)
 
+    def test_served_verification_rides_the_mux_instead_of_dialing_the_pin(self) -> None:
+        # A throwaway client dialing the pinned node opens a second VPNGate
+        # session; duplicate-cn kicks the live one, so the verification killed
+        # the chain it was checking. Rotate mode must measure the served path.
+        manager = self._manager()
+        try:
+            node = {"real_latency_ms": 10, "endpoint": _endpoint("vpngate-a")}
+            manager._nodes = [node]
+            manager.preferred_tag = "vpngate-a"
+            manager.status["preferred_tag"] = "vpngate-a"
+            with mock.patch.object(manager, "verify_fn") as verify_fn, \
+                    mock.patch("railway_manager.measure_resi_rotate",
+                               return_value={"ips": ["1.2.3.4"], "first_ms": 130}) as probe:
+                manager._run_verify(node, manager._verify_generation)
+            status = manager.status["verify"]
+        finally:
+            manager.stop()
+            self._cleanup(manager)
+
+        verify_fn.assert_not_called()          # no second VPNGate session
+        probe.assert_called_once()             # measured through the mux
+        self.assertEqual("done", status["state"])
+        self.assertEqual("1.2.3.4", status["exit_ip"])
+        self.assertEqual(130, status["ms"])
+
     def test_a_fresh_pin_gets_a_warmup_grace(self) -> None:
         # A repin points sing-box at an endpoint whose VPN session still has to
         # be established. Judging it in that window failed every probe and
