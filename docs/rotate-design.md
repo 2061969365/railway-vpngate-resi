@@ -925,3 +925,45 @@ pytest (3.13)  567 passed, 2 skipped in 104.60s
 
 本地（Windows）同 commit：567 passed / 2 skipped / 0 failed，收尾不再出现 abort。
 
+### 12.17 让套件自己站得住：离线、无真定时器、按不变量断言（2026-10-21）
+
+CI 变绿之后又做了一轮"把不确定性从套件里赶出去"（抖动排查：CI 7 轮 × 6 job = **42 次
+完整套件 0 失败**，本地 6 轮 0 失败；过程中挖出 6 处真问题）。它们都不是"偶发红"，
+而是**套件依赖机器**：
+
+| 问题 | 后果 | 修法 |
+|---|---|---|
+| 救援路径会触发后台 refresh，用的是默认 fetcher | 每次跑测试**真的连 VPNGate 线上 API 约 15 次**；装了 sing-box 的机器还会**真开 OpenVPN 会话**；后台 refresh 会在用例中途换掉节点表 | 模块级 stub 掉 `default_fetch`（直接抛错）与 `measure_real_latency`（返回 None，等价于"拨失败"） |
+| `probe_tcp_latency` 真的去连 TEST-NET-3 | Windows 上每次白等 5s 超时（5~7 条用例） | 模块级 stub 成 0；需要"活握手"的用例自己 patch |
+| 一条用例用默认 verify_fn | mock 掉 Popen 后 verify 空转到超时 ⇒ 该用例 30s、join 超时没人查、**后台探测线程泄漏到后面的用例**、Windows 退出时报 PermissionError | 该用例 stub `verify_fn`，并断言探测线程已结束 |
+| 采样 pin 与探测状态时没有同一把锁 | 探测先提交 pin 再置 done，采样落在 ~1ms 窗口里就翻（≈2%/轮） | 断言**不变量**："pin 不得在所有节点测完之前出现"，采样在同一把锁下 |
+| 临时文件名用 `id(self)` | CPython 会复用地址 ⇒ 后一轮覆盖前一轮的文件 | 文件名带上 pid |
+| `start()` 在用例里武装了真的 supervise/health 定时器 | 慢机器上可能在用例中途触发 | 模块级把 `SUPERVISE_INTERVAL` 拉长、health monitor 换成空实现（其函数体由直接调用 `check_pinned_health` 的用例覆盖） |
+
+结果：本地全量从 **222.8s 降到 101.8s**——和 CI runner 的 104.9s 对齐了，之前
+Windows 与 Linux 相差 2.1 倍的"平台分叉"消失（那 2.1 倍里一半就是上面这些真等待）。
+套件现在：**不联网、不看机器装了什么、不依赖真定时器**。
+
+### 12.18 云端端到端验收（rotate 冷启动 + 链自愈）
+
+验收 workflow（`.github/workflows/test-chain-acceptance.yml`，`workflow_dispatch` 手动触发，
+真容器 + 真 VPNGate 节点）验证 `46c5953` 那个产品改动：rotate 冷启动**不得**为了选 pin
+而另起客户端直拨节点（第二个 VPNGate 会话 ⇒ duplicate-cn 踢掉正在服务的那条）。
+
+已验证通过的判据（run 39645331362）：
+
+- 容器日志里**没有** `verify failed for` ⇒ 冷启动选 pin 时确实没有 verify 直拨；
+- `refresh_history` 里有 `auto-pin-unverified`、**没有** `auto-pin` ⇒ 走的是 rotate 兜底路径
+  （`auto-pin` 才是"verify 直拨选 pin"的签名）；
+- `backup_tag` 为 `None`、`resi.reserved == 1`、`chain_switch.mode == "clash"`；
+- Clash selector 的 `now` == `preferred_tag`，且 selector 里**没有** `auto`（链没有退回
+  全体 urltest）；
+- `/ws-chain` 在容器 ready 后 90s 内拿到**真实出口 IP**，且该 IP ≠ 容器自身出口。
+
+**一个必须写下来的最坏情况**：当**所有**候选节点都死了（例如验收脚本按整片 IP 封禁，
+把共用同一出口 IP 的多个节点一起打死），救援会**逐个试尸体**——每个候选要 2 次隧道探针
+失败（`CHAIN_FAIL_THRESHOLD=2`，约 40s）才换下一个，实测链自愈用了 **376s**。
+这是"池子空了"的最坏情况，不是常态：只死一个节点、其余健康时，救援命中
+"最近答过话"的节点（`_chain_candidates_locked` 的 proven/answered 桶），应远快于此。
+若要缩短这个最坏情况，方向是**并发试探多个候选**，而不是改判定阈值。
+
