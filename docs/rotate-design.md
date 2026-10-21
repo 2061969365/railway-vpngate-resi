@@ -1050,6 +1050,22 @@ serving 入口测量**（轮换的 loopback inbound，和 `_chain_probe_ok` / `_
 （"没连上 / 被踢 / 连上但隧道里出不去"三者分别可辨）、⑤容器内 `iptables -S OUTPUT`
 （证明只封了被 kill 的那一个 (ip,port)）、⑥serving 进程到各 VPNGate 端口的连接状态。
 
+**第 ④ 层已被推进了两格**（验收 run 39674001565 / 39679050284 的逐项采样）：
+
+- **"第二个 VPNGate 会话"的入口清零**：rotate 模式 refresh 也不再拨节点（`454999b`）⇒
+  watcher 抓到的直拨 VPNGate 节点的 throwaway 客户端 **17 → 0**；
+- 但 **"隧道 up" ≠ "隧道能出货"**：kill 之前 16 个 endpoint 里 15 个 TCP ESTABLISHED、
+  只有 7 个拿到隧道地址（`tunnel_up`），而 `delay` **全败**——**连一个"隧道 up"的
+  reference 节点（vpngate-0）delay 都是 0/131** ⇒ 隧道建起来了却不载流；
+- 由此暴露一个**选候选的口径问题**：管理器选的候选（vpngate-11/13/2…）**不在**
+  `tunnel_up` 集合里 ⇒ "real_latency_ms / 健康度"与"这个节点此刻真能出货"**不对齐**。
+
+下一步是**纯采样 + 容器内对照实验**（不动产品代码）：逐节点直连测（每个节点的 rotate
+inbound 端口 41000+i 各抓一次出口 IP）把"节点层"和"路由/选择器层"分开；再在容器里把
+"auto" urltest 组缩到 1 个成员（或把 interval 从 15s 改成 3600s）做对照——rotate 模式
+现在给 16 个成员做 URL 测试，等于同时压着 16 条 OpenVPN 会话，"隧道 up 却不载流"与
+这个现象高度吻合。若对照实验证实，产品侧的修法是**rotate 模式不发 16 成员的 urltest 组**。
+
 **CI 侧的护栏**（都已在 main 上）：
 
 - `unit-tests.yml` 的 `pytest` job：3.12/3.13 × 3 遍 = 6 个 job，每遍跑全套，并且**测试不许
