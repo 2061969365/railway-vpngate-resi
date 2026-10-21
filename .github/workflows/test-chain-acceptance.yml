@@ -371,6 +371,7 @@ jobs:
           sink = open(OUT, "a", buffering=1)
           current = {"now": None}
           log_lines = {}
+          tag_state = {}
           log_offset = 0
 
           def write(obj):
@@ -444,6 +445,8 @@ jobs:
                       sample["all"] = None
                       sample["error"] = type(exc).__name__
                   sample["tcp"] = tcp_states()
+                  with lock:
+                      sample["tunnel"] = dict(tag_state)
                   write(sample)
                   time.sleep(5)
 
@@ -489,8 +492,18 @@ jobs:
                   for line in data.decode("utf-8", "replace").splitlines():
                       if "openvpn-client[" in line:
                           tag = line.split("openvpn-client[")[1].split("]")[0]
+                          # "inbound packet connection" = the client got its
+                          # tunnel address (the tunnel is up); "not ready yet"
+                          # and "client terminated" = it is not.
+                          verdict = None
+                          if "not ready yet" in line or "client terminated" in line:
+                              verdict = "down"
+                          elif "inbound packet connection" in line:
+                              verdict = "up"
                           with lock:
                               log_lines.setdefault(tag, deque(maxlen=8)).append(line[-200:])
+                              if verdict:
+                                  tag_state[tag] = verdict
                   now = current.get("now")
                   if now:
                       with lock:
@@ -844,8 +857,12 @@ jobs:
           for s in states:
               tcp = s.get("tcp") or {}
               est = sorted(t for t, v in tcp.items() if "ESTABLISHED" in v)
-              print("  t=%.0f now=%s all=%s tcp_established=%s" % (
-                  s["t"], s.get("now"), len(s.get("all") or []), ",".join(est)))
+              tunnel = s.get("tunnel") or {}
+              ups = sorted(t for t, v in tunnel.items() if v == "up")
+              downs = sorted(t for t, v in tunnel.items() if v == "down")
+              print("  t=%.0f now=%s all=%s tcp_established=%d tunnel_up=%s tunnel_down=%s" % (
+                  s["t"], s.get("now"), len(s.get("all") or []), len(est),
+                  ",".join(ups), ",".join(downs)))
           print("--- the delay tests (chain group / current node / reference) ---")
           for s in delays:
               print("  t=%.0f chain=%s now=%s now_delay=%s ref=%s ref_delay=%s" % (
