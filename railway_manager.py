@@ -55,7 +55,12 @@ PINNED_FAIL_THRESHOLD = 3
 CHAIN_FAIL_THRESHOLD = 2
 CHAIN_RESCUE_COOLDOWN = 30.0
 CHAIN_RESCUE_COOLDOWN_MAX = 120.0
-CHAIN_PROBE_TIMEOUT = 8.0
+CHAIN_PROBE_TIMEOUT = 12.0
+# A freshly pinned endpoint has to establish its OpenVPN session before the
+# chain can carry traffic. Judging it inside that window repinned the chain in
+# a loop (every probe "failed", the pool walked node by node, and the chain
+# never settled) - so a new pin gets this much grace before probes may fail it.
+CHAIN_SETTLE_GRACE = 45.0
 # A pin that just failed the end-to-end probe must not be picked again for a
 # while: with two dead nodes at the top of the ranking the rescue used to
 # bounce A -> B -> A forever while the cooldown grew to five minutes, i.e. the
@@ -1836,6 +1841,9 @@ class RailwayManager:
         self._cpu_model = _cpu_model(); self._cpu_cores = os.cpu_count(); self._cpu_last = None
         self._fail_streak = 0; self._pinned_fail_streak = 0; self._rescue_round = 0; self._crash_streak = 0; self._retry_after = 0.0; self._mixed_fail_streak = 0; self._mixed_retry_after = 0.0; self._health_mixed_streak = 0; self._refresh_generation = 0
         self._chain_fail_streak = 0; self._chain_rescue_at = 0.0; self._chain_rescue_attempts = 0
+        # 0 = no pin yet, so the very first health tick is not treated as a
+        # warm-up window (a restored pin gets a stamp in load_persisted).
+        self._chain_pin_at = 0.0
         # Pin whose dead handshake was already announced as "standby carries the
         # chain": the handshake failure repeats every tick, the history line must
         # not.
@@ -2498,6 +2506,10 @@ class RailwayManager:
             else:
                 self.preferred_tag = preferred; self.backup_tag = None if self.resi_rotate else backup
             self._auto_pinned = auto_pinned
+            if preferred:
+                # A restored pin starts a fresh process: give its endpoint the
+                # same warm-up window a repin gets.
+                self._chain_pin_at = time.monotonic()
         return nodes, preferred
     def _boot_from_last_good(self) -> bool:
         try:
@@ -2835,6 +2847,7 @@ class RailwayManager:
             node = next((n for n in self._nodes if n.get("endpoint", {}).get("tag") == tag), None) if tag else None
             self._rescue_round += 1
             round_id = self._rescue_round
+            warmed = (time.monotonic() - self._chain_pin_at) < CHAIN_SETTLE_GRACE
         if tag is None:
             return "no-preferred"
         if node is None:
@@ -2879,6 +2892,10 @@ class RailwayManager:
                     self._chain_rescue_attempts = 0
                     # This node carries the chain again: it is not dead.
                     self._chain_dead_until.pop(tag, None)
+                elif warmed:
+                    # Too early to judge: the endpoint may still be dialing.
+                    self._chain_fail_streak = 0
+                    chain_streak = 0
                 else:
                     self._chain_fail_streak += 1
                     chain_streak = self._chain_fail_streak
@@ -2894,6 +2911,10 @@ class RailwayManager:
         with self._lock:
             self._pinned_fail_streak += 1
             streak = self._pinned_fail_streak
+        if warmed:
+            # Same reason as above: a pin we just moved to needs time to come
+            # up before its handshake failure means anything.
+            return "pinned"
         if self.want_singbox and self._chain_probe_ok():
             # The pin's handshake is gone, but the chain still exits a real IP
             # (a hot switch already moved the selector). Repinning here would
@@ -2991,6 +3012,7 @@ class RailwayManager:
                 self._record_history("auto-pin-skipped", "manual switch won the race")
                 return False
             self.preferred_tag = best; self.backup_tag = second; self._auto_pinned = True
+            self._chain_pin_at = time.monotonic()
             self.status["preferred_tag"] = best; self.status["backup_tag"] = second; self.status["auto_pinned"] = True
             self._persist_state()
             return True
@@ -3022,6 +3044,7 @@ class RailwayManager:
             with self._lock:
                 old = self.preferred_tag
                 self.preferred_tag = target; self.backup_tag = None; self._auto_pinned = False
+                self._chain_pin_at = time.monotonic()
                 self.status["preferred_tag"] = target; self.status["backup_tag"] = None; self.status["auto_pinned"] = False
                 self._rescue_round += 1; self._persist_state()
         else:
@@ -3033,6 +3056,7 @@ class RailwayManager:
                 with self._lock:
                     old = self.preferred_tag
                     self.preferred_tag = target; self.backup_tag = None; self._auto_pinned = False
+                    self._chain_pin_at = time.monotonic()
                     self.status["preferred_tag"] = target; self.status["backup_tag"] = None; self.status["auto_pinned"] = False
                     self._rescue_round += 1; self._persist_state()
             finally:
@@ -3561,6 +3585,7 @@ class RailwayManager:
                             self._record_history("auto-pin-skipped", "pin won the race")
                             return
                         self.preferred_tag = pinned; self.backup_tag = pinned_second; self._auto_pinned = True
+                        self._chain_pin_at = time.monotonic()
                         self.status["preferred_tag"] = pinned; self.status["backup_tag"] = pinned_second; self.status["auto_pinned"] = True
                         self._persist_state()
                 self._invalidate_verify(f"auto-pinned to {pinned} (unverified, rotate mode)")
@@ -3578,6 +3603,7 @@ class RailwayManager:
                     self._apply_config(final="auto", preferred=self.preferred_tag, backup=self.backup_tag)
                     return
                 self.preferred_tag = pinned; self.backup_tag = pinned_second; self._auto_pinned = True
+                self._chain_pin_at = time.monotonic()
                 self.status["preferred_tag"] = pinned; self.status["backup_tag"] = pinned_second; self.status["auto_pinned"] = True
                 self._persist_state()
         self._invalidate_verify(f"auto-pinned to {pinned}")

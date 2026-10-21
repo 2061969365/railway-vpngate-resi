@@ -616,6 +616,10 @@ VPNGate 一个节点只允许一个会话，预留即意味着轮换永远不能
   候选集按 tag 排序写进配置（字节稳定，不会因为排序变化触发重写）。
 - 换 pin = `PUT /proxies/chain {"name": tag}`（Clash API 绑 `127.0.0.1:$CLASH_API_PORT`，
   带随机 secret）。**不写文件、不重启、不断连接**，所以轮换侧完全无感。
+- **新 pin 有 45s 预热宽限**（`CHAIN_SETTLE_GRACE`）：刚切过去的 endpoint 还要建立自己的
+  OpenVPN 会话，宽限期内探针失败不算数。没有这条时每次切换都在"新节点还没连上"时被判死，
+  于是整池逐个走一遍、chain 永远不收敛（云端验收第一次就是这么挂的）。
+- chain 探针超时从 8s 提到 12s，给首包留余量。
 - 重启后 pin 的恢复：sing-box 起在配置里的 `default` 上，`_reapply_pin_when_ready()`
   在 API 就绪后把运行时 pin 重新选回去。
 - 预留数回到 1 ⇒ 轮换池与 D13 完全一致；`backup_tag` 在 rotate 模式下恒为 `None`

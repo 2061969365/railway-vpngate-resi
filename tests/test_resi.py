@@ -892,6 +892,34 @@ class RotateManagerTests(unittest.TestCase):
 
         self.assertEqual("vpngate-c", pinned)
 
+    def test_a_fresh_pin_gets_a_warmup_grace(self) -> None:
+        # A repin points sing-box at an endpoint whose VPN session still has to
+        # be established. Judging it in that window failed every probe and
+        # walked the whole pool without the chain ever settling.
+        manager = self._manager()
+        try:
+            manager._nodes = [
+                {"real_latency_ms": 10, "endpoint": _endpoint("vpngate-a")},
+                {"real_latency_ms": 20, "endpoint": _endpoint("vpngate-b")},
+            ]
+            with manager._lock:
+                manager.preferred_tag = "vpngate-b"
+                manager.status["preferred_tag"] = "vpngate-b"
+                manager._chain_pin_at = time.monotonic()
+            with mock.patch("railway_manager.probe_tcp_latency", return_value=25), \
+                    mock.patch.object(RailwayManager, "_chain_probe_ok", return_value=False), \
+                    mock.patch.object(RailwayManager, "_apply_config") as apply_cfg, \
+                    mock.patch.object(RailwayManager, "_invalidate_verify"):
+                states = [manager.check_pinned_health() for _ in range(4)]
+            pinned = manager.preferred_tag
+        finally:
+            manager.stop()
+            self._cleanup(manager)
+
+        self.assertEqual(["pinned"] * 4, states)
+        self.assertEqual("vpngate-b", pinned)
+        apply_cfg.assert_not_called()
+
     def test_chain_rescue_walks_the_pool_instead_of_bouncing(self) -> None:
         # Two dead nodes on top of the stale ranking made the rescue bounce
         # A -> B -> A while the cooldown doubled to five minutes: the chain
@@ -914,6 +942,7 @@ class RotateManagerTests(unittest.TestCase):
                     mock.patch.object(RailwayManager, "_invalidate_verify"):
                 for _ in range(3):
                     manager._chain_rescue_at -= 10 ** 6   # let the cooldown expire
+                    manager._chain_pin_at = 0.0           # and the warm-up grace
                     manager.check_pinned_health()
                     manager.check_pinned_health()
                     pins.append(manager.preferred_tag)

@@ -1155,6 +1155,8 @@ class PinnedHealthTests(unittest.TestCase):
                                      return_value=100):
                         self.assertTrue(manager.refresh_once())
                     manager.switch(tag="vpngate-0")
+                    # The pin has been in place for a while: no warm-up grace.
+                    manager._chain_pin_at = 0.0
 
                     failing = lambda host, port, timeout=5: 0
                     with mock.patch.object(manager, "dial_fn",
@@ -1221,6 +1223,7 @@ class PinnedHealthTests(unittest.TestCase):
                                 "203.0.113.11", "203.0.113.12",
                                 "203.0.113.13")))
                     manager.switch(tag="vpngate-0")
+                    manager._chain_pin_at = 0.0   # pin is old: no warm-up grace
                     # Simulate an auto pin (not operator-held).
                     manager._auto_pinned = True
                     by_server = {n["server"]: n for n in manager._nodes}
@@ -4068,6 +4071,7 @@ class AutoPinFlagTests(unittest.TestCase):
                         fetcher=lambda url, timeout: _snapshot_csv(
                             "203.0.113.11", "203.0.113.12")))
                     manager.switch(tag="vpngate-0")
+                    manager._chain_pin_at = 0.0   # pin is old: no warm-up grace
                     by_server = {n["server"]: n for n in manager._nodes}
                     by_server["203.0.113.11"]["real_latency_ms"] = 70
                     by_server["203.0.113.12"]["real_latency_ms"] = 30
