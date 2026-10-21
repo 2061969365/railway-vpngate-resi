@@ -35,6 +35,8 @@ from vpngate_to_singbox import (
     render_resi_username,
     snapshot_to_nodes,
 )
+
+
 def _safe_print(text: str, flush: bool = True) -> None:
     """print() that cannot take the process down during shutdown.
 

@@ -2,6 +2,7 @@
 import base64
 import contextlib
 import inspect
+import io
 import json
 import os
 import re
@@ -5604,6 +5605,38 @@ class RescueRoundTests(unittest.TestCase):
         self.assertEqual("vpngate-1", manager.preferred_tag)
         self.assertEqual("vpngate-0", manager.backup_tag)
         self.assertTrue(manager._auto_pinned)
+
+
+class LoggingTests(unittest.TestCase):
+    """A background thread must not log after the manager stopped.
+
+    Logging while the interpreter is finalizing races it for the stdout
+    lock, and CPython 3.13 then aborts the whole process
+    (`_enter_buffered_busy`, exit 134). The cloud CI run caught it with
+    every test green, so the guard needs a test of its own.
+    """
+
+    def test_background_logs_stop_when_the_manager_stops(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = RailwayManager(
+                port=0, mixed_port=get_free_port(), start_singbox=False,
+                auto_refresh=False, fetch_on_start=False,
+                config_path=f"{tmpdir}/singbox.json",
+                nodes_path=f"{tmpdir}/nodes.json",
+                state_path=f"{tmpdir}/state.json")
+            try:
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    manager._log("before stop")
+                self.assertIn("before stop", buf.getvalue())
+
+                manager.stop()
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    manager._log("after stop")
+                self.assertNotIn("after stop", buf.getvalue())
+            finally:
+                manager.stop()
 
 
 if __name__ == "__main__":
