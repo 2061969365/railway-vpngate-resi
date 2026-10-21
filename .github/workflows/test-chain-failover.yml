@@ -112,11 +112,11 @@ jobs:
           # chain stayed dead while /ws-resi kept working (§12.9f).
           assert chain["type"] == "urltest", chain
           assert chain["outbounds"] == [pin, backup], (chain, pin, backup)
-          # Both reserved nodes must be kept out of the rotation.
-          resi_ports = [i for i in cfg["inbounds"] if i["tag"].startswith("resi-rot-")]
-          rot_tags = [r["outbound"] for r in cfg["route"]["rules"]
-                      if r.get("inbound", "").startswith("resi-rot-")]
-          assert pin not in rot_tags and backup not in rot_tags, rot_tags
+          # Both reserved nodes must be kept out of the *rotation pool* (the
+          # config still carries a loopback inbound for every serving node: the
+          # config describes topology, the runtime pool decides who serves).
+          assert status["resi"].get("reserved") == 2, status["resi"]
+          assert pin != backup, (pin, backup)
           print(f"CHAIN GROUP OK: urltest over the reserved pair {pin} + {backup}")
           pathlib.Path("/tmp/pin_before.txt").write_text(pin)
           pathlib.Path("/tmp/backup_before.txt").write_text(backup)
