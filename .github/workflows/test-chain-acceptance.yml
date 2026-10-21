@@ -901,7 +901,7 @@ jobs:
           echo "=== iptables rules in the container ==="
           cat /tmp/iptables_r1.txt /tmp/iptables_r2.txt 2>/dev/null || echo "(none)"
           echo "=== the chain after the kill: did it carry traffic? ==="
-          docker exec rotate-trial sh -c 'cat /tmp/samples_r1.jsonl /tmp/samples_r2.jsonl 2>/dev/null' > /tmp/samples.jsonl || true
+          docker exec rotate-trial sh -c 'cat /tmp/samples_r*.jsonl 2>/dev/null' > /tmp/samples.jsonl || true
           wc -l /tmp/samples.jsonl
           python3 - <<'EOF'
           import json, pathlib
@@ -981,6 +981,7 @@ jobs:
           fi
 
       - name: The urltest control experiment (container only, no product change)
+        if: always()
         run: |
           # The "auto" urltest group tests every serving member every 15s, so
           # it holds an OpenVPN session per node at the same time. This
@@ -1015,7 +1016,20 @@ jobs:
           done
           date +%s > /tmp/urltest_changed.txt
           docker exec rotate-trial rm -f /tmp/stop_sampler
-          docker exec -d rotate-trial python3 /tmp/sampler.py "" b
+          docker exec rotate-trial python3 /tmp/diag.py clash > /tmp/clash_now.json 2>/dev/null || true
+          REF=$(python3 - <<'EOF'
+          import json
+          try:
+              data = json.load(open("/tmp/clash_now.json"))
+          except Exception:
+              data = {}
+          now = data.get("now")
+          members = [t for t in (data.get("all") or []) if t and t != now]
+          print(sorted(members)[0] if members else "")
+          EOF
+          )
+          echo "the control experiment watches the chain and the reference node $REF"
+          docker exec -d rotate-trial python3 /tmp/sampler.py "$REF" b
           echo "sampling the urltest-free serving stack for 240s"
           sleep 240
           docker exec rotate-trial touch /tmp/stop_sampler || true
