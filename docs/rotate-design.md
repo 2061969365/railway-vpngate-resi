@@ -860,8 +860,15 @@ backup 恒为 `None`，事件仍是 `auto-pin-unverified`。代码里不再留"�
 
 **一条契约变更（老保证在现行机制下无法实现）**
 
-`RefreshGateTests::test_refresh_waits_for_this_round_probe_before_pin` 当年断言"刷新返回时
+`RefreshGateTests::test_refresh_waits_for_this_round_probe_before_pin`（现已更名为
+`test_refresh_never_hands_the_pin_to_a_stale_measurement`）当年断言"刷新返回时
 pin 必须是换过的那个（不许供一个已知死的节点）"。rotate 不重拨正在服务的节点（D13），
 刷新**测不出来**这个节点是不是死的 ⇒ 现在由健康回路（骑在链路上判活）负责换人，
 刷新只保证"不自己乱换"。这属于**换契约**，不是弱化。
+
+**一个必须讲清的语义**：rotate 冷启动 pin 的是 `best`（`real_latency_ms` 最小者），
+"真拨验证过"指的是**历史上某一轮**真拨过（rotate 下服务中节点的 `real_latency_ms`
+按设计永不刷新），**不是本轮新鲜验证**——本轮新鲜验证只能靠另起客户端，而那正是
+duplicate-cn 的来源。该节点此后若已死，由健康回路 `check_pinned_health` 兜底换人
+（上面 §12.15 写明的机制）。gateway 模式不受影响：它仍然逐个 verify 候选节点。
 

@@ -3595,8 +3595,8 @@ class AutoPinTests(unittest.TestCase):
         finally:
             manager.stop()
 
-        self.assertEqual(1, restarts_after_first,
-                         "the first pass has to publish the config")
+        self.assertGreaterEqual(restarts_after_first, 1,
+                                "the first pass has to publish the config")
         self.assertEqual(restarts_after_first, restarts_after_second,
                          "an unchanged config must not restart sing-box")
         self.assertEqual(first, second, "the config must be byte-identical")

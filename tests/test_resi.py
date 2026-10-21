@@ -751,6 +751,10 @@ class RotateManagerTests(unittest.TestCase):
                 {"real_latency_ms": 20, "endpoint": _endpoint("vpngate-b")},
                 {"real_latency_ms": 30, "endpoint": _endpoint("vpngate-c")},
             ]
+            # Rotate mode must not verify by dialing (a throwaway client opens a
+            # second VPNGate session, §12.9f), so this stub is not reached any
+            # more - it stays as a guard: if a verify ever runs here, it must
+            # not be a real dial.
             manager.verify_fn = lambda endpoint: (None, None)
             with mock.patch.object(RailwayManager, "_check_config", return_value=True), \
                     mock.patch.object(RailwayManager, "_restart_singbox"):
