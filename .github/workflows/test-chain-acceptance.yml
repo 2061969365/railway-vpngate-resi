@@ -728,6 +728,68 @@ jobs:
           fi
           echo "no 'verify failed for' line: no verify-by-dial ran"
 
+      - name: The positive control - can the per-node sweep measure the node the chain uses?
+        run: |
+          # The per-node sweep is only evidence if it can measure the node the
+          # chain is using RIGHT NOW, through that node's own serving inbound.
+          # If it cannot, the mapping (port/path) is wrong and the per-node
+          # results mean nothing.
+          docker exec -i rotate-trial python3 - <<'PY'
+          import json, os, sys, time, urllib.request
+          sys.path.insert(0, "/app")
+          from vpngate_to_singbox import measure_resi_rotate
+
+          CFG = "/app/singbox-railway.json"
+          UUID = os.environ.get("VLESS_UUID", "")
+          SECRET = json.load(open(CFG))["experimental"]["clash_api"]["secret"]
+
+          def clash(path):
+              req = urllib.request.Request("http://127.0.0.1:9090" + path,
+                                           headers={"Authorization": "Bearer " + SECRET})
+              with urllib.request.urlopen(req, timeout=12) as resp:
+                  return json.loads(resp.read().decode())
+
+          def measure(port, path, timeout=15):
+              t0 = time.time()
+              try:
+                  got = measure_resi_rotate(UUID, port, path, count=1, timeout=timeout)
+              except Exception as exc:
+                  return "error:%s" % type(exc).__name__, round(time.time() - t0, 1)
+              ips = (got or {}).get("ips") or []
+              return (ips[0] if ips else "no ip"), round(time.time() - t0, 1)
+
+          cfg = json.load(open(CFG))
+          endpoints = cfg.get("endpoints") or []
+          inbounds = {ib["tag"]: ib for ib in (cfg.get("inbounds") or [])
+                       if (ib.get("tag") or "").startswith("resi-rot-")}
+          rules = {r.get("inbound"): r.get("outbound")
+                   for r in (cfg.get("route") or {}).get("rules") or []}
+          mapping = {t: (ib.get("listen_port"), rules.get(t)) for t, ib in inbounds.items()}
+          print("1) the three orders")
+          print("   endpoints order    :", [e.get("tag") for e in endpoints])
+          print("   resi-rot-i -> (port, tag):", dict(sorted(mapping.items())))
+          print("   every serving tag has an inbound:",
+                {v[1] for v in mapping.values()} == {e.get("tag") for e in endpoints})
+          now = clash("/proxies/chain").get("now")
+          print("2) positive control: the chain is on", now)
+          target = [t for t, v in mapping.items() if v[1] == now]
+          if not target:
+              print("   NO inbound routes to the chain's node")
+          else:
+              port = mapping[target[0]][0]
+              path = ((inbounds[target[0]].get("transport") or {}).get("path")) or "/ws-resi"
+              print("   its own rotate inbound:", target[0], "port", port, "path", path)
+              print("   A. through its OWN rotate inbound  :", measure(port, path))
+              print("   B. through the chain path /ws-chain:", measure(3000, "/ws-chain"))
+              print("   C. through the rotation path /ws-resi:", measure(3000, "/ws-resi"))
+              ep = next((e for e in endpoints if e.get("tag") == now), None)
+              print("3) the endpoint config of the chain's node:")
+              print(json.dumps({k: v for k, v in (ep or {}).items() if k != "tls"}, indent=1))
+          PY
+          echo "--- the serving log of the node the chain uses ---"
+          NOW=$(docker exec rotate-trial python3 /tmp/diag.py selector 2>/dev/null | sed 's/now=\([^ ]*\).*/\1/')
+          docker exec rotate-trial sh -c "grep -a 'openvpn-client\[$NOW\]' /app/singbox-railway.json.stderr.log | tail -n 30" || true
+
       - name: Let the pin and sing-box settle before the kill
         run: |
           prev=""
