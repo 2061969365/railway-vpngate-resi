@@ -210,6 +210,24 @@ jobs:
                           out.append([item.get("server"), item.get("server_port"), ep.get("tag")])
               return out
 
+          def loopback_targets(cfg_path):
+              """The loopback clients (a VLESS client against our own port).
+
+              The rotate full probe measures a node through that node's own
+              serving inbound, so its client never opens a VPNGate session.
+              """
+              try:
+                  with open(cfg_path, encoding="utf-8") as fh:
+                      cfg = json.load(fh)
+              except (OSError, ValueError):
+                  return []
+              out = []
+              for ob in cfg.get("outbounds") or []:
+                  if ob.get("type") in ("vless", "vmess", "trojan", "shadowsocks"):
+                      if ob.get("server"):
+                          out.append([ob.get("server"), ob.get("server_port"), ob.get("tag")])
+              return out
+
           def serving_map():
               try:
                   with open(SERVING, encoding="utf-8") as fh:
@@ -303,7 +321,9 @@ jobs:
                   smap = serving_map()
                   for pid, cfg_path in clients():
                       started = proc_started(pid) or stamp
-                      for target in vpngate_targets(cfg_path):
+                      vpngate = vpngate_targets(cfg_path)
+                      targets = vpngate or loopback_targets(cfg_path)
+                      for target in targets:
                           key = (pid, tuple(target))
                           if key in seen:
                               continue
@@ -311,6 +331,7 @@ jobs:
                           host = target[0]
                           sink.write(json.dumps({
                               "t": started, "seen": stamp, "pid": pid, "config": cfg_path,
+                              "kind": "vpngate" if vpngate else "loopback",
                               "target": target, "serving_tag": smap.get(host),
                               "verified_tag": verified.get(host),
                           }) + "\n")
@@ -584,6 +605,12 @@ jobs:
           print(f"round {rnd} after: pin={s['preferred_tag']} switches={s['chain_switch']['switches']} "
                 f"pid={pid1} md5={md51} pool={s['resi']['pool']} selector={sel} heal={heal}s")
           print(f"round {rnd} last_error: {s.get('last_error')}")
+          resi = s.get("resi") or {}
+          print(f"round {rnd} resi: mode={resi.get('mode')} pool={resi.get('pool')} "
+                f"down={resi.get('down')} nodes={resi.get('nodes')} inbounds={resi.get('inbounds')} "
+                f"state={resi.get('state')} error={resi.get('error')}")
+          print(f"round {rnd} resi-probe events: "
+                + str([h.get('detail') for h in s.get('refresh_history', []) if h.get('event') == 'resi-probe'][-6:]))
           print(f"round {rnd} events:", [(h["event"], h.get("detail")) for h in s.get("refresh_history", [])][-12:])
           print(f"round {rnd} md5_changed={md51 != md50} pid_changed={pid1 != pid0} "
                 f"switches_delta={int(s['chain_switch']['switches']) - int(sw0)}")
@@ -629,10 +656,14 @@ jobs:
           events = [json.loads(line) for line in raw if line.strip()]
           markers = json.loads(pathlib.Path("/tmp/watch_markers.json").read_text())
           print("markers:", json.dumps(markers, indent=1))
-          print("throwaway sing-box clients that dialed a VPNGate node:", len(events))
+          vpngate = [e for e in events if e.get("kind") == "vpngate"]
+          loopback = [e for e in events if e.get("kind") != "vpngate"]
+          print("throwaway sing-box clients: %d total, %d dialing a VPNGate node, %d riding the loopback" % (
+              len(events), len(vpngate), len(loopback)))
           for e in events:
-              print("  t=%.3f pid=%s target=%s serving_tag=%s verified_tag=%s" % (
-                  e["t"], e["pid"], e.get("target"), e.get("serving_tag"), e.get("verified_tag")))
+              print("  t=%.3f %s pid=%s target=%s serving_tag=%s verified_tag=%s" % (
+                  e["t"], e.get("kind"), e["pid"], e.get("target"),
+                  e.get("serving_tag"), e.get("verified_tag")))
           assert events, "the watcher saw no throwaway client at all: no evidence"
           pin_t = markers.get("pin")
           assert pin_t, markers
@@ -645,16 +676,23 @@ jobs:
           end = pin_t + 30.0
           inside = [e for e in events if start <= e["t"] <= end]
           print("pin decision window: %.3f .. %.3f" % (start, end))
-          print("throwaway VPNGate dials inside the pin window: %d" % len(inside))
+          print("throwaway clients inside the pin window: %d" % len(inside))
           for e in inside:
-              print("  in-window t=%.3f target=%s serving_tag=%s verified_tag=%s" % (
+              print("  in-window t=%.3f %s target=%s serving_tag=%s verified_tag=%s" % (
+                  e["t"], e.get("kind"), e.get("target"),
+                  e.get("serving_tag"), e.get("verified_tag")))
+          # The invariant: while the pin is decided, no client may dial a
+          # VPNGate node. A throwaway client that dials one opens a SECOND
+          # VPNGate session for it and kicks the session the serving side
+          # holds (duplicate-cn). A client that only rides our own loopback
+          # (the rotate probe measures through the node's own serving
+          # inbound) opens no session at all - that is the healthy shape.
+          violations = [e for e in inside if e.get("kind") == "vpngate"]
+          print("clients that dialed a VPNGate node inside the pin window: %d" % len(violations))
+          print("throwaway VPNGate dials elsewhere in the run: %d" % len(vpngate))
+          for e in vpngate:
+              print("  vpngate t=%.3f target=%s serving_tag=%s verified_tag=%s" % (
                   e["t"], e.get("target"), e.get("serving_tag"), e.get("verified_tag")))
-          # (1) A throwaway client must never dial a node the manager has
-          #     already really measured: that node holds the only VPNGate
-          #     session it may have, and a second one kicks it (duplicate-cn).
-          #     The pre-fix cold start did exactly that (verify_fn on the
-          #     measured candidates).
-          violations = [e for e in inside if e.get("verified_tag")]
           # (2) The duplicate-cn signature itself: the serving sing-box must
           #     not lose a session while the pin is decided. (The same line
           #     shows up outside this window when the full probe legitimately
@@ -669,8 +707,7 @@ jobs:
               markers.get("auth_fail_total"), kicked))
           print("terminated session tags:", markers.get("terminated_tags"))
           assert not violations, (
-              "a throwaway client dialed a node the manager had already measured "
-              "(a second VPNGate session for a node that is serving)", violations)
+              "a throwaway client dialed a VPNGate node while the pin was decided", violations)
           assert kicked in (None, 0), (
               "a serving session was kicked while the pin was decided", kicked,
               markers.get("terminated_tags"))
