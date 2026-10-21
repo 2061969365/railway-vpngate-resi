@@ -33,7 +33,7 @@ jobs:
   chain-hotswitch:
     name: Chain repins through the Clash API without a restart
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 70
     steps:
       - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v3
@@ -357,43 +357,44 @@ jobs:
           ip_via() {
             local port="$1" url ip
             for url in https://api.ipify.org https://icanhazip.com https://ifconfig.me/ip; do
-              ip=$(curl -m 20 -s -x "socks5h://127.0.0.1:${port}" "$url" || true)
+              ip=$(curl -m 8 -s -x "socks5h://127.0.0.1:${port}" "$url" || true)
               [ -n "$ip" ] && { echo "$ip"; return 0; }
             done
             echo ""
           }
           internal_chain() {
-            docker exec rotate-trial python3 -c "import os,sys; sys.path.insert(0,'/app'); from vpngate_to_singbox import measure_resi_rotate as m; print(m(os.environ.get('VLESS_UUID',''), int(os.environ.get('PORT','3000')), '/ws-chain', count=1, timeout=20))" 2>/dev/null || true
+            docker exec rotate-trial python3 -c "import os,sys; sys.path.insert(0,'/app'); from vpngate_to_singbox import measure_resi_rotate as m; print(m(os.environ.get('VLESS_UUID',''), int(os.environ.get('PORT','3000')), '/ws-chain', count=1, timeout=20))" 2>/dev/null | tail -n 1 || true
           }
+          SECRET=$(docker exec rotate-trial python3 -c "import json;print(json.load(open('/app/singbox-railway.json'))['experimental']['clash_api']['secret'])" 2>/dev/null || true)
+          selector_now() {
+            docker exec rotate-trial curl -s -m 5 -H "Authorization: Bearer $SECRET" \
+              http://127.0.0.1:9090/proxies/chain \
+              | python3 -c "import json,sys;print('now='+str(json.load(sys.stdin).get('now')))" 2>/dev/null \
+              || echo "now=unreachable"
+          }
+          # Bounded watch. Every sample records the real client path AND both
+          # in-container signals, so even a timeout leaves usable evidence.
+          DEADLINE=$((SECONDS + 420))
           chain_ip=""
-          for i in $(seq 1 60); do
+          while [ $SECONDS -lt $DEADLINE ]; do
             chain_ip=$(ip_via 18092)
-            if [ -n "$chain_ip" ]; then
-              echo "chain alive again after ~$((i * 5))s: $chain_ip"
-              break
-            fi
-            if [ $((i % 6)) -eq 0 ]; then
-              # Independent second opinion, immune to a flaky quick tunnel: the
-              # manager's own probe rides the mux from inside the container.
-              echo "  t=$((i * 5))s external=none internal=$(internal_chain)"
-            fi
-            sleep 5
+            [ -n "$chain_ip" ] && { echo "chain alive again after ${SECONDS}s: $chain_ip"; break; }
+            echo "  t=${SECONDS}s external=none $(selector_now) internal=$(internal_chain)"
+            sleep 6
           done
           [ -n "$chain_ip" ] || {
             echo "chain never came back after the pin died"
-            echo "=== internal chain probe ==="; internal_chain
-            echo "=== chain selector state ==="
-            SECRET=$(docker exec rotate-trial python3 -c "import json;print(json.load(open('/app/singbox-railway.json'))['experimental']['clash_api']['secret'])" 2>/dev/null || true)
+            echo "=== chain selector ==="
             docker exec rotate-trial curl -s -H "Authorization: Bearer $SECRET" \
               http://127.0.0.1:9090/proxies/chain || true
             echo
-            echo "=== manager events ==="
+            echo "=== manager view ==="
             curl -m 10 -s -H "Authorization: Bearer $ADMIN_TOKEN" \
               http://127.0.0.1:3000/api/status \
-              | python3 -c "import json,sys;s=json.load(sys.stdin);print(s.get('chain_switch'));print(s.get('preferred_tag'));print([h['event'] for h in s.get('refresh_history',[])][-15:])" || true
+              | python3 -c "import json,sys;s=json.load(sys.stdin);print(s.get('chain_switch'));print('pin',s.get('preferred_tag'));print([h['event'] for h in s.get('refresh_history',[])][-18:])" || true
             echo "=== sing-box stderr tail ==="
-            docker exec rotate-trial sh -c 'tail -n 80 /app/singbox-railway.json.stderr.log' 2>/dev/null || true
-            docker logs rotate-trial 2>&1 | tail -n 60
+            docker exec rotate-trial sh -c 'tail -n 60 /app/singbox-railway.json.stderr.log' 2>/dev/null || true
+            docker logs rotate-trial 2>&1 | tail -n 40
             exit 1; }
           # Only the long-lived serving process counts: the manager spawns
           # short-lived `sing-box run` probe clients (endpoint tag dial-probe)
