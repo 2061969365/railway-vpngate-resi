@@ -1831,6 +1831,10 @@ class RailwayManager:
         self._cpu_model = _cpu_model(); self._cpu_cores = os.cpu_count(); self._cpu_last = None
         self._fail_streak = 0; self._pinned_fail_streak = 0; self._rescue_round = 0; self._crash_streak = 0; self._retry_after = 0.0; self._mixed_fail_streak = 0; self._mixed_retry_after = 0.0; self._health_mixed_streak = 0; self._refresh_generation = 0
         self._chain_fail_streak = 0; self._chain_rescue_at = 0.0; self._chain_rescue_attempts = 0
+        # Pin whose dead handshake was already announced as "standby carries the
+        # chain": the handshake failure repeats every tick, the history line must
+        # not.
+        self._pinned_standby_noted: str | None = None
         # Chain rescue evidence. `_resi_payload_at` = last time real payload
         # came through a rotation node (proof its tunnel works right now);
         # `_chain_dead_until` = nodes that just failed the chain probe and must
@@ -2837,6 +2841,7 @@ class RailwayManager:
                 if self._pinned_fail_streak > 0:
                     self._record_history("health-dial-ok", f"{tag} handshake recovered ms={hand}")
                 self._pinned_fail_streak = 0
+                self._pinned_standby_noted = None
             if self.want_singbox and not self._serving_ok():
                 self._note_mixed_down(f"{tag} serving down, watching")
                 return "pinned"
@@ -2866,6 +2871,21 @@ class RailwayManager:
         with self._lock:
             self._pinned_fail_streak += 1
             streak = self._pinned_fail_streak
+        if self.want_singbox and self._chain_probe_ok():
+            # The pin's handshake is gone, but the chain still exits a real IP:
+            # the urltest group already failed over to the reserved standby.
+            # Repinning here would rewrite the config and restart sing-box
+            # (killing every rotation connection) for zero benefit, so leave the
+            # pair alone; only a real failure - both nodes dead - may repin.
+            with self._lock:
+                if self._pinned_standby_noted != tag:
+                    self._pinned_standby_noted = tag
+                    self._record_history(
+                        "chain-on-standby",
+                        f"{tag} handshake dead but the chain exits via the standby")
+                self._pinned_fail_streak = 0
+            return "pinned"
+        with self._lock:
             if not self.auto_rescue:
                 cands = []
             else:
