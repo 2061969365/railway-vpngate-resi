@@ -490,9 +490,16 @@ jobs:
           docker exec -u 0 rotate-trial sh -c "apt-get update -qq && apt-get install -y -qq --no-install-recommends iptables" >/tmp/apt.log 2>&1 || {
             tail -n 30 /tmp/apt.log; exit 1; }
           sb_pid() {
-            docker exec rotate-trial sh -c 'for p in /proc/[0-9]*/cmdline; do
-              c=$(tr "\0" " " < "$p" 2>/dev/null)
-              case "$c" in *sing-box*run*/app/singbox-railway.json*) echo "$p" | cut -d/ -f3; break;; esac
+            # The executable is what identifies the serving instance: matching
+            # the cmdline text alone also matches this very shell (its cmdline
+            # contains the pattern), which would report a new pid per call.
+            docker exec rotate-trial sh -c 'for p in /proc/[0-9]*; do
+              pid=${p#/proc/}
+              [ -r "$p/cmdline" ] || continue
+              exe=$(readlink "$p/exe" 2>/dev/null) || continue
+              case "$exe" in */sing-box) ;; *) continue;; esac
+              c=$(tr "\0" " " < "$p/cmdline" 2>/dev/null)
+              case "$c" in *singbox-railway.json*) case "$c" in */tmp/*) continue;; esac; echo "$pid"; break;; esac
             done'
           }
           cfg_md5() { docker exec rotate-trial sh -c 'md5sum /app/singbox-railway.json | cut -d" " -f1'; }
@@ -549,7 +556,12 @@ jobs:
               sel=$(docker exec rotate-trial python3 /tmp/diag.py selector || true)
               chain=$(docker exec rotate-trial python3 /tmp/diag.py chain || true)
               now=$(echo "$sel" | sed 's/now=\([^ ]*\).*/\1/')
-              echo "round $round t=$((SECONDS - T0))s $sel chain=$chain"
+              PIDNOW=$(sb_pid)
+              if [ -n "$PIDNOW" ] && [ "$PIDNOW" != "$PID0" ]; then
+                echo "round $round: the serving sing-box changed pid $PID0 -> $PIDNOW"
+                curl -m 10 -s -H "$AUTH" http://127.0.0.1:3000/api/status | python3 -c "import json,sys;s=json.load(sys.stdin);print('  manager last_error:',s.get('last_error'));print('  history:',[(h['event'],h.get('detail')) for h in s.get('refresh_history',[])][-6:])" || true
+              fi
+              echo "round $round t=$((SECONDS - T0))s $sel chain=$chain pid=$PIDNOW"
               # The chain is only "healed" when it carries traffic again AND the
               # selector really moved off the killed pin.
               case "$chain" in
@@ -712,6 +724,8 @@ jobs:
           docker exec rotate-trial sh -c 'cat /app/singbox-railway.json.stderr.log /app/singbox-railway.json.stderr.log.prev 2>/dev/null | grep -aiE "panic|fatal error|runtime error|goroutine [0-9]+ \[" | head -n 20' || echo "(no panic)"
           echo "=== last 40 lines of the serving sing-box log ==="
           docker exec rotate-trial sh -c 'tail -n 40 /app/singbox-railway.json.stderr.log' || true
+          echo "=== per-node 'endpoint is not ready yet' in the serving log (dead clients) ==="
+          docker exec rotate-trial sh -c 'cat /app/singbox-railway.json.stderr.log /app/singbox-railway.json.stderr.log.prev 2>/dev/null | grep -ao "openvpn-client\[[^]]*\]: endpoint is not ready yet" | sort | uniq -c | sort -rn | head -n 20' || true
           echo "=== manager status: last_error / threads ==="
           curl -m 10 -s -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:3000/api/status | python3 -c "import json,sys;s=json.load(sys.stdin);print('last_error:',s.get('last_error'));print('refresh_history:',[(h['event'],h.get('detail')) for h in s.get('refresh_history',[])]);print('memory:',s.get('memory'))" || true
           echo "=== container log (last 60 lines) ==="
