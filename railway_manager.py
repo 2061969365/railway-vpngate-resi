@@ -3517,6 +3517,23 @@ class RailwayManager:
             targets.append(node)
         return targets
 
+    def _probe_target_started_serving(self, tag: str) -> bool:
+        """True when the node started serving while a probe was running.
+
+        The probe's target list is computed when the probe starts, so a node
+        can join the rotation in between: dialing it then would open a second
+        VPNGate session and duplicate-cn would kick the live one (D13). The
+        check therefore has to be repeated right before the dial.
+        """
+        with self._lock:
+            reserved = {t for t in (self.preferred_tag, self.backup_tag) if t}
+            if tag in reserved:
+                return True
+            if not (self.resi_rotate and self.vless_uuid):
+                return False
+            _usable, _parked, eligible = self._resi_pool_locked()
+            return tag in {t for t, _ in eligible}
+
     def _run_full_probe_inner(self) -> None:
         with self._lock:
             nodes = list(self._nodes)
@@ -3526,6 +3543,14 @@ class RailwayManager:
             start_preferred = self.preferred_tag
         ordered = sorted(targets, key=lambda n: (n.get("latency_ms") is None, n.get("latency_ms") or 0, n.get("server") or ""))
         def _dial_one(node: dict) -> None:
+            tag = (node.get("endpoint") or {}).get("tag")
+            if tag and self._probe_target_started_serving(tag):
+                # The node started serving while this probe was running:
+                # dialing it now would open a second VPNGate session, and
+                # duplicate-cn would kick the live one (D13).
+                with self._lock:
+                    self.status["full_probe"]["skipped"] += 1
+                return
             try:
                 ms = self.dial_fn(node) if self.dial_fn else None
             except Exception:

@@ -477,6 +477,45 @@ class FullProbeTests(unittest.TestCase):
                            "latency_ms": 100, "real_latency_ms": None,
                            "speed": 1000} for ip in ips]
 
+    def test_the_probe_skips_a_node_that_started_serving(self) -> None:
+        """A node that joined the rotation while the probe was running must
+        not be dialed: a second VPNGate session kicks the live one (D13).
+
+        The target list is computed when the probe starts, so the check has
+        to be repeated right before the dial."""
+        dialed: list[str] = []
+
+        def _dial(node):
+            dialed.append(node["server"])
+            if node["server"] == "203.0.113.11":
+                # vpngate-1 starts serving in the middle of the probe.
+                manager._nodes[1]["real_latency_ms"] = 20
+                manager._set_resi_routes([("vpngate-1", 41001)])
+            return 50
+
+        manager = self._manager(resi_rotate=True, vless_uuid="u-u-i-d",
+                                full_probe_workers=1, dial_fn=_dial)
+        try:
+            manager._nodes = [
+                {"server": "203.0.113.11", "server_port": 443,
+                 "country": "Japan", "country_short": "JP",
+                 "latency_ms": 100, "real_latency_ms": None, "speed": 1000,
+                 "endpoint": {"tag": "vpngate-0", "server": "203.0.113.11",
+                              "server_port": 443}},
+                {"server": "203.0.113.12", "server_port": 443,
+                 "country": "Japan", "country_short": "JP",
+                 "latency_ms": 200, "real_latency_ms": None, "speed": 1000,
+                 "endpoint": {"tag": "vpngate-1", "server": "203.0.113.12",
+                              "server_port": 443}},
+            ]
+            with _fake_singbox():
+                manager._run_full_probe_inner()
+        finally:
+            manager.stop()
+
+        self.assertEqual(["203.0.113.11"], dialed,
+                         "a node that started serving must not be dialed")
+
     def test_full_probe_rejects_missing_token(self) -> None:
         manager = self._manager()
         try:

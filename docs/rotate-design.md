@@ -532,6 +532,9 @@ D12 留下的疑点（"第三路相关动作改写了配置"）在这一轮被�
 - `_full_probe_targets_locked()`：rotate 模式只拨**当前不在服务中**的节点（parked 或
   从未验证过），pin/backup 永不拨；gateway 模式只跳过 pin/backup。这样真拨既能
   补齐池子、又能把 parked 的节点捞回来，却不会碰到任何活会话。
+- 目标名单是**探测开始时**算的，而节点可能在这期间开始被轮换服务 ⇒ 拨号**之前**再查一次
+  （`_probe_target_started_serving()`）：它已经进池就跳过并计入 skipped，不拨。
+  回归测试：`FullProbeTests::test_the_probe_skips_a_node_that_started_serving`。
 - `endpoint_remotes()` / `probe_endpoint_latency()`：按 sing-box 的故障转移顺序枚举
   全部 remote，任一个握手通过即算活；上面三处调用点统一改用它。
 - `full_probe.state = "done"` 移到 pin/republish 之后；验收脚本在取基线前要求
