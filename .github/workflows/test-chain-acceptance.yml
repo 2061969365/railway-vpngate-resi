@@ -357,6 +357,9 @@ jobs:
           import json, os, sys, threading, time, urllib.request
           from collections import deque
 
+          sys.path.insert(0, "/app")
+          from vpngate_to_singbox import measure_resi_rotate
+
           REF = sys.argv[1] if len(sys.argv) > 1 else ""
           ROUND = sys.argv[2] if len(sys.argv) > 2 else "0"
           OUT = "/tmp/samples_r%s.jsonl" % ROUND
@@ -364,6 +367,7 @@ jobs:
           LOG = "/app/singbox-railway.json.stderr.log"
           SERVING = "/app/singbox-railway.json"
           UUID = os.environ.get("VLESS_UUID", "")
+          ADMIN = os.environ.get("ADMIN_TOKEN", "")
           PORT = 3000
 
           SECRET = json.load(open(SERVING))["experimental"]["clash_api"]["secret"]
@@ -465,8 +469,6 @@ jobs:
                   time.sleep(3)
 
           def exit_loop():
-              sys.path.insert(0, "/app")
-              from vpngate_to_singbox import measure_resi_rotate
               while not os.path.exists(STOP):
                   sample = {"kind": "exit", "t": time.time()}
                   try:
@@ -478,6 +480,64 @@ jobs:
                       sample["error"] = "%s: %s" % (type(exc).__name__, exc)
                   write(sample)
                   time.sleep(2)
+
+          def manager_status():
+              req = urllib.request.Request("http://127.0.0.1:3000/api/status",
+                                           headers={"Authorization": "Bearer " + ADMIN})
+              with urllib.request.urlopen(req, timeout=10) as resp:
+                  return json.loads(resp.read().decode())
+
+          def pernode_routes():
+              """(tag, port, path) of every node's OWN rotate inbound.
+
+              Measuring a node through that port rides the session the serving
+              instance already holds for it, so it answers "does this node
+              carry traffic at all" without touching the chain's selector.
+              """
+              try:
+                  with open(SERVING, encoding="utf-8") as fh:
+                      cfg = json.load(fh)
+              except Exception:
+                  return []
+              ports = {}
+              for ib in cfg.get("inbounds") or []:
+                  tag = ib.get("tag") or ""
+                  if tag.startswith("resi-rot-"):
+                      path = ((ib.get("transport") or {}).get("path")) or "/ws-resi"
+                      ports[tag] = (int(ib.get("listen_port") or 0), path)
+              out = []
+              for rule in (cfg.get("route") or {}).get("rules") or []:
+                  ib = rule.get("inbound") or ""
+                  if ib in ports:
+                      port, path = ports[ib]
+                      out.append((rule.get("outbound"), port, path))
+              return out
+
+          def sweep_loop():
+              import concurrent.futures
+              while not os.path.exists(STOP):
+                  def one(item):
+                      tag, port, path = item
+                      try:
+                          got = measure_resi_rotate(UUID, port, path, count=1, timeout=8)
+                          return tag, ((got or {}).get("ips") or [])
+                      except Exception as exc:
+                          return tag, "error:%s" % type(exc).__name__
+                  results = {}
+                  try:
+                      with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+                          for tag, res in ex.map(one, pernode_routes()):
+                              results[tag] = res
+                  except Exception as exc:
+                      results = {"error": type(exc).__name__}
+                  latency = {}
+                  try:
+                      for ep in manager_status().get("endpoints") or []:
+                          latency[ep.get("tag")] = ep.get("real_latency_ms")
+                  except Exception:
+                      pass
+                  write({"kind": "pernode", "t": time.time(), "results": results, "latency": latency})
+                  time.sleep(120)
 
           def log_loop():
               global log_offset
@@ -512,7 +572,7 @@ jobs:
                           write({"kind": "log", "t": time.time(), "tag": now, "lines": lines[-3:]})
                   time.sleep(5)
 
-          for target in (state_loop, delay_loop, exit_loop, log_loop):
+          for target in (state_loop, delay_loop, exit_loop, log_loop, sweep_loop):
               threading.Thread(target=target, daemon=True).start()
           while not os.path.exists(STOP):
               time.sleep(2)
@@ -887,6 +947,30 @@ jobs:
               print("  t=%.0f tag=%s" % (s["t"], s.get("tag")))
               for line in s.get("lines") or []:
                   print("      %s" % line)
+          pernode = [s for s in samples if s.get("kind") == "pernode"]
+          print("--- the per-node sweep: every node through its OWN rotate inbound ---")
+          for s in pernode:
+              print("  sweep t=%.0f" % s["t"])
+              for tag, res in sorted((s.get("results") or {}).items()):
+                  print("     %-12s latency_ms=%-7s result=%s" % (
+                      tag, (s.get("latency") or {}).get(tag), res))
+          try:
+              cut = float(pathlib.Path("/tmp/urltest_changed.txt").read_text().strip())
+          except Exception:
+              cut = None
+          if cut:
+              print("--- the urltest control experiment (the 'auto' group shrunk at t=%.0f) ---" % cut)
+              for label, part in (("before", [s for s in delays if s["t"] < cut]),
+                                  ("after", [s for s in delays if s["t"] >= cut])):
+                  ok = [s for s in part if isinstance(s.get("chain"), int)]
+                  refok = [s for s in part if isinstance(s.get("ref_delay"), int)]
+                  print("  %-6s delay samples %3d: chain ok %3d, reference ok %3d" % (
+                      label, len(part), len(ok), len(refok)))
+              for label, part in (("before", [s for s in exits if s["t"] < cut]),
+                                  ("after", [s for s in exits if s["t"] >= cut])):
+                  ok = [s for s in part if s.get("ips")]
+                  print("  %-6s exit samples %3d: with an exit IP %3d" % (
+                      label, len(part), len(ok)))
           EOF
           echo "=== round results ==="; cat /tmp/round_results.txt 2>/dev/null || true
           if grep -q "OK$" /tmp/round_results.txt 2>/dev/null && [ "$(grep -c . /tmp/round_results.txt)" = "$(grep -c "OK$" /tmp/round_results.txt)" ]; then
@@ -895,6 +979,48 @@ jobs:
             echo "AT LEAST ONE ROUND FAILED (see above)"
             exit 1
           fi
+
+      - name: The urltest control experiment (container only, no product change)
+        run: |
+          # The "auto" urltest group tests every serving member every 15s, so
+          # it holds an OpenVPN session per node at the same time. This
+          # experiment shrinks it to one member with a one hour interval and
+          # restarts the serving sing-box, inside the container only - the
+          # repository is not touched. After this step the config md5 is no
+          # longer a criterion (the config was edited on purpose).
+          echo "=== the 'auto' urltest group BEFORE ==="
+          docker exec rotate-trial python3 -c "import json;c=json.load(open('/app/singbox-railway.json'));print(json.dumps([o for o in c['outbounds'] if o.get('tag')=='auto']))"
+          docker exec -i rotate-trial python3 - <<'PY'
+          import json
+          path = "/app/singbox-railway.json"
+          cfg = json.load(open(path))
+          for ob in cfg.get("outbounds") or []:
+              if ob.get("tag") == "auto":
+                  ob["outbounds"] = (ob.get("outbounds") or [])[:1]
+                  ob["interval"] = "3600s"
+          with open(path, "w", encoding="utf-8") as fh:
+              json.dump(cfg, fh, indent=2)
+          auto = [o for o in cfg["outbounds"] if o.get("tag") == "auto"][0]
+          print("the 'auto' group now has", len(auto.get("outbounds") or []), "member(s), interval", auto.get("interval"))
+          PY
+          PID=$(docker exec rotate-trial sh -c 'for p in /proc/[0-9]*; do pid=${p#/proc/}; [ -r "$p/cmdline" ] || continue; exe=$(readlink "$p/exe" 2>/dev/null) || continue; case "$exe" in */sing-box) ;; *) continue;; esac; c=$(tr "\0" " " < "$p/cmdline" 2>/dev/null); case "$c" in *singbox-railway.json*) case "$c" in */tmp/*) continue;; esac; echo "$pid"; break;; esac; done')
+          echo "restarting the serving sing-box (pid $PID) so it reads the edited config"
+          docker exec rotate-trial kill -9 "$PID" || true
+          for i in $(seq 1 90); do
+            if docker exec rotate-trial python3 /tmp/diag.py selector 2>/dev/null | grep -q "now="; then
+              echo "the serving stack answers again after ~$((i * 5))s"
+              break
+            fi
+            sleep 5
+          done
+          date +%s > /tmp/urltest_changed.txt
+          docker exec rotate-trial rm -f /tmp/stop_sampler
+          docker exec -d rotate-trial python3 /tmp/sampler.py "" b
+          echo "sampling the urltest-free serving stack for 240s"
+          sleep 240
+          docker exec rotate-trial touch /tmp/stop_sampler || true
+          echo "=== the 'auto' urltest group AFTER ==="
+          docker exec rotate-trial python3 -c "import json;c=json.load(open('/app/singbox-railway.json'));print(json.dumps([o for o in c['outbounds'] if o.get('tag')=='auto']))"
 
       - name: No throwaway client dialed an already measured node
         if: always()
