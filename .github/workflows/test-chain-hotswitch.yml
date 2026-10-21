@@ -371,25 +371,25 @@ jobs:
           # the endpoint, so it separates "endpoint dead" from "routing wrong").
           selector_state() {
             docker exec rotate-trial python3 - "$SECRET" <<'PY'
-import json, sys, urllib.error, urllib.request
-secret = sys.argv[1]
+          import json, sys, urllib.error, urllib.request
+          secret = sys.argv[1]
 
-def get(path):
-    req = urllib.request.Request("http://127.0.0.1:9090" + path,
-                                 headers={"Authorization": "Bearer " + secret})
-    with urllib.request.urlopen(req, timeout=12) as r:
-        return json.loads(r.read().decode())
+          def get(path):
+              req = urllib.request.Request("http://127.0.0.1:9090" + path,
+                                           headers={"Authorization": "Bearer " + secret})
+              with urllib.request.urlopen(req, timeout=12) as resp:
+                  return json.loads(resp.read().decode())
 
-now = get("/proxies/chain").get("now")
-try:
-    got = get(f"/proxies/{now}/delay?url=http%3A%2F%2Fcp.cloudflare.com%2Fgenerate_204&timeout=7000")
-    delay = got.get("delay")
-except urllib.error.HTTPError as exc:
-    delay = "http" + str(exc.code)
-except Exception as exc:                      # noqa: BLE001 - diagnostic only
-    delay = type(exc).__name__
-print(f"now={now} delay={delay}")
-PY
+          now = get("/proxies/chain").get("now")
+          try:
+              got = get(f"/proxies/{now}/delay?url=http%3A%2F%2Fcp.cloudflare.com%2Fgenerate_204&timeout=7000")
+              delay = got.get("delay")
+          except urllib.error.HTTPError as exc:
+              delay = "http" + str(exc.code)
+          except Exception as exc:
+              delay = type(exc).__name__
+          print(f"now={now} delay={delay}")
+          PY
           }
           # Bounded watch. Every sample records the real client path AND both
           # in-container signals, so even a timeout leaves usable evidence.
