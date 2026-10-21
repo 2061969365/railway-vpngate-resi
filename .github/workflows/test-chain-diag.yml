@@ -201,7 +201,7 @@ jobs:
             done
             PID1=$(sb_pid); MD51=$(cfg_md5)
             curl -m 10 -s -H "$AUTH" http://127.0.0.1:3000/api/status -o /tmp/post.json
-            python3 - "$PIN" "$SW0" "$PID0" "$PID1" "$MD50" "$MD51" "$round" "$chain" <<'EOF' || true
+            python3 - "$PIN" "$SW0" "$PID0" "$PID1" "$MD50" "$MD51" "$round" "$chain" <<'EOF'
           import json, sys
           pin0, sw0, pid0, pid1, md50, md51, rnd, chain = sys.argv[1:9]
           s = json.load(open("/tmp/post.json"))
