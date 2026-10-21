@@ -977,3 +977,38 @@ pytest 3.13 run 1/2/3   573 passed, 2 skipped in 64~65s
 "最近答过话"的节点（`_chain_candidates_locked` 的 proven/answered 桶），应远快于此。
 若要缩短这个最坏情况，方向是**并发试探多个候选**，而不是改判定阈值。
 
+### 12.19 真拨踢掉 serving 端 ⇒ 链只能试尸体（2026-10-21，验收实测）
+
+云端验收（run 39653020741）把"跑久了 chain 挂了"的机制挖出来了，证据在 serving
+sing-box 的日志里：
+
+```
+client terminated: authentication failed: terminal (auth-retry none)
+```
+
+`auth-retry none` ⇒ **serving 端不重试**：一旦这个节点的 OpenVPN 会话被别人顶掉，
+它就一直是死的（`endpoint is not ready yet`）。而顶掉它的正是 **manager 自己的真拨**——
+全量真拨对某个节点另起一个 sing-box 客户端直拨它 ⇒ **第二个 VPNGate 会话** ⇒
+duplicate-cn 把 serving 端那条踢掉（§12.9e D13 的同一条规则）。
+
+后果链（实测）：
+
+- 冷启动那轮真拨（refresh top-10 + full probe 6 个"从未验证过"的节点）把 serving 端
+  同节点客户端踢掉 8 次 ⇒ 池子**账面 12~13 个、多数是僵尸**；
+- manager 自己的 rotation 探针开始报 `resi-probe: failed: no serving endpoint answered`；
+- pin 一死，链的候选全是僵尸 ⇒ 逐个试（每个 2 次隧道探针失败 ≈40s，冷却还翻倍）
+  ⇒ **自愈实测 365~388s**。
+
+**修复**（`2983573`）：**rotate 模式下全量真拨不再真拨节点**，改成**经该节点自己的
+serving 入口测量**（轮换的 loopback inbound，和 `_chain_probe_ok` / `_served_exit_ip`
+同一个"骑 mux"原则）。客户端是连我们自己 loopback 端口的普通 VLESS 客户端，
+**不新开 OpenVPN 会话** ⇒ serving 端不再被踢；测得的出口 IP 本身就是"这个节点活着"
+的证据，池子照旧增长。gateway 模式不变（那里链的节点是唯一要紧的会话，没有第二条可踢）。
+
+回归测试：`FullProbeTests::test_the_probe_measures_through_the_serving_endpoint`
+（rotate 模式的探测**不许**调用节点的 dial 函数，必须经节点自己的端口测量）。
+
+这条也是 §12.9e D13 的收尾：D13 当年只挡住了"刷新拨正在服务的节点"，
+**全量真拨这条路一直漏着**——单测看不出来（本地没有 sing-box、也没有真节点），
+是云端验收用真容器 + 真节点 + 进程级证据才抓到的。
+
