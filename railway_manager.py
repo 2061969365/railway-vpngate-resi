@@ -3517,6 +3517,44 @@ class RailwayManager:
             targets.append(node)
         return targets
 
+    def _resi_port_for_tag(self, tag: str) -> int | None:
+        """The loopback inbound that serves exactly this node (rotate mode)."""
+        for served_tag, port in self._resi_routes:
+            if served_tag == tag:
+                return port
+        return None
+
+    def _measure_for_probe(self, node: dict) -> int | None:
+        """Measure one node for the full probe, without stealing a session.
+
+        Rotate mode measures through the node's OWN serving endpoint (the
+        loopback inbound the rotation already holds), never with a throwaway
+        OpenVPN client: a second VPNGate session kicks the serving one
+        (duplicate-cn) and the serving side does not retry ("auth-retry
+        none"), so the probe used to leave the serving set full of zombies -
+        the chain then had to walk dead candidates when its pin died
+        (measured: 6.5 minutes). The client here is a plain VLESS client
+        against our own loopback port, so no VPNGate session is opened.
+        """
+        tag = (node.get("endpoint") or {}).get("tag")
+        if self.resi_rotate and self.vless_uuid and tag:
+            port = self._resi_port_for_tag(tag)
+            if port:
+                try:
+                    got = measure_resi_rotate(
+                        self.vless_uuid, port, self.resi_path, count=1,
+                        singbox_bin=self.singbox_bin,
+                        timeout=self.dial_timeout)
+                except Exception:
+                    got = None
+                if got and got.get("ips"):
+                    return got.get("first_ms")
+                return None
+        try:
+            return self.dial_fn(node) if self.dial_fn else None
+        except Exception:
+            return None
+
     def _probe_target_started_serving(self, tag: str) -> bool:
         """True when the node started serving while a probe was running.
 
@@ -3551,10 +3589,7 @@ class RailwayManager:
                 with self._lock:
                     self.status["full_probe"]["skipped"] += 1
                 return
-            try:
-                ms = self.dial_fn(node) if self.dial_fn else None
-            except Exception:
-                ms = None
+            ms = self._measure_for_probe(node)
             with self._lock:
                 node["real_latency_ms"] = ms
                 self.status["full_probe"]["done"] += 1

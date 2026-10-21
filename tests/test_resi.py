@@ -1580,10 +1580,17 @@ class RotateManagerTests(unittest.TestCase):
                 before = manager.status["resi"]["pool"]
                 with open(manager.config_path, "rb") as handle:
                     cfg_before = handle.read()
-                # Every node really dials this time: the pool must grow to all 4.
+                # Every node really answers this time: the pool must grow to
+                # all 4. In rotate mode the probe measures through the node's
+                # own serving endpoint (a throwaway OpenVPN client would kick
+                # the serving session: duplicate-cn), so that is what is
+                # stubbed here.
                 manager.dial_fn = lambda node: 30
                 manager.verify_fn = lambda endpoint: ("198.51.100.9", 5)
-                manager._run_full_probe_inner()
+                with mock.patch("railway_manager.measure_resi_rotate",
+                                return_value={"ips": ["198.51.100.9"],
+                                              "first_ms": 30, "distinct": 1}):
+                    manager._run_full_probe_inner()
                 after = manager.status["resi"]["pool"]
                 inbounds = manager.status["resi"]["inbounds"]
                 with open(manager.config_path, "rb") as handle:

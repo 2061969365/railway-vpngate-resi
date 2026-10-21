@@ -559,6 +559,53 @@ class FullProbeTests(unittest.TestCase):
         self.assertEqual(["203.0.113.11"], dialed,
                          "a node that started serving must not be dialed")
 
+    def test_the_probe_measures_through_the_serving_endpoint(self) -> None:
+        """Rotate mode must measure through the node's own serving endpoint.
+
+        A throwaway OpenVPN client would open a second VPNGate session and
+        kick the serving one (duplicate-cn); the serving side does not retry
+        ("auth-retry none"), so the probe would leave zombies behind and the
+        chain would have to walk dead candidates when its pin dies."""
+        dialed: list[str] = []
+        measured: list[tuple] = []
+
+        def _fake_measure(uuid, port, path, count=3, singbox_bin="sing-box",
+                          timeout=15):
+            measured.append((port, path))
+            return {"ips": ["203.0.113.99"], "first_ms": 42, "distinct": 1}
+
+        manager = self._manager(resi_rotate=True, vless_uuid="u-u-i-d",
+                                full_probe_workers=1,
+                                dial_fn=lambda node: dialed.append(node["server"]) or 50)
+        try:
+            manager._nodes = [
+                {"server": "203.0.113.11", "server_port": 443,
+                 "country": "Japan", "country_short": "JP",
+                 "latency_ms": 100, "real_latency_ms": None, "speed": 1000,
+                 "endpoint": {"tag": "vpngate-0", "server": "203.0.113.11",
+                              "server_port": 443}},
+                {"server": "203.0.113.12", "server_port": 443,
+                 "country": "Japan", "country_short": "JP",
+                 "latency_ms": 200, "real_latency_ms": None, "speed": 1000,
+                 "endpoint": {"tag": "vpngate-1", "server": "203.0.113.12",
+                              "server_port": 443}},
+            ]
+            manager._set_resi_routes([("vpngate-0", 41000),
+                                      ("vpngate-1", 41001)])
+            with _fake_singbox(), \
+                 mock.patch("railway_manager.measure_resi_rotate",
+                            side_effect=_fake_measure):
+                manager._run_full_probe_inner()
+        finally:
+            manager.stop()
+
+        self.assertEqual([], dialed,
+                         "the probe must not dial the node itself")
+        self.assertEqual([41000, 41001], [port for port, _ in measured],
+                         "every node is measured through its own endpoint")
+        self.assertEqual(42, manager._nodes[0]["real_latency_ms"])
+        self.assertEqual(42, manager._nodes[1]["real_latency_ms"])
+
     def test_full_probe_rejects_missing_token(self) -> None:
         manager = self._manager()
         try:
