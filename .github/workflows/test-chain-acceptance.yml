@@ -341,8 +341,172 @@ jobs:
                           }) + "\n")
                   time.sleep(0.5)
           PY
+          cat > /tmp/sampler.py <<'PY'
+          """Sample the chain every few seconds while the pin is killed.
+
+          Four series, all timestamped:
+            state: the Clash selector (now + all) and the TCP state of every
+                   connection to a serving node (per node tag)
+            delay: the Clash delay test of the chain group, of the node it
+                   currently selects, and of one reference node that is never
+                   killed - the difference tells "the selector/routing is
+                   wrong" from "the node/session is wrong"
+            exit:  the /ws-chain exit IP (the chain's real traffic)
+            log:   the serving sing-box lines of the node it currently selects
+          """
+          import json, os, sys, threading, time, urllib.request
+          from collections import deque
+
+          REF = sys.argv[1] if len(sys.argv) > 1 else ""
+          ROUND = sys.argv[2] if len(sys.argv) > 2 else "0"
+          OUT = "/tmp/samples_r%s.jsonl" % ROUND
+          STOP = "/tmp/stop_sampler"
+          LOG = "/app/singbox-railway.json.stderr.log"
+          SERVING = "/app/singbox-railway.json"
+          UUID = os.environ.get("VLESS_UUID", "")
+          PORT = 3000
+
+          SECRET = json.load(open(SERVING))["experimental"]["clash_api"]["secret"]
+          lock = threading.Lock()
+          sink = open(OUT, "a", buffering=1)
+          current = {"now": None}
+          log_lines = {}
+          log_offset = 0
+
+          def write(obj):
+              with lock:
+                  sink.write(json.dumps(obj) + "\n")
+
+          def clash(path):
+              req = urllib.request.Request("http://127.0.0.1:9090" + path,
+                                           headers={"Authorization": "Bearer " + SECRET})
+              with urllib.request.urlopen(req, timeout=12) as resp:
+                  return json.loads(resp.read().decode())
+
+          def delay(tag):
+              try:
+                  got = clash("/proxies/%s/delay?url=http%%3A%%2F%%2Fcp.cloudflare.com%%2Fgenerate_204&timeout=3000" % tag)
+                  return got.get("delay")
+              except Exception as exc:
+                  return "error:%s" % type(exc).__name__
+
+          def node_ports():
+              try:
+                  with open(SERVING, encoding="utf-8") as fh:
+                      cfg = json.load(fh)
+              except Exception:
+                  return {}
+              out = {}
+              for ep in cfg.get("endpoints") or []:
+                  tag = ep.get("tag")
+                  if ep.get("server"):
+                      out[(ep["server"], int(ep.get("server_port") or 0))] = tag
+                  for item in ep.get("servers") or []:
+                      if isinstance(item, dict) and item.get("server"):
+                          out[(item["server"], int(item.get("server_port") or 0))] = tag
+              return out
+
+          TCP_STATES = {"01": "ESTABLISHED", "02": "SYN_SENT", "03": "SYN_RECV",
+                        "04": "FIN_WAIT1", "05": "FIN_WAIT2", "06": "TIME_WAIT",
+                        "07": "CLOSE", "08": "CLOSE_WAIT", "09": "LAST_ACK",
+                        "0A": "LISTEN", "0B": "CLOSING"}
+
+          def tcp_states():
+              try:
+                  with open("/proc/net/tcp", encoding="utf-8") as fh:
+                      rows = fh.read().splitlines()[1:]
+              except OSError:
+                  return {}
+              ports = node_ports()
+              out = {}
+              for row in rows:
+                  parts = row.split()
+                  if len(parts) < 4:
+                      continue
+                  ip_hex, port_hex = parts[2].split(":")
+                  port = int(port_hex, 16)
+                  ip = ".".join(str(int(ip_hex[i:i + 2], 16)) for i in (6, 4, 2, 0))
+                  tag = ports.get((ip, port))
+                  if tag:
+                      out.setdefault(tag, []).append(TCP_STATES.get(parts[3], parts[3]))
+              return out
+
+          def state_loop():
+              while not os.path.exists(STOP):
+                  sample = {"kind": "state", "t": time.time()}
+                  try:
+                      info = clash("/proxies/chain")
+                      current["now"] = info.get("now")
+                      sample["now"] = current["now"]
+                      sample["all"] = info.get("all")
+                  except Exception as exc:
+                      sample["now"] = None
+                      sample["all"] = None
+                      sample["error"] = type(exc).__name__
+                  sample["tcp"] = tcp_states()
+                  write(sample)
+                  time.sleep(5)
+
+          def delay_loop():
+              while not os.path.exists(STOP):
+                  sample = {"kind": "delay", "t": time.time()}
+                  sample["chain"] = delay("chain")
+                  now = current.get("now")
+                  if now:
+                      sample["now_tag"] = now
+                      sample["now_delay"] = delay(now)
+                  if REF:
+                      sample["ref"] = REF
+                      sample["ref_delay"] = delay(REF)
+                  write(sample)
+                  time.sleep(3)
+
+          def exit_loop():
+              sys.path.insert(0, "/app")
+              from vpngate_to_singbox import measure_resi_rotate
+              while not os.path.exists(STOP):
+                  sample = {"kind": "exit", "t": time.time()}
+                  try:
+                      got = measure_resi_rotate(UUID, PORT, "/ws-chain", count=1, timeout=10)
+                      sample["ips"] = (got or {}).get("ips") or []
+                      sample["error"] = None if got else "no ip"
+                  except Exception as exc:
+                      sample["ips"] = []
+                      sample["error"] = "%s: %s" % (type(exc).__name__, exc)
+                  write(sample)
+                  time.sleep(2)
+
+          def log_loop():
+              global log_offset
+              while not os.path.exists(STOP):
+                  try:
+                      with open(LOG, "rb") as fh:
+                          fh.seek(log_offset)
+                          data = fh.read()
+                          log_offset = fh.tell()
+                  except OSError:
+                      data = b""
+                  for line in data.decode("utf-8", "replace").splitlines():
+                      if "openvpn-client[" in line:
+                          tag = line.split("openvpn-client[")[1].split("]")[0]
+                          with lock:
+                              log_lines.setdefault(tag, deque(maxlen=8)).append(line[-200:])
+                  now = current.get("now")
+                  if now:
+                      with lock:
+                          lines = list(log_lines.get(now, []))
+                      if lines:
+                          write({"kind": "log", "t": time.time(), "tag": now, "lines": lines[-3:]})
+                  time.sleep(5)
+
+          for target in (state_loop, delay_loop, exit_loop, log_loop):
+              threading.Thread(target=target, daemon=True).start()
+          while not os.path.exists(STOP):
+              time.sleep(2)
+          PY
           docker cp /tmp/diag.py rotate-trial:/tmp/diag.py
           docker cp /tmp/watch.py rotate-trial:/tmp/watch.py
+          docker cp /tmp/sampler.py rotate-trial:/tmp/sampler.py
           docker exec -e ADMIN_TOKEN="$ADMIN_TOKEN" -d rotate-trial python3 /tmp/watch.py
           sleep 2
           docker exec rotate-trial sh -c 'ps -ef | grep -c "[w]atch.py"' || true
@@ -532,6 +696,24 @@ jobs:
             curl -m 10 -s -H "$AUTH" http://127.0.0.1:3000/api/status -o /tmp/pre.json
             PIN=$(python3 -c "import json;print(json.load(open('/tmp/pre.json'))['preferred_tag'])")
             SW0=$(python3 -c "import json;print(json.load(open('/tmp/pre.json'))['chain_switch']['switches'])")
+            # A reference node the chain never selects: its delay is the control
+            # for "the selector is wrong" vs "the node/session is wrong".
+            docker exec rotate-trial python3 /tmp/diag.py clash > /tmp/clash_now.json 2>/dev/null || true
+            REF=$(python3 - "$PIN" <<'EOF'
+          import json, sys
+          pin = sys.argv[1]
+          try:
+              data = json.load(open("/tmp/clash_now.json"))
+          except Exception:
+              data = {}
+          members = [t for t in (data.get("all") or []) if t and t != pin]
+          print(sorted(members)[0] if members else "")
+          EOF
+            )
+            echo "round $round: pin=$PIN reference_node=$REF"
+            docker exec rotate-trial rm -f /tmp/stop_sampler
+            docker exec -d rotate-trial python3 /tmp/sampler.py "$REF" "$round"
+            sleep 3
             docker exec rotate-trial cat /app/singbox-railway.json > /tmp/cfg.json
             python3 - "$PIN" "$round" <<'EOF'
           import json, socket, sys
@@ -570,6 +752,8 @@ jobs:
               [ -n "$ip" ] || continue
               docker exec -u 0 rotate-trial sh -c "iptables -A OUTPUT -p tcp -d $ip --dport $port -j REJECT --reject-with tcp-reset; iptables -A OUTPUT -p udp -d $ip --dport $port -j REJECT" || true
             done < /tmp/pin_ips_$round.txt
+            echo "round $round: the iptables rules that are actually in place:"
+            docker exec -u 0 rotate-trial iptables -S OUTPUT | tee /tmp/iptables_r$round.txt
             PID0=$(sb_pid); MD50=$(cfg_md5)
             echo "round $round before: pin=$PIN switches=$SW0 pid=$PID0 md5=$MD50"
             DEADLINE=$((SECONDS + 360))
@@ -640,6 +824,53 @@ jobs:
           EOF
             sleep 10
           done
+          docker exec rotate-trial touch /tmp/stop_sampler || true
+          echo "=== iptables rules in the container ==="
+          cat /tmp/iptables_r1.txt /tmp/iptables_r2.txt 2>/dev/null || echo "(none)"
+          echo "=== the chain after the kill: did it carry traffic? ==="
+          docker exec rotate-trial sh -c 'cat /tmp/samples_r1.jsonl /tmp/samples_r2.jsonl 2>/dev/null' > /tmp/samples.jsonl || true
+          wc -l /tmp/samples.jsonl
+          python3 - <<'EOF'
+          import json, pathlib
+          raw = pathlib.Path("/tmp/samples.jsonl").read_text().splitlines()
+          samples = [json.loads(l) for l in raw if l.strip()]
+          states = [s for s in samples if s.get("kind") == "state"]
+          delays = [s for s in samples if s.get("kind") == "delay"]
+          exits = [s for s in samples if s.get("kind") == "exit"]
+          logs = [s for s in samples if s.get("kind") == "log"]
+          print("samples: %d state, %d delay, %d exit, %d log" % (
+              len(states), len(delays), len(exits), len(logs)))
+          print("--- the selector over time (now / all) ---")
+          for s in states:
+              tcp = s.get("tcp") or {}
+              est = sorted(t for t, v in tcp.items() if "ESTABLISHED" in v)
+              print("  t=%.0f now=%s all=%s tcp_established=%s" % (
+                  s["t"], s.get("now"), len(s.get("all") or []), ",".join(est)))
+          print("--- the delay tests (chain group / current node / reference) ---")
+          for s in delays:
+              print("  t=%.0f chain=%s now=%s now_delay=%s ref=%s ref_delay=%s" % (
+                  s["t"], s.get("chain"), s.get("now_tag"), s.get("now_delay"),
+                  s.get("ref"), s.get("ref_delay")))
+          print("--- the /ws-chain exit IP ---")
+          ok = [s for s in exits if s.get("ips")]
+          for s in exits:
+              print("  t=%.0f ips=%s error=%s" % (s["t"], s.get("ips"), s.get("error")))
+          if ok:
+              print("CHAIN AFTER THE KILL: it carried traffic %d time(s), first at t=%.0f" % (
+                  len(ok), ok[0]["t"]))
+          else:
+              print("CHAIN AFTER THE KILL: it NEVER carried traffic (no /ws-chain exit IP in any sample)")
+          if delays:
+              ref_ok = [s for s in delays if isinstance(s.get("ref_delay"), int)]
+              chain_ok = [s for s in delays if isinstance(s.get("chain"), int)]
+              print("delay samples: chain ok %d/%d, reference ok %d/%d" % (
+                  len(chain_ok), len(delays), len(ref_ok), len(delays)))
+          print("--- the serving log lines of the node the chain selects ---")
+          for s in logs[-12:]:
+              print("  t=%.0f tag=%s" % (s["t"], s.get("tag")))
+              for line in s.get("lines") or []:
+                  print("      %s" % line)
+          EOF
           echo "=== round results ==="; cat /tmp/round_results.txt 2>/dev/null || true
           if grep -q "OK$" /tmp/round_results.txt 2>/dev/null && [ "$(grep -c . /tmp/round_results.txt)" = "$(grep -c "OK$" /tmp/round_results.txt)" ]; then
             echo "ALL ROUNDS OK"
