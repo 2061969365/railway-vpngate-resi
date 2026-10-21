@@ -966,6 +966,39 @@ class RotateManagerTests(unittest.TestCase):
         self.assertEqual("vpngate-b", pinned)
         self.assertEqual("vpngate-c", backup)
 
+    def test_dead_pin_handshake_does_not_repin_while_the_standby_carries_chain(self) -> None:
+        # The pin's TCP handshake is gone but the chain still exits a real IP
+        # (urltest already moved to the reserved standby). Repinning would
+        # rewrite the config and restart sing-box, killing every rotation
+        # connection, for no benefit: the pair is left alone until a real
+        # failure - both nodes dead - triggers the rescue.
+        manager = self._manager()
+        manager.want_singbox = True
+        try:
+            manager._nodes = [
+                {"real_latency_ms": 10, "latency_ms": 10, "endpoint": _endpoint("vpngate-a")},
+                {"real_latency_ms": 20, "latency_ms": 20, "endpoint": _endpoint("vpngate-b")},
+                {"real_latency_ms": 30, "latency_ms": 30, "endpoint": _endpoint("vpngate-c")},
+            ]
+            with manager._lock:
+                manager.preferred_tag = "vpngate-a"
+                manager.backup_tag = "vpngate-b"
+                manager.status["preferred_tag"] = "vpngate-a"
+            with mock.patch("railway_manager.probe_tcp_latency", return_value=0), \
+                    mock.patch.object(RailwayManager, "_chain_probe_ok", return_value=True), \
+                    mock.patch.object(RailwayManager, "_apply_config") as apply_cfg:
+                states = [manager.check_pinned_health() for _ in range(6)]
+            pinned = manager.preferred_tag
+            events = [e["event"] for e in manager.status["refresh_history"]]
+        finally:
+            manager.stop()
+            self._cleanup(manager)
+
+        self.assertEqual(["pinned"] * 6, states)
+        self.assertEqual("vpngate-a", pinned)
+        apply_cfg.assert_not_called()
+        self.assertIn("chain-on-standby", events)
+
     def test_rotate_mode_keeps_the_pin_while_the_chain_carries_traffic(self) -> None:
         manager = self._manager()
         try:
