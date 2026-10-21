@@ -626,13 +626,21 @@ VPNGate 一个节点只允许一个会话，预留即意味着轮换永远不能
   会把正在服务的那条踢掉——"验证"本身把链接杀了，于是验证循环变成"每次验证 chain 就死"。
   这条以前也埋在 D13 里（旧代码把 pin 当验证目标直拨），与"手动切一下就好了"吻合。
 
-**云端实测（16 节点 / REAL_TOPK=10，连杀两轮 pin）**：
+**云端实测（16 节点 / REAL_TOPK=10，连杀两轮 pin，GH Actions run 39567628243 全绿）**：
 
 ```
-round 1  杀 vpngate-0(47.188.79.92)  96s 后 chain=ips=36.12.175.158  now=vpngate-1 switches=1 md5 不变 pool=13
-round 2  杀 vpngate-1(36.12.175.158) 90s 后 chain=ips=219.100.37.238 now=vpngate-2 switches=2 md5 不变 pool=13
-         /ws-node 全程 172.215.211.49 不变；每轮 pid 有变（supervisor 重启），但配置 md5 一个字节没变
+round 1  iptables 拒 vpngate-0  → t=30/57/84s chain 全失败（now 仍是 vpngate-0）
+                                  t=98s  now=vpngate-1 chain=ips=156.239.242.10
+                                  switches_delta=1 md5_changed=False pool=10  ⇒ ROUND 1 OK
+round 2  iptables 拒 vpngate-1  → t=128/155s chain 全失败
+                                  t=168s now=vpngate-2 chain=ips=104.32.23.226
+                                  switches_delta=1 md5_changed=False pool=10  ⇒ ROUND 2 OK
+         /ws-node 全程 64.236.200.231 不变；配置 md5 自始至终 033b694623cbe8856cf5c3e1885f0569
+         每轮 pid 有变（supervisor 重启），事件流：auto-pin → verify-invalidated → auto-rescue
 ```
+
+修复前同一条工作流（run 39566516410）也能"切换成功"，但每轮验证一次就把 chain 再杀一次；
+修复后连锁两轮都在一次热切换内收敛，**没有一次配置重写**——这就是"手动切一下就好"的机器版本。
 - 重启后 pin 的恢复：sing-box 起在配置里的 `default` 上，`_reapply_pin_when_ready()`
   在 API 就绪后把运行时 pin 重新选回去。
 - 预留数回到 1 ⇒ 轮换池与 D13 完全一致；`backup_tag` 在 rotate 模式下恒为 `None`
@@ -667,7 +675,7 @@ round 2  杀 vpngate-1(36.12.175.158) 90s 后 chain=ips=219.100.37.238 now=vpnga
 10. **轮换的连接预算不得吃满 mux 槽位**：前两路必须保留独立额度，否则第三路的风暴
     会以"新连接被丢弃"的形式掐死另外两路（D12）。
 
-### 12.11 测试矩阵（`tests/test_resi.py`，98 项全绿）
+### 12.11 测试矩阵（`tests/test_resi.py`，106 项全绿）
 
 | 场景 | 测试 |
 |---|---|
