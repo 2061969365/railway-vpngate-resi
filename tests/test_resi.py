@@ -253,18 +253,36 @@ class RotateConfigTests(unittest.TestCase):
 
         self.assertEqual("/ws-home", inbound["transport"]["path"])
 
-    def test_chain_group_fails_over_between_the_two_reserved_nodes(self) -> None:
-        # A selector never fails over by itself: a dead pin left the chain dead
-        # until the manager repinned it, while /ws-resi (which skips parked
-        # nodes) kept working. The rotate chain is an urltest over the two
-        # reserved nodes, so a pin death is absorbed within one probe cycle
-        # without a config rewrite - and neither node is dialed by the rotation.
-        chain = next(o for o in self._cfg(3, preferred="vpngate-0",
-                                          backup="vpngate-1")["outbounds"]
+    def test_chain_selector_lists_every_serving_tag(self) -> None:
+        # The chain is a plain selector whose candidate list is the whole
+        # serving set: any repin is then one Clash API call (PUT /proxies/chain)
+        # instead of a config rewrite + sing-box restart, so moving the pin can
+        # no longer kill the rotation's connections.
+        chain = next(o for o in self._cfg(3, preferred="vpngate-1",
+                                           chain_candidates=["vpngate-0", "vpngate-2"])["outbounds"]
                      if o["tag"] == "chain")
 
-        self.assertEqual("urltest", chain["type"])
-        self.assertEqual(["vpngate-0", "vpngate-1"], chain["outbounds"])
+        self.assertEqual("selector", chain["type"])
+        self.assertEqual(["vpngate-1", "vpngate-0", "vpngate-2"], chain["outbounds"])
+        self.assertEqual("vpngate-1", chain["default"])
+        self.assertFalse(chain["interrupt_exist_connections"])
+
+    def test_chain_selector_never_dials_the_rotation_group(self) -> None:
+        # "auto" is the all-nodes urltest: letting the chain fall into it makes
+        # the chain and the rotation fight over VPNGate's single session per
+        # node ("one dead, two dead"), so the rotate group must not list it.
+        chain = next(o for o in self._cfg(3, preferred="vpngate-1",
+                                           chain_candidates=["vpngate-0"])["outbounds"]
+                     if o["tag"] == "chain")
+
+        self.assertNotIn("auto", chain["outbounds"])
+
+    def test_clash_api_is_added_for_runtime_pinning(self) -> None:
+        cfg = self._cfg(2, preferred="vpngate-0",
+                        clash_api={"external_controller": "127.0.0.1:9090", "secret": "s3"})
+
+        self.assertEqual({"external_controller": "127.0.0.1:9090", "secret": "s3"},
+                         cfg["experimental"]["clash_api"])
 
     def test_rotate_without_a_backup_keeps_the_selector(self) -> None:
         chain = next(o for o in self._cfg(2, preferred="vpngate-0")["outbounds"]
@@ -750,10 +768,10 @@ class RotateManagerTests(unittest.TestCase):
             self._cleanup(manager)
 
         self.assertEqual("vpngate-a", pinned)
-        # A dial-verified node is a legitimate standby: the chain urltest pair
-        # needs two reserved nodes so a dead pin fails over without a restart.
-        self.assertEqual("vpngate-b", backup)
-        self.assertEqual(["vpngate-c"], pool)
+        # One reserved node is all the rotation can spare: the chain fails over
+        # through a Clash API hot switch, so no standby is taken from the pool.
+        self.assertIsNone(backup)
+        self.assertEqual(["vpngate-b", "vpngate-c"], pool)
 
     def test_rotate_mode_never_unpins_a_dead_chain_node(self) -> None:
         # Dropping the pin would hand the chain to urltest, which is exactly the
@@ -808,10 +826,8 @@ class RotateManagerTests(unittest.TestCase):
 
         self.assertEqual(["pinned", "rescued"], states)
         self.assertEqual("vpngate-b", pinned)
-        # The rescue always reserves a standby too, otherwise the chain urltest
-        # group would be back to a single node and the next pin death is a
-        # multi-minute outage again.
-        self.assertEqual("vpngate-c", backup)
+        # No standby reservation: the rotation keeps every node except the pin.
+        self.assertIsNone(backup)
         self.assertIn("chain-rescue", events)
 
     def test_chain_rescue_prefers_the_node_that_carries_rotation_traffic(self) -> None:
@@ -846,7 +862,7 @@ class RotateManagerTests(unittest.TestCase):
 
         self.assertEqual("rescued", state)
         self.assertEqual("vpngate-d", pinned)
-        self.assertEqual("vpngate-b", backup)
+        self.assertIsNone(backup)
 
     def test_chain_rescue_prefers_a_node_that_returned_bytes(self) -> None:
         # Weaker evidence than payload, still fresher than a latency number
@@ -964,14 +980,14 @@ class RotateManagerTests(unittest.TestCase):
 
         self.assertEqual("rescued", state)
         self.assertEqual("vpngate-b", pinned)
-        self.assertEqual("vpngate-c", backup)
+        self.assertIsNone(backup)
 
     def test_dead_pin_handshake_does_not_repin_while_the_standby_carries_chain(self) -> None:
         # The pin's TCP handshake is gone but the chain still exits a real IP
-        # (urltest already moved to the reserved standby). Repinning would
-        # rewrite the config and restart sing-box, killing every rotation
-        # connection, for no benefit: the pair is left alone until a real
-        # failure - both nodes dead - triggers the rescue.
+        # (a hot switch already moved the selector). Repinning would rewrite the
+        # config and restart sing-box, killing every rotation connection, for no
+        # benefit: the pair is left alone until a real failure - the chain path
+        # itself dead - triggers the rescue.
         manager = self._manager()
         manager.want_singbox = True
         try:
@@ -998,6 +1014,106 @@ class RotateManagerTests(unittest.TestCase):
         self.assertEqual("vpngate-a", pinned)
         apply_cfg.assert_not_called()
         self.assertIn("chain-on-standby", events)
+
+    def test_chain_rescue_hot_switches_without_rewriting_the_config(self) -> None:
+        # The whole point of the Clash API path: a repin must not write the
+        # config, because that restarts sing-box and drops every live
+        # connection of all three paths - the collateral damage that took
+        # /ws-resi down together with /ws-chain.
+        manager = self._manager(clash_api_port=9090)
+        manager.want_singbox = True
+        try:
+            manager._nodes = [
+                {"real_latency_ms": 10, "endpoint": _endpoint("vpngate-a")},
+                {"real_latency_ms": 20, "endpoint": _endpoint("vpngate-b")},
+            ]
+            with manager._lock:
+                manager.preferred_tag = "vpngate-a"
+                manager.status["preferred_tag"] = "vpngate-a"
+            with mock.patch("railway_manager.probe_tcp_latency", return_value=25), \
+                    mock.patch.object(RailwayManager, "_chain_probe_ok", return_value=False), \
+                    mock.patch.object(RailwayManager, "_serving_ok", return_value=True), \
+                    mock.patch.object(RailwayManager, "_clash_api_ready", return_value=True), \
+                    mock.patch.object(RailwayManager, "_clash_select", return_value=True) as select, \
+                    mock.patch.object(RailwayManager, "_apply_config") as apply_cfg, \
+                    mock.patch.object(RailwayManager, "_invalidate_verify"):
+                states = [manager.check_pinned_health() for _ in range(2)]
+            pinned = manager.preferred_tag
+        finally:
+            manager.stop()
+            self._cleanup(manager)
+
+        self.assertEqual(["pinned", "rescued"], states)
+        self.assertEqual("vpngate-b", pinned)
+        select.assert_called_once_with("vpngate-b")
+        apply_cfg.assert_not_called()
+
+    def test_manual_switch_hot_switches_when_the_tag_is_a_candidate(self) -> None:
+        manager = self._manager(clash_api_port=9090)
+        manager.want_singbox = True
+        try:
+            manager._nodes = [
+                {"real_latency_ms": 10, "endpoint": _endpoint("vpngate-a")},
+                {"real_latency_ms": 20, "endpoint": _endpoint("vpngate-b")},
+            ]
+            with mock.patch.object(RailwayManager, "_clash_api_ready", return_value=True), \
+                    mock.patch.object(RailwayManager, "_clash_select", return_value=True), \
+                    mock.patch.object(RailwayManager, "_apply_config") as apply_cfg:
+                ok, effective = manager.switch("vpngate-b")
+            pinned = manager.preferred_tag
+        finally:
+            manager.stop()
+            self._cleanup(manager)
+
+        self.assertEqual((True, "chain"), (ok, effective))
+        self.assertEqual("vpngate-b", pinned)
+        apply_cfg.assert_not_called()
+
+    def test_hot_switch_falls_back_to_a_rewrite_when_the_api_is_down(self) -> None:
+        manager = self._manager(clash_api_port=9090)
+        manager.want_singbox = True
+        try:
+            manager._nodes = [
+                {"real_latency_ms": 10, "endpoint": _endpoint("vpngate-a")},
+                {"real_latency_ms": 20, "endpoint": _endpoint("vpngate-b")},
+            ]
+            with manager._lock:
+                manager.preferred_tag = "vpngate-a"
+                manager.status["preferred_tag"] = "vpngate-a"
+            with mock.patch("railway_manager.probe_tcp_latency", return_value=25), \
+                    mock.patch.object(RailwayManager, "_chain_probe_ok", return_value=False), \
+                    mock.patch.object(RailwayManager, "_serving_ok", return_value=True), \
+                    mock.patch.object(RailwayManager, "_clash_api_ready", return_value=False), \
+                    mock.patch.object(RailwayManager, "_apply_config", return_value=True) as apply_cfg, \
+                    mock.patch.object(RailwayManager, "_invalidate_verify"):
+                states = [manager.check_pinned_health() for _ in range(2)]
+            pinned = manager.preferred_tag
+        finally:
+            manager.stop()
+            self._cleanup(manager)
+
+        self.assertEqual(["pinned", "rescued"], states)
+        self.assertEqual("vpngate-b", pinned)
+        self.assertTrue(apply_cfg.called)
+
+    def test_chain_selector_tags_cover_the_whole_serving_set(self) -> None:
+        manager = self._manager(clash_api_port=9090)
+        try:
+            manager._nodes = [
+                {"real_latency_ms": 30, "endpoint": _endpoint("vpngate-c")},
+                {"real_latency_ms": 10, "endpoint": _endpoint("vpngate-a")},
+                {"latency_ms": 40, "endpoint": _endpoint("vpngate-b")},
+            ]
+            with manager._lock:
+                manager.preferred_tag = "vpngate-a"
+            tags = manager._chain_selector_tags()
+        finally:
+            manager.stop()
+            self._cleanup(manager)
+
+        # Config-stable order (by tag) - otherwise the file looks changed on
+        # every repin and sing-box restarts anyway.
+        self.assertEqual(["vpngate-a", "vpngate-b", "vpngate-c"], tags)
 
     def test_rotate_mode_keeps_the_pin_while_the_chain_carries_traffic(self) -> None:
         manager = self._manager()

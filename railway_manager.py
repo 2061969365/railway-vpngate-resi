@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -1536,6 +1537,9 @@ def build_config_from_env(env: dict) -> dict:
         "auto_rescue": _env_bool(env, "AUTO_RESCUE", True),
         "health_check_interval": _int_env(env, "HEALTH_CHECK_INTERVAL", 20, 5, 300),
         "max_mux_connections": _int_env(env, "MAX_MUX_CONNECTIONS", 100, 1, 1000),
+        # Loopback Clash API: how the chain is repinned without rewriting the
+        # config / restarting sing-box. 0 disables the hot switch.
+        "clash_api_port": _int_env(env, "CLASH_API_PORT", 9090, 0, 65535),
         "data_dir": env.get("DATA_DIR") or env.get("RAILWAY_VOLUME_MOUNT_PATH") or ".",
         "vless_uuid": env.get("VLESS_UUID", ""),
         "vless_direct_port": vless_direct_port, "vless_chain_port": vless_chain_port,
@@ -1804,7 +1808,8 @@ class RailwayManager:
         config_path: str = "singbox-railway.json", nodes_path: str = "nodes.json", state_path: str = "state.json",
         settings_path: str | None = None, singbox_bin: str = "sing-box", start_singbox: bool = True,
         auto_refresh: bool = True, fetch_on_start: bool = True, retry_delays: tuple = (5, 10),
-        max_mux_connections: int = MAX_MUX_CONNECTIONS, health_check_interval: int = HEALTH_CHECK_INTERVAL, fetcher=None) -> None:
+        max_mux_connections: int = MAX_MUX_CONNECTIONS, health_check_interval: int = HEALTH_CHECK_INTERVAL, fetcher=None,
+        clash_api_port: int = 9090) -> None:
         self.port = port; self.mixed_port = mixed_port; self.username = username; self.password = password
         self.admin_token = admin_token; self.snapshot_url = snapshot_url
         self.snapshot_urls = list(snapshot_urls) if snapshot_urls else [snapshot_url]
@@ -1844,6 +1849,15 @@ class RailwayManager:
         # prefer it over a node that merely has a stale latency number.
         self._resi_ok_at: dict[str, float] = {}
         self._chain_dead_until: dict[str, float] = {}
+        # Runtime pin switching through the sing-box Clash API. Rewriting the
+        # config and restarting sing-box for every repin was the collateral
+        # damage that took the rotation down with the chain; a selector written
+        # with all serving tags as candidates can be moved with one loopback
+        # HTTP call instead (design §12.9g). 0 disables the hot path.
+        self.clash_api_port = int(clash_api_port or 0)
+        self.clash_api_secret = os.urandom(16).hex()
+        self._clash_ready_at = 0.0
+        self._clash_switch_lock = threading.Lock()
         self._lock = threading.RLock(); self._refresh_lock = threading.Lock(); self._config_lock = threading.Lock()
         if resi:
             resi_status = {"enabled": True, "mode": ("sticky" if self.resi_session_ttl > 0 else "rotation"),
@@ -1865,6 +1879,8 @@ class RailwayManager:
             "full_probe": {"state": "idle", "done": 0, "total": 0}, "refresh_job": {"state": "idle", "started_at": None, "ok": None, "error": None}, "probe": {"state": "idle", "tag": None, "ms": None, "error": None},
             "verify": {"state": "idle", "exit_ip": None, "ms": None, "via_tag": None, "error": None, "checked_at": None},
             "tunnel": {"state": "off"}, "vless": ({"uuid": vless_uuid, "direct_path": vless_direct_path, "chain_path": vless_chain_path} if vless_uuid else None),
+            "chain_switch": {"mode": ("clash" if (clash_api_port and resi_rotate) else "config"),
+                             "clash_port": int(clash_api_port or 0), "ready": False, "switches": 0},
             "resi": resi_status}
         self._full_probe_thread = None; self._single_probe_thread = None; self._verify_thread = None; self._verify_generation = 0; self._refresh_thread = None
         self._stop_event = threading.Event(); self._mux_slots = threading.BoundedSemaphore(max_mux_connections); self._mux_inflight = 0
@@ -2474,7 +2490,14 @@ class RailwayManager:
             pass
         with self._lock:
             self._nodes = nodes; self._first_seen = first_seen
-            self.preferred_tag = preferred; self.backup_tag = backup; self._auto_pinned = auto_pinned
+            # Rotate mode reserves exactly one node for the chain; a backup left
+            # over from an older version would shrink the rotation pool for a
+            # standby the hot switch does not need.
+            if self.resi_rotate and not self.clash_api_port:
+                self.preferred_tag = preferred; self.backup_tag = backup
+            else:
+                self.preferred_tag = preferred; self.backup_tag = None if self.resi_rotate else backup
+            self._auto_pinned = auto_pinned
         return nodes, preferred
     def _boot_from_last_good(self) -> bool:
         try:
@@ -2754,10 +2777,12 @@ class RailwayManager:
 
         Rotate mode must not unpin (an unpinned chain turns the urltest group
         into a second client of the very nodes the rotation dials), so the only
-        safe move is another pin - but a pin that is *live now*, and with a
-        second reserved node so the chain keeps a hot standby. The failing pin
-        goes into the dead-memory so consecutive rescues walk through the pool
-        instead of bouncing between the same two corpses.
+        safe move is another pin - but a pin that is *live now*. The switch is
+        done through the Clash API when the running config already lists the
+        tag: a local HTTP call, no config rewrite and no sing-box restart, so
+        the rotation keeps every connection. The failing pin goes into the
+        dead-memory so consecutive rescues walk through the pool instead of
+        bouncing between the same two corpses.
         """
         now = time.monotonic()
         with self._lock:
@@ -2767,35 +2792,33 @@ class RailwayManager:
                 return "pinned"
             tag = self.preferred_tag
             cands = self._chain_candidates_locked(now)
-            pair = [(n.get("endpoint") or {}).get("tag") for n in cands[:2]]
-        pair = [t for t in pair if t]
-        if not pair:
+            best = (cands[0].get("endpoint") or {}).get("tag") if cands else None
+        if not best:
             with self._lock:
                 self._chain_rescue_attempts += 1
                 self._chain_rescue_at = now
             self._record_history("chain-rescue-skipped", f"{reason}: no tunnel-verified alternative")
             print(f"chain rescue skipped: {reason}: no tunnel-verified alternative", flush=True)
             return "pinned"
-        best = pair[0]
-        second = pair[1] if len(pair) > 1 else None
+        hot = self._repin_runtime(best, reason)
         with self._config_lock:
-            if not self._apply_config(final="auto", preferred=best, backup=second):
-                return "pinned"
-            if not self._commit_rescue(round_id, best, second):
-                return "pinned"
-            with self._lock:
-                self._chain_rescue_attempts += 1
-                self._chain_rescue_at = now
-                self._chain_fail_streak = 0
-                if tag and tag != best:
-                    # It just failed an end-to-end probe: keep it out of the
-                    # next rescue's ranking (A->B->A loops never recover).
-                    self._chain_dead_until[tag] = now + CHAIN_DEAD_MEMORY
-                    self._resi_payload_at.pop(tag, None)
+            ok = self._commit_rescue(round_id, best, None) if hot else (
+                self._apply_config(final="auto", preferred=best, backup=None)
+                and self._commit_rescue(round_id, best, None))
+        if not ok:
+            return "pinned"
+        with self._lock:
+            self._chain_rescue_attempts += 1
+            self._chain_rescue_at = now
+            self._chain_fail_streak = 0
+            if tag and tag != best:
+                # It just failed an end-to-end probe: keep it out of the
+                # next rescue's ranking (A->B->A loops never recover).
+                self._chain_dead_until[tag] = now + CHAIN_DEAD_MEMORY
+                self._resi_payload_at.pop(tag, None)
         self._invalidate_verify(f"chain rescue to {best}")
-        self._record_history("chain-rescue", f"{reason}: {tag} -> {best}")
-        print(f"chain rescue: {reason}: {tag} -> {best}"
-              + (f" backup={second}" if second else ""), flush=True)
+        self._record_history("chain-rescue", f"{reason}: {tag} -> {best}" + (" (hot)" if hot else ""))
+        print(f"chain rescue: {reason}: {tag} -> {best}" + (" (hot switch)" if hot else ""), flush=True)
         return "rescued"
 
     def check_pinned_health(self, probe_fn=None) -> str:
@@ -2872,17 +2895,17 @@ class RailwayManager:
             self._pinned_fail_streak += 1
             streak = self._pinned_fail_streak
         if self.want_singbox and self._chain_probe_ok():
-            # The pin's handshake is gone, but the chain still exits a real IP:
-            # the urltest group already failed over to the reserved standby.
-            # Repinning here would rewrite the config and restart sing-box
-            # (killing every rotation connection) for zero benefit, so leave the
-            # pair alone; only a real failure - both nodes dead - may repin.
+            # The pin's handshake is gone, but the chain still exits a real IP
+            # (a hot switch already moved the selector). Repinning here would
+            # rewrite the config and restart sing-box for zero benefit, so leave
+            # the pair alone; only a real failure - the chain path itself dead -
+            # may repin.
             with self._lock:
                 if self._pinned_standby_noted != tag:
                     self._pinned_standby_noted = tag
                     self._record_history(
                         "chain-on-standby",
-                        f"{tag} handshake dead but the chain exits via the standby")
+                        f"{tag} handshake dead but the chain still exits")
                 self._pinned_fail_streak = 0
             return "pinned"
         with self._lock:
@@ -2893,21 +2916,12 @@ class RailwayManager:
                 # payload proof, then unparked verified nodes, then parked ones.
                 now = time.monotonic()
                 cands = self._chain_candidates_locked(now)
-                # The reserved standby is a free promotion when the pin's
-                # handshake is dead (it is already in the config and, being
-                # reserved, never competes with the rotation).
-                if self.backup_tag and self.backup_tag != tag:
-                    standby = next((n for n in self._nodes
-                                    if (n.get("endpoint") or {}).get("tag") == self.backup_tag), None)
-                    if (standby is not None
-                            and self._chain_dead_until.get(self.backup_tag, 0.0) <= now):
-                        cands.insert(0, standby)
                 if not cands:
                     # Nothing is tunnel-verified yet (cold start): handshake
                     # verification is enough to move the pin off a dead node.
                     cands = sorted(
                         (n for n in self._nodes
-                         if (n.get("endpoint") or {}).get("tag") not in (tag, self.backup_tag)
+                         if (n.get("endpoint") or {}).get("tag") != tag
                          and n.get("latency_ms") is not None
                          and self._chain_dead_until.get(
                              (n.get("endpoint") or {}).get("tag") or "", 0.0) <= now),
@@ -2942,11 +2956,10 @@ class RailwayManager:
         alive_tags = self._fresh_probe_tags(cands) if self.auto_rescue else []
         stale = False
         if alive_tags:
-            best, second = alive_tags[0], (alive_tags[1] if len(alive_tags) > 1 else None)
+            best = alive_tags[0]
         else:
             stale = True
             best = ((cands[0].get("endpoint") or {}).get("tag"))
-            second = ((cands[1].get("endpoint") or {}).get("tag") if len(cands) > 1 else None)
             try:
                 self._trigger_bg_refresh(f"{tag} all handshakes dead")
             except Exception:
@@ -2955,17 +2968,21 @@ class RailwayManager:
             return "pinned"
         with self._lock:
             self._pinned_fail_streak = 0
+        hot = self._repin_runtime(best, f"{tag} handshake failed")
         with self._config_lock:
-            if not self._apply_config(final="auto", preferred=best, backup=second):
-                return "pinned"
-            if not self._commit_rescue(round_id, best, second):
+            ok = self._commit_rescue(round_id, best, None) if hot else (
+                self._apply_config(final="auto", preferred=best, backup=None)
+                and self._commit_rescue(round_id, best, None))
+        if not ok:
+            if not hot:
                 with self._lock:
-                    cur = self.preferred_tag; cur_b = self.backup_tag
+                    cur = self.preferred_tag
                 if cur is not None:
-                    self._apply_config(final="auto", preferred=cur, backup=cur_b)
-                return "pinned"
+                    self._apply_config(final="auto", preferred=cur, backup=None)
+            return "pinned"
         self._invalidate_verify(f"rescued to {best}")
-        self._record_history("auto-rescue" + ("-stale" if stale else ""), f"{tag} handshake failed, rescued to {best}" + (f" backup={second}" if second else ""))
+        self._record_history("auto-rescue" + ("-stale" if stale else ""),
+                             f"{tag} handshake failed, rescued to {best}" + (" (hot)" if hot else ""))
         return "rescued"
 
     def _commit_rescue(self, round_id: int, best: str | None, second: str | None) -> bool:
@@ -2998,21 +3015,31 @@ class RailwayManager:
             target = node["endpoint"]["tag"] if node is not None else None
             effective = "chain" if target else "auto"
         # trylock: a long refresh apply must not wedge switch for minutes.
-        if not self._config_lock.acquire(timeout=5):
-            return False, "busy, retry later"
-        try:
-            if not self._apply_config(final="auto", preferred=target):
-                return False, "config check failed, kept previous"
+        hot = bool(target) and self._repin_runtime(target, "manual switch")
+        if hot:
+            # Nothing to write: the running config already lists the target as
+            # a chain candidate, so the whole switch is one loopback HTTP call.
             with self._lock:
                 old = self.preferred_tag
                 self.preferred_tag = target; self.backup_tag = None; self._auto_pinned = False
                 self.status["preferred_tag"] = target; self.status["backup_tag"] = None; self.status["auto_pinned"] = False
                 self._rescue_round += 1; self._persist_state()
-        finally:
+        else:
+            if not self._config_lock.acquire(timeout=5):
+                return False, "busy, retry later"
             try:
-                self._config_lock.release()
-            except Exception:
-                pass
+                if not self._apply_config(final="auto", preferred=target):
+                    return False, "config check failed, kept previous"
+                with self._lock:
+                    old = self.preferred_tag
+                    self.preferred_tag = target; self.backup_tag = None; self._auto_pinned = False
+                    self.status["preferred_tag"] = target; self.status["backup_tag"] = None; self.status["auto_pinned"] = False
+                    self._rescue_round += 1; self._persist_state()
+            finally:
+                try:
+                    self._config_lock.release()
+                except Exception:
+                    pass
         with self._lock:
             self._pinned_fail_streak = 0
         if old != target:
@@ -3075,6 +3102,107 @@ class RailwayManager:
             if current.get(key) != config.get(key):
                 return False
         return True
+    def _clash_call(self, path: str, payload: dict | None = None, timeout: float = 3.0) -> tuple[int, str]:
+        """One call against the loopback Clash API (0 = not answerable)."""
+        if not self.clash_api_port:
+            return 0, ""
+        url = f"http://127.0.0.1:{self.clash_api_port}{path}"
+        data = None if payload is None else json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(url, data=data, method="PUT" if data is not None else "GET")
+        request.add_header("Authorization", f"Bearer {self.clash_api_secret}")
+        if data is not None:
+            request.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return int(response.status), response.read(4096).decode("utf-8", "replace")
+        except urllib.error.HTTPError as exc:
+            return int(exc.code), ""
+        except Exception:
+            return 0, ""
+
+    def _clash_api_ready(self, force: bool = False) -> bool:
+        now = time.monotonic()
+        if not force and self._clash_ready_at and now - self._clash_ready_at < 5.0:
+            return True
+        code, _ = self._clash_call("/version", timeout=1.5)
+        self._clash_ready_at = now if code == 200 else 0.0
+        chain_status = self.status.get("chain_switch")
+        if isinstance(chain_status, dict):
+            chain_status["ready"] = code == 200
+        return code == 200
+
+    def _clash_select(self, tag: str) -> bool:
+        """Move the "chain" selector to `tag` without touching the config.
+
+        This is the whole point of the Clash API path: a repin must not rewrite
+        the config, because a rewrite restarts sing-box and kills every live
+        connection of all three paths - the collateral damage that used to take
+        /ws-resi down together with the chain.
+        """
+        if not tag:
+            return False
+        with self._clash_switch_lock:
+            code, _ = self._clash_call("/proxies/chain", {"name": tag})
+        if code in (200, 204):
+            self._clash_ready_at = time.monotonic()
+            chain_status = self.status.get("chain_switch")
+            if isinstance(chain_status, dict):
+                chain_status["ready"] = True
+                chain_status["switches"] = int(chain_status.get("switches", 0)) + 1
+            return True
+        return False
+
+    def _chain_selector_tags(self) -> list[str]:
+        """Every serving tag the "chain" selector may hot-switch to.
+
+        Sorted by tag on purpose: the config must stay byte-identical when the
+        pin changes, otherwise every repin rewrites the file and restarts
+        sing-box again. Which tag is picked is decided at switch time by the
+        evidence ranking; only the *candidate set* lives in the config.
+        """
+        serving = {(node.get("endpoint") or {}).get("tag") for node in self._serving_nodes()}
+        return sorted(tag for tag in serving if tag)
+
+    def _repin_runtime(self, tag: str, reason: str) -> bool:
+        """Hot-switch the chain; False means "fall back to a config rewrite"."""
+        if not (self.resi_rotate and self.want_singbox and tag):
+            return False
+        if not self._clash_api_ready():
+            return False
+        if not self._clash_select(tag):
+            self._record_history("chain-hot-switch-failed", f"{reason}: {tag}")
+            return False
+        return True
+
+    def _repoint_chain(self, tag: str | None, round_id: int, reason: str) -> bool:
+        """Point the chain at `tag`: hot switch first, config rewrite as fallback."""
+        if not tag:
+            return False
+        hot = self._repin_runtime(tag, reason)
+        with self._config_lock:
+            if hot:
+                return self._commit_rescue(round_id, tag, None)
+            if not self._apply_config(final="auto", preferred=tag, backup=None):
+                return False
+            return self._commit_rescue(round_id, tag, None)
+
+    def _reapply_pin_when_ready(self) -> None:
+        """After a restart sing-box starts on the config's default pin.
+
+        A pin that only ever existed as a hot switch is not in the file, so put
+        it back as soon as the API answers.
+        """
+        for _ in range(60):
+            tag = self.preferred_tag
+            if not tag:
+                return
+            try:
+                if self._clash_api_ready(force=True) and self._clash_select(tag):
+                    return
+            except Exception:
+                pass
+            time.sleep(0.5)
+
     def _apply_config(self, final: str = "auto", preferred: str | None = None, backup: str | None = None) -> bool:
         serving = self._ordered_serving()
         resi_outbound = self._resi_outbound()
@@ -3086,11 +3214,16 @@ class RailwayManager:
             vless_uuid = self.vless_uuid or None; direct_port = self.vless_direct_port; chain_port = self.vless_chain_port
             resi_port = self.resi_port; resi_path = self.resi_path
             config_path = self.config_path; last_good_path = self.last_good_path; want_singbox = self.want_singbox
+            clash_api = ({"external_controller": f"127.0.0.1:{self.clash_api_port}",
+                          "secret": self.clash_api_secret}
+                         if (self.clash_api_port and want_singbox) else None)
+            candidates = self._chain_selector_tags() if self.resi_rotate else None
         config = build_singbox_config(endpoints, "127.0.0.1", mixed_port, mixed_users=[(username, password)],
             final=final, preferred=preferred, backup=backup, vless_uuid=vless_uuid,
             vless_direct_port=direct_port, vless_chain_port=chain_port,
             resi=resi_outbound, resi_port=resi_port, resi_path=resi_path,
-            resi_rotate=self.resi_rotate, resi_rotate_tags=rotate_tags)
+            resi_rotate=self.resi_rotate, resi_rotate_tags=rotate_tags,
+            chain_candidates=candidates, clash_api=clash_api)
         if self.resi_rotate:
             self._set_resi_routes(rotate_routes)
         if want_singbox and self._serving_config_unchanged(config):
@@ -3405,6 +3538,10 @@ class RailwayManager:
                     if rip:
                         pinned_second = (r.get("endpoint") or {}).get("tag")
                         break
+                if self.resi_rotate:
+                    # One reserved node is all the rotation can spare; the chain
+                    # fails over through a Clash API hot switch, not a standby.
+                    pinned_second = None
                 break
         if pinned is None:
             if self.resi_rotate:
@@ -3414,10 +3551,7 @@ class RailwayManager:
                 # per node. Pin the best *dial-verified* node even without an
                 # exit probe; the pin is what lets the rotation exclude it.
                 pinned = best
-                # Rotate mode wants a reserved standby so the chain urltest
-                # pair exists even without exit-IP verification (a dial-verified
-                # node already carries a tunnel; urltest probes it anyway).
-                pinned_second = second if (self.resi_rotate and second != pinned) else None
+                pinned_second = None    # never invent an unverified standby
                 with self._config_lock:
                     if not self._apply_config(final="auto", preferred=pinned, backup=pinned_second):
                         self._record_history("auto-pin-failed", pinned)
@@ -4044,6 +4178,10 @@ class RailwayManager:
                     new_handle = None
             self._singbox_proc = new_proc; self._stderr_handle = new_handle
         _reap_process(old_proc, old_handle)
+        if self.clash_api_port and self.resi_rotate:
+            # The fresh process starts on the config's default pin; a pin that
+            # only ever existed as a hot switch has to be put back.
+            threading.Thread(target=self._reapply_pin_when_ready, daemon=True, name="clash-pin").start()
     def _terminate_singbox(self) -> None:
         with self._lock:
             proc, self._singbox_proc = self._singbox_proc, None
@@ -4105,7 +4243,8 @@ def main() -> int:
         resi_session_ttl=(cfg["resi"]["session_ttl"] if cfg["resi"] else 0),
         tunnel_token=cfg["tunnel_token"], cloudflared_bin=cfg["cloudflared_bin"], disguise_path=cfg["disguise_path"],
         config_path=os.path.join(data_dir, "singbox-railway.json"), nodes_path=os.path.join(data_dir, "nodes.json"),
-        state_path=os.path.join(data_dir, "state.json"), settings_path=os.path.join(data_dir, "settings.json"))
+        state_path=os.path.join(data_dir, "state.json"), settings_path=os.path.join(data_dir, "settings.json"),
+        clash_api_port=cfg["clash_api_port"])
     stop_event = threading.Event()
     def _on_signal(signum, frame) -> None:
         stop_event.set()

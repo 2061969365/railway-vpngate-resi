@@ -570,35 +570,64 @@ D12 留下的疑点（"第三路相关动作改写了配置"）在这一轮被�
 
 修法：
 
-- rotate 模式下 `chain` 改成 **`urltest[pin, backup]`**：两个都是预留节点（轮换永远
-  不拨），pin 死掉由 urltest 在一个探测周期内切到 backup，**不写配置、不重启**；只有
-  两个都死才需要 manager 介入。`_rescue_chain` 现在总是补一个 backup，保证这个
-  "双节点对"永远存在；`_auto_pin_best` 在 rotate 模式下也用 dial-verified 的次优节点
-  当 standby（不再因为出口 IP 没验过就留空）。
+- rotate 模式下 `chain` 改成 **selector over 全部 serving 节点**（`chain_candidates`），
+  pin 的切换走 **sing-box Clash API 的 `PUT /proxies/chain`**：一条回环 HTTP 调用，
+  **不写配置、不重启 sing-box、不掐断任何连接**。热切换失败（API 没起来 / 目标不在候选
+  里）才退回"写配置 + 重启"。
 - `_chain_candidates_locked()`：按**活证据**排序——① 最近 15 分钟真的从它传过 payload
   的节点（`_resi_payload_at`：轮换侧的成功流量就是最新鲜的"活着"证明）② 未被 park 的
   已验证节点（按 `real_latency_ms`）③ 被 park 的节点（按 `down_until`，和轮换自己的
-  兜底顺序一致）。pin/backup 和 `_chain_dead_until` 里的节点一律排除。
+  兜底顺序一致）。pin 和 `_chain_dead_until` 里的节点一律排除。
 - `_chain_dead_until` 失败记忆（15 分钟）：刚被判死的 pin 不会被下一次 rescue 再选中，
   连续 rescue 会**逐个走完池子**而不是原地打转；某节点重新真的传过 payload
   （`_resi_proven`）或 chain 探针成功时立刻清掉记忆。
 - pin 从快照消失 ⇒ 直接重 pin，不再留在 `auto` urltest 上。
-- **pin 的 TCP 握手死了但 chain 仍在出 IP**（standby 已接管）：不重 pin、不重写配置、
-  不重启 sing-box——此时重启会掐断所有第三路连接，而 chain 本来就在工作。只记一条
-  `chain-on-standby`（同一个死 pin 只记一次），把重 pin 留给"两个预留节点都死"的
-  真实故障。
+- **pin 的 TCP 握手死了但 chain 仍在出 IP**（热切换后的节点在承载）：不重 pin、不重写
+  配置、不重启 sing-box——此时重启会掐断所有第三路连接，而 chain 本来就在工作。只记
+  一条 `chain-on-standby`（同一个死 pin 只记一次）。
 - 冷却 30s 起、上限 120s（原来 45s→300s），配合失败记忆，恢复时间是"一个健康节点被
   找到为止"，最坏情况随池子大小线性增长而不是无限。
-- TCP 握手就死的那条分支同样改用证据排序，并且优先把预留 standby 提为 pin。
+- TCP 握手就死的那条分支同样改用证据排序 + 热切换。
 
-证据：`test_chain_group_fails_over_between_the_two_reserved_nodes`、
-`test_rotate_without_a_backup_keeps_the_selector`、
+证据：`test_chain_selector_lists_every_serving_tag`、
+`test_chain_selector_never_dials_the_rotation_group`、
+`test_clash_api_is_added_for_runtime_pinning`、
+`test_chain_rescue_hot_switches_without_rewriting_the_config`、
+`test_manual_switch_hot_switches_when_the_tag_is_a_candidate`、
+`test_hot_switch_falls_back_to_a_rewrite_when_the_api_is_down`、
+`test_chain_selector_tags_cover_the_whole_serving_set`、
 `test_chain_rescue_prefers_the_node_that_carries_rotation_traffic`、
 `test_chain_rescue_walks_the_pool_instead_of_bouncing`、
 `test_chain_rescue_skips_a_node_the_rotation_parked`、
-`test_a_pin_that_left_the_snapshot_gets_repinned`；`sing-box check` 对两种形态
-（urltest 双节点对 / 单 pin selector 兜底）都通过；本地复现脚本（陈旧延迟 + pin 隧道死）
-在修复前 `A→B→A` 永不恢复，修复后第 2 个健康周期就切到轮换证明活着的节点。
+`test_a_pin_that_left_the_snapshot_gets_repinned`；真 `sing-box 1.14.0` 实测
+`PUT /proxies/chain {"name": ...}` 返回 204 且 `/proxies/chain.now` 立即变成新节点、
+未知 tag 返回失败（优雅回退）——见 §12.9g。
+
+### 12.9g D15：urltest 双预留把轮换池吃掉（"chain 活着 resi 挂了"）
+
+D14 用 `urltest[pin, backup]` 换来了"pin 死 15s 自愈"，代价是**永久预留两个节点**：
+VPNGate 一个节点只允许一个会话，预留即意味着轮换永远不能用它，而且 urltest 每 15s
+对这两个节点各探一次、常驻两条会话。池子小的部署（或者节点大面积被 park 时）轮换池
+会被压到 0，于是 `/ws-chain` 活着、`/ws-resi` 挂掉——和上一次的故障正好镜像。
+
+修法（D15，替代 D14 的 urltest）：**只预留 1 个节点 + 运行时热切换**。
+
+- `chain` = `selector[所有 serving 节点, default=pin, interrupt_exist_connections=false]`，
+  候选集按 tag 排序写进配置（字节稳定，不会因为排序变化触发重写）。
+- 换 pin = `PUT /proxies/chain {"name": tag}`（Clash API 绑 `127.0.0.1:$CLASH_API_PORT`，
+  带随机 secret）。**不写文件、不重启、不断连接**，所以轮换侧完全无感。
+- 重启后 pin 的恢复：sing-box 起在配置里的 `default` 上，`_reapply_pin_when_ready()`
+  在 API 就绪后把运行时 pin 重新选回去。
+- 预留数回到 1 ⇒ 轮换池与 D13 完全一致；`backup_tag` 在 rotate 模式下恒为 `None`
+  （旧 state.json 里的 backup 会在加载时清掉）。
+- 热切换失败时退回 D13 的"写配置 + 重启"，所以功能不依赖 Clash API 可用。
+
+代价与取舍：热切换要等 chain 探针连续失败 2 次（约 40s）才触发，比 urltest 的 15s 慢，
+但**代价是 0 连带伤害**（不重启、不掐连接、不占第二个节点）；而 D14 的 15s 是拿
+"resi 池 -1 且常驻两条探测会话"换来的。`CLASH_API_PORT=0` 可整体关闭热切换。
+
+证据：真 sing-box 1.14.0 上 `PUT /proxies/chain` → 204、`now` 立即切换、错误 tag 优雅
+失败；单测覆盖"热切换不写配置文件"（`_apply_config` 断言未被调用）与"API 不可用时回退"。
 
 ### 12.10 不变量（后续改动必须守住）
 

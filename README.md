@@ -146,6 +146,7 @@ vless://<UUID>@node.example.com:443?security=tls&sni=node.example.com&type=ws&pa
 | `RESI_USER_TEMPLATE` | `{user}` | 粘性模式用；占位符仅 `{user}` `{session}` `{ttl}` |
 | `RESI_PORT` / `RESI_PATH` | `8084` / `/ws-resi` | 入站端口 / WS 路径 |
 | `RESI_PROBE_INTERVAL` | `300` | 住宅出口自动探测间隔（秒） |
+| `CLASH_API_PORT` | `9090` | sing-box Clash API 的**回环**端口，换 pin 走 `PUT /proxies/chain`（不写配置、不重启）。`0` = 关闭热切换，退回"改配置+重启" |
 
 **粘性（Sticky）**：`RESI_SESSION_TTL>0` 且 `RESI_USER_TEMPLATE` 里包含 `{session}`
 才会渲染 session 参数。格式必须按代理商官方文档填写，本仓库不猜格式：

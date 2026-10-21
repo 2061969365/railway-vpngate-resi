@@ -1234,12 +1234,13 @@ class PinnedHealthTests(unittest.TestCase):
                         self.assertEqual("rescued", manager.check_pinned_health(probe_fn=failing))
 
                 self.assertEqual("vpngate-1", manager.preferred_tag)
-                self.assertEqual("vpngate-2", manager.backup_tag)
+                # One reserved node: the chain fails over through a Clash API
+                # hot switch, so no standby is taken from the rotation.
+                self.assertIsNone(manager.backup_tag)
                 self.assertTrue(manager._auto_pinned)
                 written = _read_json(f"{tmpdir}/singbox.json")
                 chain = next(o for o in written["outbounds"] if o["tag"] == "chain")
-                self.assertEqual(["vpngate-1", "vpngate-2", "auto"],
-                                 chain["outbounds"])
+                self.assertEqual(["vpngate-1", "auto"], chain["outbounds"])
                 events = [e["event"] for e in manager.status["refresh_history"]]
                 # "auto-rescue-stale" when no candidate had a fresh verify:
                 # the rescue still happens, it is just based on stale data.

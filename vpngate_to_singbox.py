@@ -1239,6 +1239,8 @@ def build_singbox_config(
     resi_in_port: int = RESI_IN_PORT,
     resi_rotate: bool = False,
     resi_rotate_tags: list[str] | None = None,
+    chain_candidates: list[str] | None = None,
+    clash_api: dict | None = None,
 ) -> dict:
     """Wrap endpoints in a minimal checkable sing-box config.
 
@@ -1258,16 +1260,20 @@ def build_singbox_config(
     two paths never mix. Requires the mixed inbound (the $PORT mux target).
 
     When preferred names one of the endpoint tags, a "chain" group becomes
-    route.final instead of the bare tag. In rotate mode (resi_rotate) the group
-    is a *urltest* over [preferred, backup]: a selector never fails over by
-    itself, so a dead pinned node used to leave the chain dead until the
-    manager repinned it - minutes of downtime, and only if the rescue happened
-    to pick a live node. urltest keeps the two reserved nodes as a hot standby
-    pair (both are excluded from the rotation, so failing over cannot create
-    the duplicate-VPNGate-session collision that killed the chain before).
-    In every other mode the group stays a selector ([preferred, backup?,
-    "auto"]), where the all-nodes urltest can be the last resort without
-    competing with a rotation.
+    route.final instead of the bare tag. It is a *selector*, because the
+    manager switches it through the Clash API (``PUT /proxies/chain``): a repin
+    is then a local HTTP call - no config rewrite, no sing-box restart and no
+    dropped connections - which is the only way to move the pin without
+    collateral damage to the rotation. ``chain_candidates`` lists every tag the
+    selector may be switched to (rotate mode passes all serving endpoints, so
+    any live node is one call away); without it the group falls back to
+    [preferred, backup?, "auto"]. A selector never fails over by itself, and
+    that is fine: the manager probes the chain path every health tick and
+    hot-switches it, so a dead pin costs one probe interval, not a dead path.
+
+    ``clash_api`` ({"external_controller", "secret"}) adds the experimental
+    Clash API section that makes those runtime switches possible; it is bound
+    to loopback only.
 
     When resi ({"server","server_port","username","password"}) is given, a
     third path is added: a "resi" socks outbound plus a "vless-resi" WS
@@ -1305,18 +1311,21 @@ def build_singbox_config(
         "route": {"final": route_final, "auto_detect_interface": True},
     }
     if preferred:
-        failover = [preferred] + ([backup] if backup else [])
-        if resi_rotate and backup:
-            # Two reserved nodes and a real health-based switch: the chain
-            # survives its pin dying without a config rewrite, and the rotation
-            # never dials either of them (see the docstring above).
-            config["outbounds"].append(
-                {"type": "urltest", "tag": "chain", "outbounds": failover,
-                 "interval": "15s", "tolerance": 50})
-        else:
-            config["outbounds"].append(
-                {"type": "selector", "tag": "chain",
-                 "outbounds": failover + ["auto"]})
+        ordered: list[str] = [preferred]
+        for tag in (chain_candidates or []):
+            if tag in tags and tag not in ordered:
+                ordered.append(tag)
+        if backup and backup in tags and backup not in ordered:
+            ordered.append(backup)
+        if chain_candidates is None and "auto" not in ordered:
+            ordered.append("auto")
+        config["outbounds"].append({
+            "type": "selector", "tag": "chain", "outbounds": ordered,
+            "default": preferred,
+            # A runtime switch must not tear down the connections already
+            # riding the chain: only new connections move to the new pin.
+            "interrupt_exist_connections": False,
+        })
     if mixed_listen is not None and mixed_port is not None:
         inbound: dict = {"type": "mixed", "tag": "mixed-in",
                          "listen": mixed_listen, "listen_port": mixed_port}
@@ -1393,6 +1402,11 @@ def build_singbox_config(
             })
             config["route"].setdefault("rules", []).append(
                 {"inbound": f"resi-rot-{i}", "outbound": ep["tag"]})
+    if clash_api:
+        # Loopback-only REST API: it is how the manager moves the "chain"
+        # selector at runtime (PUT /proxies/chain) instead of rewriting this
+        # file and restarting sing-box for every repin.
+        config["experimental"] = {"clash_api": dict(clash_api)}
     return config
 
 
