@@ -1160,7 +1160,7 @@ class PinnedHealthTests(unittest.TestCase):
                         self.assertTrue(manager.refresh_once())
                     manager.switch(tag="vpngate-0")
                     # The pin has been in place for a while: no warm-up grace.
-                    manager._chain_pin_at = 0.0
+                    manager._chain_pin_at = time.monotonic() - 3600.0
 
                     failing = lambda host, port, timeout=5: 0
                     with mock.patch.object(manager, "dial_fn",
@@ -1192,7 +1192,7 @@ class PinnedHealthTests(unittest.TestCase):
                     manager.switch(tag="vpngate-0")
                     # A pin from an earlier round, not a warm-up pin:
                     # otherwise CHAIN_SETTLE_GRACE suppresses the rescue.
-                    manager._chain_pin_at = 0.0
+                    manager._chain_pin_at = time.monotonic() - 3600.0
                     by_server = {n["server"]: n for n in manager._nodes}
                     by_server["203.0.113.11"]["real_latency_ms"] = 70
                     by_server["203.0.113.12"]["real_latency_ms"] = 30
@@ -3314,14 +3314,14 @@ class RefreshAutoProbeTests(unittest.TestCase):
 
 
 class RefreshGateTests(unittest.TestCase):
-    """Refresh must not serve a pin until this round's full probe lands.
+    """The refresh stays out of the pin decision.
 
-    Root cause: refresh_once applied the config from stale pins (old
-    real_latency_ms, or None -> urltest blind pick), then kicked the
-    full probe to the background. The serving pin therefore described
-    last round's world, frequently a handshake-fast but tunnel-dead
-    node. The gate: refresh waits (bounded) for this round's full
-    probe to finish before applying the serving pin.
+    The old gate ("refresh waits for this round's full probe before applying
+    the pin") was removed with the simpler-manager rewrite: rotate mode never
+    re-dials a serving node - a second session would kick the live one (D13) -
+    so a refresh cannot re-measure the nodes it serves, and re-picking the pin
+    from such a measurement would only pin a stale node. The health loop that
+    rides the served chain is the only judge of the pin.
     """
 
     def _manager(self, **kwargs):
@@ -3366,7 +3366,7 @@ class RefreshGateTests(unittest.TestCase):
             manager.preferred_tag = "vpngate-0"
             manager.status["preferred_tag"] = "vpngate-0"
             manager._auto_pinned = True
-            manager._chain_pin_at = 0.0
+            manager._chain_pin_at = time.monotonic() - 3600.0
             with _fake_singbox(), \
                  mock.patch("railway_manager.probe_tcp_latency",
                             return_value=100), \
@@ -3415,7 +3415,7 @@ class RefreshGateTests(unittest.TestCase):
             manager.preferred_tag = "vpngate-0"
             manager.status["preferred_tag"] = "vpngate-0"
             manager._auto_pinned = True
-            manager._chain_pin_at = 0.0
+            manager._chain_pin_at = time.monotonic() - 3600.0
             with _fake_singbox(), \
                  mock.patch("railway_manager.probe_tcp_latency",
                             return_value=100):
@@ -3479,13 +3479,16 @@ class AutoPinTests(unittest.TestCase):
                                         "server_port": 443}}
                           for i, (ip, hand) in enumerate(specs)]
 
-    def _run_probe(self, manager, dial):
+    def _run_probe(self, manager, dial, verify=None):
         manager.dial_fn = dial
-        # Auto-pin verifies exit IPs; unit tests stub it alive unless
-        # they patch verify_fn themselves for the exit-IP cases.
+        # Auto-pin verifies exit IPs; unit tests stub it alive unless they
+        # pass their own `verify`. It has to be injected HERE: patching
+        # manager.verify_fn outside would be shadowed by this patch and the
+        # caller's assertion would be vacuous.
+        side_effect = verify if verify is not None else (
+            lambda ep: ("9.9.9.9", 11))
         with _fake_singbox(), \
-             mock.patch.object(manager, "verify_fn",
-                               side_effect=lambda ep: ("9.9.9.9", 11)):
+             mock.patch.object(manager, "verify_fn", side_effect=side_effect):
             self._post(manager, "/api/full_probe")
             manager._full_probe_thread.join(timeout=30)
 
@@ -3536,8 +3539,74 @@ class AutoPinTests(unittest.TestCase):
         self.assertEqual("vpngate-0", manager.preferred_tag)
         self.assertIsNone(manager.backup_tag)
 
+    def test_rotate_cold_start_never_dials_to_verify(self) -> None:
+        """Rotate mode must not verify by dialing.
+
+        `verify_fn` starts a throwaway sing-box client, i.e. a SECOND VPNGate
+        session: duplicate-cn kicks the one the rotation is serving. The
+        rotation already dialed these nodes (real_latency_ms is set only after
+        a real dial), so the pin is taken from them directly."""
+        verify_calls: list[str] = []
+
+        def _verify(ep):
+            verify_calls.append(ep["server"])
+            return ("9.9.9.9", 11)
+
+        manager = self._manager(resi_rotate=True, vless_uuid="u-u-i-d")
+        try:
+            self._seed_nodes(manager, ("203.0.113.11", 100),
+                             ("203.0.113.12", 200))
+            manager._nodes[0]["real_latency_ms"] = 10
+            manager._nodes[1]["real_latency_ms"] = 20
+            manager.verify_fn = _verify
+            with mock.patch.object(RailwayManager, "_check_config",
+                                   return_value=True), \
+                 mock.patch.object(RailwayManager, "_restart_singbox"):
+                manager._auto_pin_best(manager._nodes, None)
+            events = [e["event"] for e in manager.status["refresh_history"]]
+            pinned = manager.preferred_tag
+            backup = manager.backup_tag
+        finally:
+            manager.stop()
+
+        self.assertEqual([], verify_calls,
+                         "rotate mode must never dial a node to verify it")
+        self.assertEqual("vpngate-0", pinned)
+        self.assertIsNone(backup, "rotate mode reserves exactly one node")
+        self.assertIn("auto-pin-unverified", events)
+
+    def test_a_repeated_full_probe_does_not_restart_singbox(self) -> None:
+        """The full probe re-publishes the same config: the file is identical
+        and sing-box is NOT restarted the second time (no flap, no dropped
+        client connection)."""
+        dial = lambda node: {"203.0.113.11": 70, "203.0.113.12": 30}[node["server"]]
+        manager = self._manager(start_singbox=True)
+        try:
+            self._seed_nodes(manager, ("203.0.113.11", 100),
+                             ("203.0.113.12", 200))
+            manager._singbox_proc = mock.Mock(poll=mock.Mock(return_value=None))
+            with mock.patch.object(RailwayManager, "_restart_singbox") as restart:
+                self._run_probe(manager, dial)
+                first = Path(manager.config_path).read_bytes()
+                restarts_after_first = restart.call_count
+                self._run_probe(manager, dial)
+                second = Path(manager.config_path).read_bytes()
+                restarts_after_second = restart.call_count
+        finally:
+            manager.stop()
+
+        self.assertEqual(1, restarts_after_first,
+                         "the first pass has to publish the config")
+        self.assertEqual(restarts_after_first, restarts_after_second,
+                         "an unchanged config must not restart sing-box")
+        self.assertEqual(first, second, "the config must be byte-identical")
+
     def test_tie_keeps_current_without_flap(self) -> None:
-        manager = self._manager()
+        """An existing pin is never re-verified and never replaced: the full
+        probe publishes the SAME pin pair, so the chain selector still points
+        at the pin the operator chose (no flap)."""
+        verify_mock = mock.Mock(return_value=("9.9.9.9", 11))
+        manager = self._manager(start_singbox=True)
         try:
             self._seed_nodes(manager, ("203.0.113.11", 100),
                              ("203.0.113.12", 200))
@@ -3546,30 +3615,34 @@ class AutoPinTests(unittest.TestCase):
             manager.backup_tag = "vpngate-0"
             manager.status["backup_tag"] = "vpngate-0"
             manager._auto_pinned = True
-            with _fake_singbox(), \
-                 mock.patch.object(manager, "_apply_config",
-                                   return_value=True) as apply_mock, \
-                 mock.patch.object(manager, "verify_fn",
-                                   side_effect=AssertionError(
-                                       "tie-keep must not verify")) as verify_mock:
+            manager._singbox_proc = mock.Mock(poll=mock.Mock(return_value=None))
+            with mock.patch.object(RailwayManager, "_restart_singbox") as restart:
                 self._run_probe(manager, lambda node: {"203.0.113.11": 60,
-                                                       "203.0.113.12": 50}[node["server"]])
+                                                       "203.0.113.12": 50}[node["server"]],
+                                verify=verify_mock)
                 events = [e["event"]
                           for e in manager.status["refresh_history"]]
+                config = _read_json(manager.config_path)
         finally:
             manager.stop()
 
+        # The pin and the standby are untouched ...
         self.assertEqual("vpngate-1", manager.preferred_tag)
         self.assertEqual("vpngate-0", manager.backup_tag)
         self.assertIn("auto-pin-skipped", events)
-        # `_run_full_probe_inner` ends with `_republish_config()`, which
-        # re-applies the *same* pins; `_apply_config` short-circuits on an
-        # unchanged file, so this is not a flap. What must never happen is
-        # a different pin being written or a verify dial opening.
-        apply_mock.assert_called_once_with(final="auto",
-                                          preferred="vpngate-1",
-                                          backup="vpngate-0")
+        # ... and the pin was never verified (a verify dials the node, which
+        # would open a second VPNGate session and kill the serving one).
         verify_mock.assert_not_called()
+        # ... and the published config still points the chain at that pin.
+        chain = next((o for o in config["outbounds"]
+                      if o.get("tag") == "chain"), None)
+        self.assertIsNotNone(chain, "a pinned chain must publish a selector")
+        self.assertEqual("vpngate-1", chain["outbounds"][0])
+        self.assertEqual("vpngate-1", chain.get("default"))
+        self.assertIn("vpngate-0", chain["outbounds"],
+                      "the standby stays in the selector")
+        self.assertEqual(1, restart.call_count,
+                         "the probe publishes the config exactly once")
 
     @unittest.skip("auto-pin repin path was dropped in the simpler-manager rewrite; AUTO_REPIN is no longer wired from env")
     def test_same_best_refreshes_stale_backup(self) -> None:
@@ -4980,7 +5053,8 @@ class DeadPinTests(unittest.TestCase):
 
     def test_a_dead_pin_is_replaced_even_with_nothing_measured(self) -> None:
         """The pin died and has no fresh latency of its own: the health loop
-        still moves the chain onto a handshake-verified node.
+        still moves the chain onto another node - and records the *stale*
+        fallback, because no candidate answered a fresh handshake.
 
         The old full-probe tie-keep used to do this; after the simpler-manager
         rewrite `_auto_pin_best` never touches an existing pin, so
@@ -4992,25 +5066,68 @@ class DeadPinTests(unittest.TestCase):
                 dial_fn=lambda node: dial_calls.append(node["server"]) or None)
             try:
                 # The pin was never dialed (real_latency_ms=None); the only
-                # replacement candidate can only be ranked by its handshake.
+                # replacement candidate is ranked by its stale measurement.
                 self._seed_nodes(manager, ("203.0.113.11", 100, None),
                                  ("203.0.113.12", 200, 40))
                 manager.preferred_tag = "vpngate-0"
                 manager.status["preferred_tag"] = "vpngate-0"
                 manager._auto_pinned = True
-                manager._chain_pin_at = 0.0     # old pin: no warm-up grace
+                # An old pin, not a warm-up one: CHAIN_SETTLE_GRACE would
+                # otherwise suppress the very death judgement under test.
+                manager._chain_pin_at = time.monotonic() - 3600.0
                 failing = lambda host, port, timeout=5: 0
-                with _fake_singbox():
+                with _fake_singbox(), \
+                     mock.patch("railway_manager.probe_tcp_latency",
+                                return_value=0):
                     result = manager.check_pinned_health(probe_fn=failing)
                     events = [(e["event"], e.get("detail", ""))
                               for e in manager.status["refresh_history"]]
+                # read the files while the temp dir still exists
+                state = _read_json(manager.state_path)
+                config = _read_json(manager.config_path)
             finally:
                 manager.stop()
 
         self.assertEqual("rescued", result)
         self.assertEqual("vpngate-1", manager.preferred_tag)
         self.assertEqual([], dial_calls, "a real dial would open a second session")
-        self.assertTrue(any(ev.startswith("auto-rescue") for ev, _ in events))
+        # No candidate answered a fresh handshake: the stale fallback is
+        # recorded, and the pin is moved all the same.
+        self.assertIn("auto-rescue-stale", [ev for ev, _ in events])
+        # The new pin is published and persisted, not just held in memory.
+        self.assertEqual("vpngate-1", manager.status["preferred_tag"])
+        self.assertEqual("vpngate-1", state.get("preferred_tag"))
+        chain = next((o for o in config["outbounds"]
+                      if o.get("tag") == "chain"), None)
+        self.assertIsNotNone(chain, "a pinned chain must publish a selector")
+        self.assertEqual("vpngate-1", chain["outbounds"][0])
+
+    def test_a_dead_pin_is_replaced_with_fresh_handshake_evidence(self) -> None:
+        """The replacement candidate answers a fresh handshake: the rescue
+        records the *evidenced* event, not the stale fallback."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = self._manager(tmpdir, dial_fn=lambda node: None)
+            try:
+                self._seed_nodes(manager, ("203.0.113.11", 100, None),
+                                 ("203.0.113.12", 200, 40))
+                manager.preferred_tag = "vpngate-0"
+                manager.status["preferred_tag"] = "vpngate-0"
+                manager._auto_pinned = True
+                manager._chain_pin_at = time.monotonic() - 3600.0
+                failing = lambda host, port, timeout=5: 0
+                with _fake_singbox(), \
+                     mock.patch("railway_manager.probe_tcp_latency",
+                                return_value=50):
+                    result = manager.check_pinned_health(probe_fn=failing)
+                    events = [e["event"]
+                              for e in manager.status["refresh_history"]]
+            finally:
+                manager.stop()
+
+        self.assertEqual("rescued", result)
+        self.assertEqual("vpngate-1", manager.preferred_tag)
+        self.assertIn("auto-rescue", events)
+        self.assertNotIn("auto-rescue-stale", events)
 
     def test_health_failure_never_dials_and_fast_rescues(self) -> None:
         """First failed handshake rescues to the alive node immediately (no
@@ -5027,7 +5144,7 @@ class DeadPinTests(unittest.TestCase):
                 manager.preferred_tag = "vpngate-0"
                 manager.status["preferred_tag"] = "vpngate-0"
                 manager._auto_pinned = True
-                manager._chain_pin_at = 0.0
+                manager._chain_pin_at = time.monotonic() - 3600.0
                 failing = lambda host, port, timeout=5: 0
                 with _fake_singbox():
                     result = manager.check_pinned_health(probe_fn=failing)
@@ -5054,7 +5171,7 @@ class DeadPinTests(unittest.TestCase):
                 manager.preferred_tag = "vpngate-0"
                 manager.status["preferred_tag"] = "vpngate-0"
                 manager._auto_pinned = True
-                manager._chain_pin_at = 0.0
+                manager._chain_pin_at = time.monotonic() - 3600.0
                 healthy = lambda host, port, timeout=5: 120
                 with _fake_singbox(), \
                      mock.patch.object(manager, "_chain_probe_ok",
@@ -5088,7 +5205,7 @@ class DeadPinTests(unittest.TestCase):
                 manager.preferred_tag = "vpngate-0"
                 manager.status["preferred_tag"] = "vpngate-0"
                 manager._auto_pinned = True
-                manager._chain_pin_at = 0.0
+                manager._chain_pin_at = time.monotonic() - 3600.0
                 with _fake_singbox(), \
                      mock.patch.object(manager, "_chain_probe_ok",
                                        return_value=True):

@@ -3567,30 +3567,34 @@ class RailwayManager:
                 self._record_history("auto-pin-skipped", f"switched mid-run to {self.preferred_tag}")
                 return
         pinned = None; pinned_second = None
-        for i, cand in enumerate(measured[:EXIT_VERIFY_CAP]):
-            tag = (cand.get("endpoint") or {}).get("tag")
-            ep = cand.get("endpoint") or cand
-            try:
-                ip, _ = self.verify_fn(ep)
-            except Exception:
-                ip = None
-            if ip:
-                pinned = tag
-                rest = [n for n in measured[i+1:] if (n.get("endpoint") or {}).get("tag") != tag]
-                pinned_second = None
-                for r in rest[:EXIT_VERIFY_CAP]:
-                    try:
-                        rip, _ = self.verify_fn(r.get("endpoint") or r)
-                    except Exception:
-                        rip = None
-                    if rip:
-                        pinned_second = (r.get("endpoint") or {}).get("tag")
-                        break
-                if self.resi_rotate:
-                    # One reserved node is all the rotation can spare; the chain
-                    # fails over through a Clash API hot switch, not a standby.
+        # Rotate mode must NOT verify by dialing. `verify_fn` starts a
+        # throwaway sing-box client: that opens a SECOND VPNGate session and
+        # duplicate-cn kicks the one the rotation is serving right now - the
+        # same rule `_run_verify` follows through `_served_exit_ip` (D13).
+        # The candidates here are already dial-verified (real_latency_ms is
+        # only set after a real dial), so rotate mode pins the best of them
+        # directly and never dials a serving node.
+        if not self.resi_rotate:
+            for i, cand in enumerate(measured[:EXIT_VERIFY_CAP]):
+                tag = (cand.get("endpoint") or {}).get("tag")
+                ep = cand.get("endpoint") or cand
+                try:
+                    ip, _ = self.verify_fn(ep)
+                except Exception:
+                    ip = None
+                if ip:
+                    pinned = tag
+                    rest = [n for n in measured[i+1:] if (n.get("endpoint") or {}).get("tag") != tag]
                     pinned_second = None
-                break
+                    for r in rest[:EXIT_VERIFY_CAP]:
+                        try:
+                            rip, _ = self.verify_fn(r.get("endpoint") or r)
+                        except Exception:
+                            rip = None
+                        if rip:
+                            pinned_second = (r.get("endpoint") or {}).get("tag")
+                            break
+                    break
         if pinned is None:
             if self.resi_rotate:
                 # Rotate mode must never run with the chain unpinned: an

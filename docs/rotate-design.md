@@ -809,3 +809,58 @@ route rules: 100 {'inbound': 'resi-rot-0', 'outbound': 'vpngate-0'} ... 'resi-ro
    （"有 pin 绝不重新 verify" + "无出口 IP 就不 pin"），因为它原来同时断言两件互相独立的事；
    拆分后两条各自都能独立失败、互不遮蔽。
 
+### 12.15 审计回合：rotate 冷启动不再直拨验证（2026-10-21）
+
+独立审计（只读）挑出三处问题，本轮全部修掉，并补上审计点名的"无人守护"缺口。
+
+**1) rotate 冷启动的 verify 直拨 = duplicate-cn 隐患（产品修复）**
+
+`_auto_pin_best` 在**没有 pin** 时会走 `self.verify_fn(ep)` 逐个直拨候选（默认
+`measure_exit_ip` 会**另起一个 sing-box 进程**直拨该节点）⇒ 第二个 VPNGate 会话 ⇒
+duplicate-cn 把正在服务的那条踢掉。而 rotate 下服务中节点的 `real_latency_ms` 按设计
+**永不刷新**（§12.9e D13），陈旧数字会把轮换此刻正服务、客户端正骑着的节点排进前 3 个候选；
+`_full_probe_targets_locked` 明确把"正在服务"的节点排除在全量真拨之外，而 `_auto_pin_best`
+的 verify 循环**没有等价排除**。这与 `_run_verify` 走 `_served_exit_ip` 的规则是同一条
+（§12.9f：服务中验证必须走 mux）。
+
+修复（`railway_manager.py` 的 `_auto_pin_best`）：**rotate 模式不走 verify 循环**，直接采用
+`best`（`real_latency_ms` 只在真拨成功之后才有 ⇒ 一定是真拨验证过的节点，满足 §12.10 第 8 条），
+backup 恒为 `None`，事件仍是 `auto-pin-unverified`。代码里不再留"服务中验证必须走 mux"的例外。
+
+回归测试：`AutoPinTests::test_rotate_cold_start_never_dials_to_verify`
+（rotate 冷启动 ⇒ `verify_fn` 一次都没被调用、pin = best、backup = None、事件 `auto-pin-unverified`）。
+
+**2) 一条空断言**（`AutoPinTests::test_tie_keeps_current_without_flap`）
+
+`_run_probe` 内部又 patch 了一次 `manager.verify_fn`，把外层那个"不许 verify"的 mock 整个遮蔽
+⇒ `verify_mock.assert_not_called()` 恒为真，**产品真去 verify 了这条用例照样绿**。
+修复：`_run_probe(manager, dial, verify=None)` 改成把 verify 从调用方注入，外层断言恢复有效。
+
+**3) "不抖动"没有断言**
+
+`_apply_config` 被 mock ⇒ `_serving_config_unchanged` 的短路与 `_restart_singbox` 根本没执行，
+"内容不变所以不重启"只是注释。修复：
+
+- `test_tie_keeps_current_without_flap` 不再 mock `_apply_config`，改为断言**发布出去的配置**里
+  chain 选择器仍然是同一组 pin（`outbounds[0]`、`default`、standby 都在）；
+- 新增 `AutoPinTests::test_a_repeated_full_probe_does_not_restart_singbox`：第二次全量探测后
+  配置文件**逐字节相同**，且 `_restart_singbox` **没有**被调用。
+
+**顺带补上的"无人守护"缺口**
+
+- `auto-rescue` 与 `auto-rescue-stale` 现在**分别**有断言：
+  `test_a_dead_pin_is_replaced_even_with_nothing_measured`（没有候选通过新鲜握手 ⇒ stale 事件，
+  pin 照样被换走）与 `test_a_dead_pin_is_replaced_with_fresh_handshake_evidence`
+  （候选通过新鲜握手 ⇒ 事件恰好是 `auto-rescue`）。
+- 换 pin 之后**落盘 + 写进配置**现在有断言：`status["preferred_tag"]`、`state.json` 里的
+  `preferred_tag`、发布配置里 chain 选择器的 `outbounds[0]`。
+- 暖机豁免不再依赖"机器开机多久"：用例里用 `time.monotonic() - 3600.0` 表达"这是一个老 pin"，
+  否则开机不到 45 秒时 `CHAIN_SETTLE_GRACE` 反而会把要测的"判死"豁免掉（偶发红）。
+
+**一条契约变更（老保证在现行机制下无法实现）**
+
+`RefreshGateTests::test_refresh_waits_for_this_round_probe_before_pin` 当年断言"刷新返回时
+pin 必须是换过的那个（不许供一个已知死的节点）"。rotate 不重拨正在服务的节点（D13），
+刷新**测不出来**这个节点是不是死的 ⇒ 现在由健康回路（骑在链路上判活）负责换人，
+刷新只保证"不自己乱换"。这属于**换契约**，不是弱化。
+
