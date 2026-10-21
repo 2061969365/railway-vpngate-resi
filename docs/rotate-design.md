@@ -944,6 +944,16 @@ CI 变绿之后又做了一轮"把不确定性从套件里赶出去"（抖动排
 Windows 与 Linux 相差 2.1 倍的"平台分叉"消失（那 2.1 倍里一半就是上面这些真等待）。
 套件现在：**不联网、不看机器装了什么、不依赖真定时器**。
 
+CI（run 39648621269，commit `6e07d50`，Python 3.12/3.13 × 3 遍 = 6 个 job）：
+
+```
+pytest 3.12 run 1/2/3   573 passed, 2 skipped in 64~66s
+pytest 3.13 run 1/2/3   573 passed, 2 skipped in 64~65s
+```
+
+（离线化之前 CI 是 105s、本地是 222.8s；现在两边都在 ~65~102s，且互不依赖机器。）
+
+
 ### 12.18 云端端到端验收（rotate 冷启动 + 链自愈）
 
 验收 workflow（`.github/workflows/test-chain-acceptance.yml`，`workflow_dispatch` 手动触发，
