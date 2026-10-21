@@ -848,6 +848,34 @@ class RotateManagerTests(unittest.TestCase):
         self.assertEqual("vpngate-d", pinned)
         self.assertEqual("vpngate-b", backup)
 
+    def test_chain_rescue_prefers_a_node_that_returned_bytes(self) -> None:
+        # Weaker evidence than payload, still fresher than a latency number
+        # measured hours ago: a node that answered the rotation beats one that
+        # only looks fast in the stale ranking.
+        manager = self._manager()
+        try:
+            manager._nodes = [
+                {"real_latency_ms": 10, "endpoint": _endpoint("vpngate-a")},
+                {"real_latency_ms": 5, "endpoint": _endpoint("vpngate-b")},
+                {"real_latency_ms": 8, "endpoint": _endpoint("vpngate-c")},
+            ]
+            with manager._lock:
+                manager.preferred_tag = "vpngate-a"
+                manager.status["preferred_tag"] = "vpngate-a"
+                manager._resi_ok_at["vpngate-c"] = time.monotonic()
+            with mock.patch("railway_manager.probe_tcp_latency", return_value=25), \
+                    mock.patch.object(RailwayManager, "_chain_probe_ok", return_value=False), \
+                    mock.patch.object(RailwayManager, "_apply_config", return_value=True), \
+                    mock.patch.object(RailwayManager, "_invalidate_verify"):
+                manager.check_pinned_health()
+                manager.check_pinned_health()
+            pinned = manager.preferred_tag
+        finally:
+            manager.stop()
+            self._cleanup(manager)
+
+        self.assertEqual("vpngate-c", pinned)
+
     def test_chain_rescue_walks_the_pool_instead_of_bouncing(self) -> None:
         # Two dead nodes on top of the stale ranking made the rescue bounce
         # A -> B -> A while the cooldown doubled to five minutes: the chain

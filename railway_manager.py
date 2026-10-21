@@ -1836,6 +1836,9 @@ class RailwayManager:
         # `_chain_dead_until` = nodes that just failed the chain probe and must
         # not be re-pinned while the memory lasts (see _rescue_chain).
         self._resi_payload_at: dict[str, float] = {}
+        # Weaker but earlier proof: the node did return *some* bytes. Enough to
+        # prefer it over a node that merely has a stale latency number.
+        self._resi_ok_at: dict[str, float] = {}
         self._chain_dead_until: dict[str, float] = {}
         self._lock = threading.RLock(); self._refresh_lock = threading.Lock(); self._config_lock = threading.Lock()
         if resi:
@@ -2696,8 +2699,10 @@ class RailwayManager:
 
         1. nodes that just carried rotation payload: the tunnel demonstrably
            works right now, whatever the old latency number says;
-        2. verified nodes the rotation has not parked, by real latency;
-        3. parked nodes, soonest to come back first (last resort, exactly how
+        2. nodes that at least returned some bytes recently (weaker proof, but
+           still fresher than a latency number measured hours ago);
+        3. verified nodes the rotation has not parked, by real latency;
+        4. parked nodes, soonest to come back first (last resort, exactly how
            the rotation itself falls back).
 
         Nodes that already failed the chain probe are skipped while their
@@ -2705,6 +2710,7 @@ class RailwayManager:
         """
         reserved = {self.preferred_tag, self.backup_tag}
         proven: list[dict] = []
+        answered: list[dict] = []
         fresh: list[dict] = []
         parked: list[dict] = []
         for node in self._nodes:
@@ -2718,20 +2724,26 @@ class RailwayManager:
             entry = self._resi_health.get(tag) or {}
             down_until = float(entry.get("down_until", 0.0))
             proof = self._resi_payload_at.get(tag, 0.0)
+            answered_at = self._resi_ok_at.get(tag, 0.0)
             if down_until > now:
                 parked.append(node)
             elif proof and now - proof <= CHAIN_ALIVE_WINDOW:
                 proven.append(node)
+            elif answered_at and now - answered_at <= CHAIN_ALIVE_WINDOW:
+                answered.append(node)
             else:
                 fresh.append(node)
-        proven.sort(key=lambda n: (-self._resi_payload_at.get(
-            (n.get("endpoint") or {}).get("tag") or "", 0.0), n["real_latency_ms"]))
+        def _recent(table: dict[str, float]):
+            return lambda n: (-table.get((n.get("endpoint") or {}).get("tag") or "", 0.0),
+                              n["real_latency_ms"])
+        proven.sort(key=_recent(self._resi_payload_at))
+        answered.sort(key=_recent(self._resi_ok_at))
         fresh.sort(key=lambda n: (n["real_latency_ms"],
                                   (n.get("endpoint") or {}).get("tag") or ""))
         parked.sort(key=lambda n: (
             float((self._resi_health.get((n.get("endpoint") or {}).get("tag") or "") or {})
                   .get("down_until", 0.0)), n["real_latency_ms"]))
-        return proven + fresh + parked
+        return proven + answered + fresh + parked
 
     def _rescue_chain(self, reason: str, round_id: int) -> str:
         """Repin the chain when the tunnel behind a TCP-alive pin is dead.
@@ -3564,6 +3576,8 @@ class RailwayManager:
                 del self._resi_health[tag]
             for tag in [t for t in self._resi_payload_at if t not in live]:
                 del self._resi_payload_at[tag]
+            for tag in [t for t in self._resi_ok_at if t not in live]:
+                del self._resi_ok_at[tag]
             for tag in [t for t in self._chain_dead_until if t not in live]:
                 del self._chain_dead_until[tag]
             if changed:
@@ -3718,6 +3732,9 @@ class RailwayManager:
         endpoint dial-probes a dead IP).
         """
         payload = down_bytes >= RESI_PAYLOAD_BYTES
+        if down_bytes > 0:
+            with self._lock:
+                self._resi_ok_at[tag] = time.monotonic()
         if payload:
             self._resi_proven(tag)
             self._set_resi(state="up", error=None)
