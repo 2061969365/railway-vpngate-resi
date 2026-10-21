@@ -180,6 +180,10 @@ jobs:
                   parts = [p.decode("utf-8", "replace") for p in raw.split(b"\0") if p]
                   if not parts or "sing-box" not in os.path.basename(parts[0]):
                       continue
+                  # `sing-box check -c ...` only validates a config, it opens no
+                  # session: only a `run` can hold a VPNGate session.
+                  if len(parts) < 2 or parts[1] != "run":
+                      continue
                   cfg = None
                   for i, arg in enumerate(parts):
                       if arg == "-c" and i + 1 < len(parts):
@@ -502,15 +506,37 @@ jobs:
           pin, rnd = sys.argv[1], sys.argv[2]
           cfg = json.load(open("/tmp/cfg.json"))
           ep = next(e for e in cfg["endpoints"] if e["tag"] == pin)
-          addrs = [ep["server"]] if ep.get("server") else []
-          addrs += [x["server"] for x in (ep.get("servers") or []) if x.get("server")]
-          ips = sorted({i[4][0] for a in addrs for i in socket.getaddrinfo(a, None)})
-          open(f"/tmp/pin_ips_{rnd}.txt", "w").write("\n".join(ips) + "\n")
-          print(f"round {rnd}: pin {pin}: {ips}")
+          # Every remote of the endpoint, with its port. VPNGate serves many
+          # nodes from the SAME ip on different ports, so the kill has to be
+          # per (ip, port): blocking the whole ip would take the rotation
+          # pool down with it.
+          remotes = []
+          if ep.get("server"):
+              remotes.append((ep["server"], int(ep.get("server_port") or 0)))
+          for item in (ep.get("servers") or []):
+              if isinstance(item, dict) and item.get("server"):
+                  remotes.append((item["server"], int(item.get("server_port") or 0)))
+          pairs = set()
+          for host, port in remotes:
+              try:
+                  infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+              except OSError:
+                  infos = [(host, port)]
+              for info in infos:
+                  ip = info[4][0]
+                  if ":" in ip:          # iptables here is IPv4 only
+                      continue
+                  pairs.add((ip, port))
+          with open(f"/tmp/pin_ips_{rnd}.txt", "w", encoding="utf-8") as fh:
+              for ip, port in sorted(pairs):
+                  fh.write(f"{ip} {port}\n")
+          print(f"round {rnd}: pin {pin}: {len(pairs)} address/port pair(s)")
+          for ip, port in sorted(pairs):
+              print(f"  block {ip}:{port}")
           EOF
-            while read -r ip; do
+            while read -r ip port; do
               [ -n "$ip" ] || continue
-              docker exec -u 0 rotate-trial sh -c "iptables -A OUTPUT -p tcp -d $ip -j REJECT --reject-with tcp-reset; iptables -A OUTPUT -p udp -d $ip -j REJECT" || true
+              docker exec -u 0 rotate-trial sh -c "iptables -A OUTPUT -p tcp -d $ip --dport $port -j REJECT --reject-with tcp-reset; iptables -A OUTPUT -p udp -d $ip --dport $port -j REJECT" || true
             done < /tmp/pin_ips_$round.txt
             PID0=$(sb_pid); MD50=$(cfg_md5)
             echo "round $round before: pin=$PIN switches=$SW0 pid=$PID0 md5=$MD50"
@@ -531,35 +557,53 @@ jobs:
               esac
               sleep 5
             done
-            PID1=$(sb_pid); MD51=$(cfg_md5)
+                        PID1=$(sb_pid); MD51=$(cfg_md5)
             HEAL=$((SECONDS - T0))
             echo "round $round heal_time=${HEAL}s" | tee -a /tmp/heal_times.txt
+            # How many serving sing-box instances did the log see? Each one is
+            # a restart of the serving stack.
+            docker exec rotate-trial sh -c 'cat /app/singbox-railway.json.stderr.log /app/singbox-railway.json.stderr.log.prev 2>/dev/null | grep -ao "\[[0-9]\{4\}\] endpoint/openvpn-client" | sort -u | tr "\n" " "' || true
+            echo
             curl -m 10 -s -H "$AUTH" http://127.0.0.1:3000/api/status -o /tmp/post.json
             python3 - "$PIN" "$SW0" "$PID0" "$PID1" "$MD50" "$MD51" "$round" "$chain" "$sel" "$HEAL" <<'EOF'
-          import json, sys
+          import json, pathlib, sys
           pin0, sw0, pid0, pid1, md50, md51, rnd, chain, sel, heal = sys.argv[1:11]
           s = json.load(open("/tmp/post.json"))
           print(f"round {rnd} after: pin={s['preferred_tag']} switches={s['chain_switch']['switches']} "
                 f"pid={pid1} md5={md51} pool={s['resi']['pool']} selector={sel} heal={heal}s")
+          print(f"round {rnd} last_error: {s.get('last_error')}")
           print(f"round {rnd} events:", [(h["event"], h.get("detail")) for h in s.get("refresh_history", [])][-12:])
           print(f"round {rnd} md5_changed={md51 != md50} pid_changed={pid1 != pid0} "
                 f"switches_delta={int(s['chain_switch']['switches']) - int(sw0)}")
+          problems = []
           if not chain.startswith("ips="):
-              print("ROUND FAILED: the chain never carried traffic again"); raise SystemExit(3)
+              problems.append("the chain never carried traffic again")
           if int(heal) > 120:
-              print(f"ROUND FAILED: the chain healed only after {heal}s (limit 120s)"); raise SystemExit(8)
+              problems.append(f"the chain healed only after {heal}s (limit 120s)")
           if md51 != md50:
-              print("ROUND FAILED: the repin rewrote the config"); raise SystemExit(4)
+              problems.append("the repin rewrote the config")
           if pid1 != pid0:
-              print("ROUND FAILED: the repin restarted sing-box"); raise SystemExit(6)
+              problems.append("the repin restarted sing-box")
           if int(s["chain_switch"]["switches"]) <= int(sw0):
-              print("ROUND FAILED: no hot switch was recorded"); raise SystemExit(5)
+              problems.append("no hot switch was recorded")
           if s["preferred_tag"] == pin0:
-              print("ROUND FAILED: the pin did not move"); raise SystemExit(7)
-          print(f"ROUND {rnd} OK: the chain came back through a hot switch in {heal}s")
+              problems.append("the pin did not move")
+          with open("/tmp/round_results.txt", "a", encoding="utf-8") as fh:
+              fh.write(f"round {rnd}: " + ("; ".join(problems) if problems else "OK") + "\n")
+          if problems:
+              print(f"ROUND {rnd} FAILED: " + "; ".join(problems))
+          else:
+              print(f"ROUND {rnd} OK: the chain came back through a hot switch in {heal}s")
           EOF
             sleep 10
           done
+          echo "=== round results ==="; cat /tmp/round_results.txt 2>/dev/null || true
+          if grep -q "OK$" /tmp/round_results.txt 2>/dev/null && [ "$(grep -c . /tmp/round_results.txt)" = "$(grep -c "OK$" /tmp/round_results.txt)" ]; then
+            echo "ALL ROUNDS OK"
+          else
+            echo "AT LEAST ONE ROUND FAILED (see above)"
+            exit 1
+          fi
 
       - name: No throwaway client dialed an already measured node
         if: always()
@@ -660,6 +704,18 @@ jobs:
           docker logs rotate-trial 2>&1 | grep -n "verify" || echo "(no verify line)"
           echo "=== throwaway VPNGate dials ==="
           docker exec rotate-trial cat /tmp/dial_events.jsonl 2>/dev/null | tail -n 40 || true
+          echo "=== round results ==="; cat /tmp/round_results.txt 2>/dev/null || echo "(none)"
+          echo "=== serving sing-box instances in the log (one per restart) ==="
+          docker exec rotate-trial sh -c 'cat /app/singbox-railway.json.stderr.log /app/singbox-railway.json.stderr.log.prev 2>/dev/null | grep -ao "\[[0-9]\{4\}\] endpoint/openvpn-client" | sort -u | tr "\n" " "' || true
+          echo
+          echo "=== sing-box crash markers ==="
+          docker exec rotate-trial sh -c 'cat /app/singbox-railway.json.stderr.log /app/singbox-railway.json.stderr.log.prev 2>/dev/null | grep -aiE "panic|fatal error|runtime error|goroutine [0-9]+ \[" | head -n 20' || echo "(no panic)"
+          echo "=== last 40 lines of the serving sing-box log ==="
+          docker exec rotate-trial sh -c 'tail -n 40 /app/singbox-railway.json.stderr.log' || true
+          echo "=== manager status: last_error / threads ==="
+          curl -m 10 -s -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:3000/api/status | python3 -c "import json,sys;s=json.load(sys.stdin);print('last_error:',s.get('last_error'));print('refresh_history:',[(h['event'],h.get('detail')) for h in s.get('refresh_history',[])]);print('memory:',s.get('memory'))" || true
+          echo "=== container log (last 60 lines) ==="
+          docker logs rotate-trial 2>&1 | tail -n 60
           echo "=== route rules ==="
           docker exec rotate-trial python3 -c "import json;c=json.load(open('/app/singbox-railway.json'));print(json.dumps(c['route'],indent=1)[:1200])"
           echo "=== restart / rewrite causes ==="
