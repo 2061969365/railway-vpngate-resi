@@ -95,6 +95,26 @@ jobs:
           assert s.get("backup_tag"), s
           print("POOL OK: verified pool with a pinned pair")
           EOF
+          # The initial refresh can still be republishing (auto-pin writes the
+          # config and restarts sing-box). A pid/md5 baseline taken while that
+          # is in flight blames the failover for a restart it did not do: wait
+          # until the process and the config are quiet - no rewrite in the last
+          # 60 seconds, same pid+md5 across two samples.
+          prev=""
+          for i in $(seq 1 60); do
+            pid=$(docker exec rotate-trial sh -c 'for p in /proc/[0-9]*/cmdline; do tr "\0" " " < "$p" 2>/dev/null | grep -q "sing-box run" && echo "$p" | cut -d/ -f3; done | head -n1')
+            md5=$(docker exec rotate-trial sh -c 'md5sum /app/singbox-railway.json | cut -d" " -f1')
+            recent=$(docker logs --since 60s rotate-trial 2>&1 | grep -c "config rewritten" || true)
+            cur="$pid/$md5"
+            echo "settle $i: pid=$pid md5=$md5 rewrites_in_last_60s=$recent"
+            if [ "$cur" = "$prev" ] && [ "$recent" = "0" ]; then
+              echo "SETTLED: pin and sing-box are quiet"
+              break
+            fi
+            prev="$cur"
+            sleep 10
+          done
+          [ "$recent" = "0" ] || { echo "config never settled"; exit 1; }
 
       - name: The chain group is an urltest pair (not a selector)
         run: |
@@ -251,8 +271,17 @@ jobs:
 
       - name: Kill ONLY the chain pin (backup must take over, no restart)
         run: |
+          docker exec -u 0 rotate-trial sh -c "apt-get update -qq && apt-get install -y -qq --no-install-recommends iptables" >/tmp/apt.log 2>&1 || {
+            tail -n 30 /tmp/apt.log; exit 1; }
           # Re-snapshot right before the kill: the baseline wait above may have
           # legitimately triggered a rescue (the initial pin can be a corpse).
+          for i in $(seq 1 12); do
+            recent=$(docker logs --since 60s rotate-trial 2>&1 | grep -c "config rewritten" || true)
+            [ "$recent" = "0" ] && break
+            echo "in-flight config rewrite, waiting before the baseline ($i)"
+            sleep 10
+          done
+          [ "$recent" = "0" ] || { echo "config still being rewritten"; exit 1; }
           docker logs rotate-trial 2>&1 | grep -c "chain rescue:" > /tmp/rescues_at_baseline.txt || true
           docker exec rotate-trial sh -c 'md5sum /app/singbox-railway.json | cut -d" " -f1' > /tmp/cfg_before.txt
           docker exec rotate-trial sh -c 'for p in /proc/[0-9]*/cmdline; do tr "\0" " " < "$p" 2>/dev/null | grep -q "sing-box run" && echo "$p" | cut -d/ -f3; done | head -n1' > /tmp/sb_pid_before.txt
