@@ -1,5 +1,9 @@
 name: Unit tests
 
+# The suite is timing sensitive (background probes, health loops, the 45s
+# warm-up grace), so every push runs it several times per interpreter: a
+# green run that only holds once is not green.
+
 on:
   push:
     branches: [main]
@@ -12,10 +16,13 @@ permissions:
 jobs:
   pytest:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.12", "3.13"]
+        repeat: [1, 2, 3]
+    name: pytest ${{ matrix.python-version }} run ${{ matrix.repeat }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
