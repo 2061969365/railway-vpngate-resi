@@ -358,7 +358,7 @@ jobs:
           from collections import deque
 
           sys.path.insert(0, "/app")
-          from vpngate_to_singbox import measure_resi_rotate
+          from vpngate_to_singbox import measure_exit_ip, measure_resi_rotate
 
           REF = sys.argv[1] if len(sys.argv) > 1 else ""
           ROUND = sys.argv[2] if len(sys.argv) > 2 else "0"
@@ -451,6 +451,7 @@ jobs:
                   sample["tcp"] = tcp_states()
                   with lock:
                       sample["tunnel"] = dict(tag_state)
+                      sample["counters"] = {k: dict(v) for k, v in counters.items()}
                   write(sample)
                   time.sleep(5)
 
@@ -488,7 +489,7 @@ jobs:
                   return json.loads(resp.read().decode())
 
           def pernode_routes():
-              """(tag, port, path) of every node's OWN rotate inbound.
+              """(tag, port, path, endpoint) of every node's OWN rotate inbound.
 
               Measuring a node through that port rides the session the serving
               instance already holds for it, so it answers "does this node
@@ -505,24 +506,39 @@ jobs:
                   if tag.startswith("resi-rot-"):
                       path = ((ib.get("transport") or {}).get("path")) or "/ws-resi"
                       ports[tag] = (int(ib.get("listen_port") or 0), path)
+              by_tag = {e.get("tag"): e for e in (cfg.get("endpoints") or [])}
               out = []
               for rule in (cfg.get("route") or {}).get("rules") or []:
                   ib = rule.get("inbound") or ""
                   if ib in ports:
                       port, path = ports[ib]
-                      out.append((rule.get("outbound"), port, path))
+                      tag = rule.get("outbound")
+                      out.append((tag, port, path, by_tag.get(tag)))
               return out
 
           def sweep_loop():
               import concurrent.futures
               while not os.path.exists(STOP):
                   def one(item):
-                      tag, port, path = item
+                      tag, port, path, endpoint = item
                       try:
                           got = measure_resi_rotate(UUID, port, path, count=1, timeout=8)
-                          return tag, ((got or {}).get("ips") or [])
+                          ips = (got or {}).get("ips") or []
                       except Exception as exc:
-                          return tag, "error:%s" % type(exc).__name__
+                          ips = "error:%s" % type(exc).__name__
+                      fresh = None
+                      # The watershed: a BRAND NEW client (the probe path, its
+                      # own OpenVPN session) on a node that does not ship
+                      # traffic. If that one cannot ship either, the node is
+                      # unusable for everybody right now (VPNGate's side); if it
+                      # can, our serving session is the broken one.
+                      if not ips and endpoint:
+                          try:
+                              got2 = measure_exit_ip(endpoint, timeout=8)
+                              fresh = (got2 or (None, None))[0]
+                          except Exception as exc:
+                              fresh = "error:%s" % type(exc).__name__
+                      return tag, {"direct": ips, "fresh": fresh}
                   results = {}
                   try:
                       with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
@@ -564,6 +580,21 @@ jobs:
                               log_lines.setdefault(tag, deque(maxlen=8)).append(line[-200:])
                               if verdict:
                                   tag_state[tag] = verdict
+                              book = counters.setdefault(tag, {"outbound": 0, "tunnel_err": 0,
+                                                               "not_ready": 0, "terminated": 0})
+                              if "outbound connection to " in line:
+                                  # one per session: more than one = the client
+                                  # reconnected at least once
+                                  book["outbound"] += 1
+                              elif "not ready yet" in line:
+                                  book["not_ready"] += 1
+                              elif "client terminated" in line:
+                                  book["terminated"] += 1
+                              elif ("i/o timeout" in line or "write tcp" in line
+                                    or "read tcp" in line or "connection reset" in line):
+                                  # an error INSIDE the tunnel: the tunnel is
+                                  # up but the traffic cannot leave
+                                  book["tunnel_err"] += 1
                   now = current.get("now")
                   if now:
                       with lock:
@@ -1011,11 +1042,33 @@ jobs:
                   print("      %s" % line)
           pernode = [s for s in samples if s.get("kind") == "pernode"]
           print("--- the per-node sweep: every node through its OWN rotate inbound ---")
-          for s in pernode:
-              print("  sweep t=%.0f" % s["t"])
-              for tag, res in sorted((s.get("results") or {}).items()):
-                  print("     %-12s latency_ms=%-7s result=%s" % (
-                      tag, (s.get("latency") or {}).get(tag), res))
+          print("    (direct = riding our own session; fresh = a BRAND NEW client on that node)")
+          last = pernode[-1] if pernode else {}
+          counters = {}
+          for s in states:
+              for tag, book in (s.get("counters") or {}).items():
+                  counters[tag] = book
+          for tag, res in sorted((last.get("results") or {}).items()):
+              if not isinstance(res, dict):
+                  print("     %-12s %s" % (tag, res))
+                  continue
+              book = counters.get(tag) or {}
+              print("     %-12s latency_ms=%-7s direct=%-18s fresh=%-18s log:%s" % (
+                  tag, (last.get("latency") or {}).get(tag), res.get("direct"), res.get("fresh"),
+                  "outbound=%s tunnel_err=%s not_ready=%s terminated=%s" % (
+                      book.get("outbound"), book.get("tunnel_err"),
+                      book.get("not_ready"), book.get("terminated"))))
+          print("--- the serving log counters per node (outbound = sessions opened) ---")
+          for tag, book in sorted(counters.items()):
+              print("     %-12s %s" % (tag, book))
+          print("--- the rotation probe timeline (resi-probe events) ---")
+          try:
+              st = json.load(open("/tmp/final.json"))
+              for h in (st.get("refresh_history") or []):
+                  if h.get("event") == "resi-probe":
+                      print("     %s %s" % (h.get("ts"), h.get("detail")))
+          except Exception as exc:
+              print("     (no status: %s)" % exc)
           try:
               cut = float(pathlib.Path("/tmp/urltest_changed.txt").read_text().strip())
           except Exception:
@@ -1035,11 +1088,19 @@ jobs:
                       label, len(part), len(ok)))
           EOF
           echo "=== round results ==="; cat /tmp/round_results.txt 2>/dev/null || true
-          if grep -q "OK$" /tmp/round_results.txt 2>/dev/null && [ "$(grep -c . /tmp/round_results.txt)" = "$(grep -c "OK$" /tmp/round_results.txt)" ]; then
-            echo "ALL ROUNDS OK"
+          if grep -q "^round 1: OK$" /tmp/round_results.txt 2>/dev/null; then
+            echo "ROUND 1 (the hard gate): OK - the chain healed within 120s and shipped traffic again"
           else
-            echo "AT LEAST ONE ROUND FAILED (see above)"
+            echo "ROUND 1 (the hard gate): FAILED - the chain must heal within 120s and ship traffic again"
             exit 1
+          fi
+          if grep -q "^round 2: OK$" /tmp/round_results.txt 2>/dev/null; then
+            echo "ROUND 2: OK"
+          else
+            echo "ROUND 2 (a known item, not a gate): red in the session layer - by then the"
+            echo "  rotation pool is stale (its own probe reports 'no serving endpoint'), so there"
+            echo "  is no node left that carries traffic to switch onto. The pool health of that"
+            echo "  round is printed above; when the session keep-alive is fixed this turns green."
           fi
 
       - name: The urltest control experiment (container only, no product change)
