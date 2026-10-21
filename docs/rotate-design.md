@@ -872,3 +872,45 @@ pin 必须是换过的那个（不许供一个已知死的节点）"。rotate �
 duplicate-cn 的来源。该节点此后若已死，由健康回路 `check_pinned_health` 兜底换人
 （上面 §12.15 写明的机制）。gateway 模式不受影响：它仍然逐个 verify 候选节点。
 
+### 12.16 云端 CI 抓到的两个跨平台缺陷（2026-10-21）
+
+单测迁到现行机制后，本地（Windows）全绿，但**云端 CI 第一次跑就红**，而且红的原因
+本地根本复现不出来。CI 因此变成常驻 workflow（`.github/workflows/unit-tests.yml`，
+push 到 main 与 PR 都跑，Python 3.12 + 3.13 双版本）。
+
+**1) 后台全量探测与用例手写的测量值抢同一份数据（跨平台竞态）**
+
+`refresh_once` 会起一个后台全量探测，探测把拨号结果**写回节点字典**：拨号失败就把
+`real_latency_ms` 写成 `None`（`railway_manager.py:3517`）。而那几条用例是在 refresh
+之后**手工**写测量值的，于是两边写同一批字典，谁后写谁赢：
+
+- Windows 上探测先结束 → 手写的值活下来 → 用例绿；
+- Linux CI 上探测后结束 → 手写的值被抹成 `None` → `_chain_candidates_locked` 找不到
+  候选 → 健康回路返回 `pinned` 而不是 `rescued` → 用例红。
+
+修法：用例在写测量值之前先 `_settle_probes(manager)` 等后台探测结束；暖机豁免也不再
+依赖"机器开机多久"（`manager._chain_pin_at = 0.0` 改成 `time.monotonic() - 3600.0`，
+否则刚开机的 runner 落在 45s 豁免窗口里，会把用例要测的"判死"直接豁免掉）。
+
+**2) 后台线程在解释器收尾时打日志 ⇒ 整个进程被 SIGABRT**
+
+Python 3.13 上，守护线程在解释器收尾期间 `print()` 会撞上
+`Fatal Python error: _enter_buffered_busy`（stdout 锁已经没了）⇒ **exit 134**，
+CI job 直接失败——尽管所有用例都过了。触发路径是后台 refresh 在收尾时还在拨号，
+`submit` 抛 `cannot schedule new futures after interpreter shutdown`，而**打印这条错误**
+才是致命的那个动作。`sys.is_finalizing()` 单独不够：打印可能在收尾开始前就进入、
+在拿锁时才输掉。
+
+修法（产品侧）：后台线程的日志统一走 `RailwayManager._log()`——`stop()` 置位
+`_stop_event` 之后就不再打（生产上就是 SIGTERM 路径，测试里是 `finally: manager.stop()`）；
+模块级日志走 `_safe_print()`，解释器收尾期间直接丢弃。
+
+**CI 结果**（run 39639250220，commit `aad26ba`）：
+
+```
+pytest (3.12)  567 passed, 2 skipped in 104.93s
+pytest (3.13)  567 passed, 2 skipped in 104.60s
+```
+
+本地（Windows）同 commit：567 passed / 2 skipped / 0 failed，收尾不再出现 abort。
+
