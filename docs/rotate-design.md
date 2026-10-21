@@ -583,6 +583,10 @@ D12 留下的疑点（"第三路相关动作改写了配置"）在这一轮被�
   连续 rescue 会**逐个走完池子**而不是原地打转；某节点重新真的传过 payload
   （`_resi_proven`）或 chain 探针成功时立刻清掉记忆。
 - pin 从快照消失 ⇒ 直接重 pin，不再留在 `auto` urltest 上。
+- **pin 的 TCP 握手死了但 chain 仍在出 IP**（standby 已接管）：不重 pin、不重写配置、
+  不重启 sing-box——此时重启会掐断所有第三路连接，而 chain 本来就在工作。只记一条
+  `chain-on-standby`（同一个死 pin 只记一次），把重 pin 留给"两个预留节点都死"的
+  真实故障。
 - 冷却 30s 起、上限 120s（原来 45s→300s），配合失败记忆，恢复时间是"一个健康节点被
   找到为止"，最坏情况随池子大小线性增长而不是无限。
 - TCP 握手就死的那条分支同样改用证据排序，并且优先把预留 standby 提为 pin。
@@ -617,7 +621,7 @@ D12 留下的疑点（"第三路相关动作改写了配置"）在这一轮被�
 10. **轮换的连接预算不得吃满 mux 槽位**：前两路必须保留独立额度，否则第三路的风暴
     会以"新连接被丢弃"的形式掐死另外两路（D12）。
 
-### 12.11 测试矩阵（`tests/test_resi.py`，96 项全绿）
+### 12.11 测试矩阵（`tests/test_resi.py`，98 项全绿）
 
 | 场景 | 测试 |
 |---|---|
@@ -660,6 +664,7 @@ D12 留下的疑点（"第三路相关动作改写了配置"）在这一轮被�
 | 连续 rescue 逐个走池子、绝不在两个死节点间来回跳 | `test_chain_rescue_walks_the_pool_instead_of_bouncing` |
 | rescue 跳过轮换已经 park 的节点 | `test_chain_rescue_skips_a_node_the_rotation_parked` |
 | pin 从快照消失 → 直接重 pin，不退回全体 urltest | `test_a_pin_that_left_the_snapshot_gets_repinned` |
+| 握手死了但 standby 在承载 → 不重 pin、不重启 | `test_dead_pin_handshake_does_not_repin_while_the_standby_carries_chain` |
 
 另外用真 sing-box 1.14.0 校验了 100 节点静态入站的配置（不是 mock）：
 
