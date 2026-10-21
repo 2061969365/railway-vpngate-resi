@@ -3386,6 +3386,16 @@ class RailwayManager:
         # would open a second VPNGate session (duplicate-cn is off) and kick the
         # live one, i.e. the refresh itself would kill good nodes. Those nodes
         # keep their previous verification and are handed back unchanged.
+        #
+        # In rotate mode it does not dial ANY node: the throwaway client would
+        # hold the node's single VPNGate session *before* the serving instance
+        # logs in, and the serving endpoint then never gets past the
+        # authentication (the session is still taken) - the cloud acceptance
+        # saw exactly that: 15 of 16 endpoints had their TCP up but their
+        # tunnel never came up, and the only working one was the node that had
+        # been dialed first. The full probe measures the same nodes through
+        # their own serving endpoints (no second session), so it is the one
+        # that fills the pool.
         skip_keys: set[tuple[str, int]] = set()
         carried: dict[tuple[str, int], int] = {}
         with self._lock:
@@ -3401,7 +3411,8 @@ class RailwayManager:
             csv_text = self._fetch_with_retry(fetch)
             nodes = snapshot_to_nodes(csv_text, limit=self.limit, probe_pool=probe_pool,
                 probe_fn=lambda h, p: probe_tcp_latency(h, p, 5), probe_workers=self.probe_workers,
-                real_topk=self.real_topk, dial_fn=self.dial_fn, dial_workers=self.dial_workers,
+                real_topk=(0 if self.resi_rotate else self.real_topk),
+                dial_fn=self.dial_fn, dial_workers=self.dial_workers,
                 dial_timeout=self.dial_timeout, singbox_bin=self.singbox_bin,
                 skip_dial_keys=skip_keys)
             if not nodes:

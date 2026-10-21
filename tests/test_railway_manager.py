@@ -351,6 +351,37 @@ class RefreshTests(unittest.TestCase):
                    if "dial.json" not in str(c)]
         self.assertEqual(1, len(serving))
 
+    def test_rotate_refresh_never_dials_a_node(self) -> None:
+        """Rotate mode must not dial any node during a refresh.
+
+        The throwaway client would hold the node's single VPNGate session
+        before the serving instance logs in, and the serving endpoint then
+        never gets past the authentication: the cloud acceptance saw 15 of
+        16 endpoints with their TCP up but their tunnel never coming up.
+        The full probe measures the same nodes through their own serving
+        endpoint instead (no second session), so it is the one that fills
+        the pool.
+        """
+        dialed: list[str] = []
+        manager = self._manager(resi_rotate=True, vless_uuid="u-u-i-d",
+                                dial_fn=lambda node: dialed.append(node["server"]) or 50)
+        try:
+            with mock.patch("railway_manager.subprocess.Popen"), \
+                 mock.patch.object(RailwayManager, "_check_config", return_value=True), \
+                 mock.patch("railway_manager.probe_tcp_latency", return_value=100), \
+                 mock.patch("railway_manager.measure_resi_rotate",
+                            return_value={"ips": ["203.0.113.99"],
+                                          "first_ms": 30, "distinct": 1}):
+                ok = manager.refresh_once(
+                    fetcher=lambda url, timeout: _snapshot_csv(
+                        "203.0.113.11", "203.0.113.12"))
+        finally:
+            manager.stop()
+
+        self.assertTrue(ok)
+        self.assertEqual([], dialed,
+                         "rotate mode must not dial during a refresh")
+
     def test_refresh_failure_keeps_old_endpoints(self) -> None:
         manager = self._manager(retry_delays=(0, 0))
         manager.status["endpoints"] = [{"tag": "old"}]
