@@ -268,6 +268,14 @@ def ovpn_to_endpoint(
         # "nointeract" retries the authentication instead, so the endpoint
         # recovers as soon as the other session is gone.
         "auth_retry": "nointeract",
+        # Keep the session alive and let a dead one reconnect by itself.
+        # sing-box has no default receive timeout for TCP endpoints ("No
+        # default receive timeout is used for TCP"), and VPNGate hands out
+        # TCP, so without these a session that stops carrying traffic stays
+        # "connected" for good: the cloud acceptance measured 15 of 16
+        # serving endpoints with their TCP up and their tunnel silent.
+        "ping_interval": "20s",
+        "ping_restart": "60s",
         **_keepalive_fields(config_text),
         **({"remote_random": True} if _REMOTE_RANDOM_RE.search(config_text) else {}),
         "system": False,
@@ -594,6 +602,11 @@ def _dial_probe_config(endpoint: dict, port: int) -> dict:
     probe_endpoint = dict(endpoint)
     probe_endpoint["tag"] = "dial-probe"
     probe_endpoint["auth_retry"] = "none"
+    # A probe only measures: it must not wait for a keepalive ping or for a
+    # reconnect - "this node is taken" has to be a quick answer.
+    probe_endpoint["ping_interval"] = ""
+    probe_endpoint["ping_restart"] = ""
+    probe_endpoint["ping_restart_disabled"] = True
     config = build_singbox_config([probe_endpoint], mixed_listen="127.0.0.1",
                                   mixed_port=port)
     config["route"]["final"] = "dial-probe"

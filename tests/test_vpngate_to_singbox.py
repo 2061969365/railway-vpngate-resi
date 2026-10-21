@@ -87,6 +87,12 @@ class ConvertTcpTests(unittest.TestCase):
         # and the serving endpoint stays dead; the endpoint must retry the
         # authentication instead.
         self.assertEqual("nointeract", ep["auth_retry"])
+        # A serving endpoint must keep its session alive and be able to
+        # reconnect: sing-box has no default receive timeout for TCP, and a
+        # silent session that stays "connected" is how the pool emptied
+        # itself.
+        self.assertEqual("20s", ep["ping_interval"])
+        self.assertEqual("60s", ep["ping_restart"])
 
     def test_the_probe_does_not_retry_a_rejected_login(self) -> None:
         """The serving endpoint retries a rejected login; the throwaway probe
@@ -103,6 +109,10 @@ class ConvertTcpTests(unittest.TestCase):
 
         probe = next(e for e in config["endpoints"] if e["tag"] == "dial-probe")
         self.assertEqual("none", probe["auth_retry"])
+        # the probe must not wait for a keepalive or a reconnect
+        self.assertEqual("", probe["ping_interval"])
+        self.assertEqual("", probe["ping_restart"])
+        self.assertTrue(probe["ping_restart_disabled"])
         # the serving endpoint keeps the retry
         self.assertEqual("nointeract", ep["auth_retry"])
 
