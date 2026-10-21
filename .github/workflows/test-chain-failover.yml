@@ -102,7 +102,7 @@ jobs:
           # 60 seconds, same pid+md5 across two samples.
           prev=""
           for i in $(seq 1 60); do
-            pid=$(docker exec rotate-trial sh -c 'for p in /proc/[0-9]*/cmdline; do tr "\0" " " < "$p" 2>/dev/null | grep -q "sing-box run" && echo "$p" | cut -d/ -f3; done | head -n1')
+            pid=$(docker exec rotate-trial sh -c 'for p in /proc/[0-9]*/cmdline; do c=$(tr "\0" " " < "$p" 2>/dev/null); case "$c" in *sing-box*run*/app/singbox-railway.json*) echo "$p" | cut -d/ -f3; break;; esac; done')
             md5=$(docker exec rotate-trial sh -c 'md5sum /app/singbox-railway.json | cut -d" " -f1')
             recent=$(docker logs --since 60s rotate-trial 2>&1 | grep -c "config rewritten" || true)
             cur="$pid/$md5"
@@ -145,7 +145,7 @@ jobs:
           docker logs rotate-trial 2>&1 | grep -c "chain rescue:" > /tmp/rescues_at_baseline.txt || true
           echo "chain rescues so far: $(cat /tmp/rescues_at_baseline.txt)"
           docker exec rotate-trial sh -c 'md5sum /app/singbox-railway.json | cut -d" " -f1' > /tmp/cfg_before.txt
-          docker exec rotate-trial sh -c 'for p in /proc/[0-9]*/cmdline; do tr "\0" " " < "$p" 2>/dev/null | grep -q "sing-box run" && echo "$p" | cut -d/ -f3; done | head -n1' > /tmp/sb_pid_before.txt
+          docker exec rotate-trial sh -c 'for p in /proc/[0-9]*/cmdline; do c=$(tr "\0" " " < "$p" 2>/dev/null); case "$c" in *sing-box*run*/app/singbox-railway.json*) echo "$p" | cut -d/ -f3; break;; esac; done' > /tmp/sb_pid_before.txt
           echo "pid=$(cat /tmp/sb_pid_before.txt) md5=$(cat /tmp/cfg_before.txt)"
 
       - name: Start one quick tunnel to :3000
@@ -284,7 +284,7 @@ jobs:
           [ "$recent" = "0" ] || { echo "config still being rewritten"; exit 1; }
           docker logs rotate-trial 2>&1 | grep -c "chain rescue:" > /tmp/rescues_at_baseline.txt || true
           docker exec rotate-trial sh -c 'md5sum /app/singbox-railway.json | cut -d" " -f1' > /tmp/cfg_before.txt
-          docker exec rotate-trial sh -c 'for p in /proc/[0-9]*/cmdline; do tr "\0" " " < "$p" 2>/dev/null | grep -q "sing-box run" && echo "$p" | cut -d/ -f3; done | head -n1' > /tmp/sb_pid_before.txt
+          docker exec rotate-trial sh -c 'for p in /proc/[0-9]*/cmdline; do c=$(tr "\0" " " < "$p" 2>/dev/null); case "$c" in *sing-box*run*/app/singbox-railway.json*) echo "$p" | cut -d/ -f3; break;; esac; done' > /tmp/sb_pid_before.txt
           curl -m 10 -s -H "Authorization: Bearer $ADMIN_TOKEN" \
             http://127.0.0.1:3000/api/status -o /tmp/status_prekill.json
           docker exec rotate-trial cat /app/singbox-railway.json > /tmp/cfg.json
@@ -373,18 +373,29 @@ jobs:
             sleep 5
           done
           [ -n "$chain_ip" ] || { echo "chain never failed over to the standby"; docker logs rotate-trial 2>&1 | tail -n 60; exit 1; }
-          SB_PID=$(docker exec rotate-trial sh -c 'for p in /proc/[0-9]*/cmdline; do tr "\0" " " < "$p" 2>/dev/null | grep -q "sing-box run" && echo "$p" | cut -d/ -f3; done | head -n1')
+          # Only the long-lived serving process counts: the manager spawns
+          # short-lived `sing-box run` probe clients (endpoint tag dial-probe)
+          # whose pids can otherwise be mistaken for the daemon.
+          sb_pid() {
+            docker exec rotate-trial sh -c 'for p in /proc/[0-9]*/cmdline; do
+              c=$(tr "\0" " " < "$p" 2>/dev/null)
+              case "$c" in *sing-box*run*/app/singbox-railway.json*) echo "$p" | cut -d/ -f3; break;; esac
+            done'
+          }
+          SB_PID=$(sb_pid); sleep 4; SB_PID2=$(sb_pid)
           CFG_MD5=$(docker exec rotate-trial sh -c 'md5sum /app/singbox-railway.json | cut -d" " -f1')
           RESCUES=$(docker logs rotate-trial 2>&1 | grep -c "chain rescue:" || true)
-          echo "pid before=$(cat /tmp/sb_pid_before.txt) after=$SB_PID"
+          echo "pid before=$(cat /tmp/sb_pid_before.txt) after=$SB_PID/$SB_PID2"
           echo "md5 before=$(cat /tmp/cfg_before.txt) after=$CFG_MD5"
           echo "rescues before=$(cat /tmp/rescues_at_baseline.txt) after=$RESCUES"
-          [ "$SB_PID" = "$(cat /tmp/sb_pid_before.txt)" ] || {
-            echo "urltest failover restarted sing-box (it must not)"; exit 1; }
-          [ "$CFG_MD5" = "$(cat /tmp/cfg_before.txt)" ] || {
-            echo "urltest failover rewrote the config (it must not)"; exit 1; }
-          [ "$RESCUES" = "$(cat /tmp/rescues_at_baseline.txt)" ] || {
-            echo "a chain rescue ran although the standby carried the traffic"; exit 1; }
+          if [ "$SB_PID" != "$SB_PID2" ] || [ "$SB_PID" != "$(cat /tmp/sb_pid_before.txt)" ] \
+             || [ "$CFG_MD5" != "$(cat /tmp/cfg_before.txt)" ] \
+             || [ "$RESCUES" != "$(cat /tmp/rescues_at_baseline.txt)" ]; then
+            echo "FAILED: the pin death leaked into a restart/rewrite/rescue"
+            docker logs rotate-trial --since 180s 2>&1 | grep -Ev "dial-probe|endpoint/openvpn" | tail -n 60 || true
+            docker exec rotate-trial sh -c 'ls -l /tmp/*.log 2>/dev/null | head' || true
+            exit 1
+          fi
           echo "STANDBY OK: pin killed, chain still exits, no rewrite, no restart, no rescue"
 
       - name: Kill the backup too (both reserved dead => rescue to a proven node)
