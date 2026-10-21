@@ -812,6 +812,7 @@ route rules: 100 {'inbound': 'resi-rot-0', 'outbound': 'vpngate-0'} ... 'resi-ro
 ### 12.15 审计回合：rotate 冷启动不再直拨验证（2026-10-21）
 
 独立审计（只读）挑出三处问题，本轮全部修掉，并补上审计点名的"无人守护"缺口。
+本轮之后全量：**567 passed / 2 skipped / 0 failed**（`tests/test_resi.py` 仍 106 passed）。
 
 **1) rotate 冷启动的 verify 直拨 = duplicate-cn 隐患（产品修复）**
 
