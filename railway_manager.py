@@ -2845,6 +2845,9 @@ class RailwayManager:
                 return "pinned"
             tag = self.preferred_tag
             cands = self._chain_candidates_locked(now)
+        # Measured outside the lock: the check opens a tunnel round trip.
+        cands = self._chain_traffic_candidates(cands)
+        with self._lock:
             best = (cands[0].get("endpoint") or {}).get("tag") if cands else None
         if not best:
             with self._lock:
@@ -3015,6 +3018,9 @@ class RailwayManager:
             except Exception:
                 pass
             return "unpinned"
+        # Only nodes that carry traffic right now may be picked: the
+        # handshake proves the node is up, not that its tunnel still works.
+        cands = self._chain_traffic_candidates(cands)
         alive_tags = self._fresh_probe_tags(cands) if self.auto_rescue else []
         stale = False
         if alive_tags:
@@ -3565,6 +3571,49 @@ class RailwayManager:
             return self.dial_fn(node) if self.dial_fn else None
         except Exception:
             return None
+
+    def _chain_candidate_carries_traffic(self, node: dict) -> bool:
+        """Does this node carry traffic RIGHT NOW?
+
+        The rotation's exit-IP evidence is a snapshot: a node that carried
+        traffic an hour ago may have a dead OpenVPN session now (the control
+        channel stays up while the data channel is gone). The cloud
+        acceptance measured exactly that - 15 of 16 nodes were connected but
+        silent, and the chain walked them one by one for six minutes.
+
+        In rotate mode the node's own serving endpoint is the only honest
+        witness, so ask it. Gateway mode has no per-node endpoint and keeps
+        the old behaviour.
+        """
+        tag = (node.get("endpoint") or {}).get("tag")
+        if not (self.resi_rotate and self.vless_uuid and tag):
+            return True
+        port = self._resi_port_for_tag(tag)
+        if not port:
+            return False
+        try:
+            got = measure_resi_rotate(
+                self.vless_uuid, port, self.resi_path, count=1,
+                singbox_bin=self.singbox_bin, timeout=self.dial_timeout)
+        except Exception:
+            got = None
+        return bool(got and got.get("ips"))
+
+    def _chain_traffic_candidates(self, cands: list[dict]) -> list[dict]:
+        """The candidates that carry traffic right now, best first.
+
+        A node's measured latency is not evidence that it still works, so
+        the chain may only move onto a node that answers now. At most a few
+        candidates are asked (each measurement is a tunnel round trip) and,
+        if none answers, the best ranked one is kept - a dead candidate is
+        still better than no candidate.
+        """
+        if not (self.resi_rotate and self.vless_uuid) or not cands:
+            return cands
+        limit = min(len(cands), 3)
+        alive = [n for n in cands[:limit]
+                 if self._chain_candidate_carries_traffic(n)]
+        return alive or cands[:1]
 
     def _probe_target_started_serving(self, tag: str) -> bool:
         """True when the node started serving while a probe was running.

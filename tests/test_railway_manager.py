@@ -5305,6 +5305,53 @@ class DeadPinTests(unittest.TestCase):
         self.assertIsNotNone(chain, "a pinned chain must publish a selector")
         self.assertEqual("vpngate-1", chain["outbounds"][0])
 
+    def test_the_rescue_only_moves_to_a_node_that_carries_traffic(self) -> None:
+        """A candidate that is connected but silent must not get the chain.
+
+        The rotation's latency number is a snapshot: the cloud acceptance
+        measured 15 of 16 serving nodes connected but dead while their
+        measured latency still said 277-546ms. Switching the chain onto one
+        of those leaves it without traffic, so the rescue asks the node's own
+        serving endpoint first.
+        """
+        measured: list[int] = []
+
+        def _measure(uuid, port, path, count=3, singbox_bin="sing-box",
+                     timeout=15):
+            measured.append(port)
+            if port == 41001:
+                return {"ips": ["203.0.113.99"], "first_ms": 30, "distinct": 1}
+            return {"ips": [], "first_ms": None, "distinct": 0}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = self._manager(tmpdir, resi_rotate=True,
+                                    vless_uuid="u-u-i-d")
+            try:
+                self._seed_nodes(manager, ("203.0.113.11", 100, 30),
+                                 ("203.0.113.12", 200, 40),
+                                 ("203.0.113.13", 300, 50))
+                manager._set_resi_routes([("vpngate-0", 41000),
+                                          ("vpngate-1", 41001),
+                                          ("vpngate-2", 41002)])
+                manager.preferred_tag = "vpngate-0"
+                manager.status["preferred_tag"] = "vpngate-0"
+                manager._auto_pinned = True
+                manager._chain_pin_at = time.monotonic() - 3600.0
+                failing = lambda host, port, timeout=5: 0
+                with _fake_singbox(), \
+                     mock.patch("railway_manager.measure_resi_rotate",
+                                side_effect=_measure), \
+                     mock.patch("railway_manager.probe_tcp_latency",
+                                return_value=0):
+                    result = manager.check_pinned_health(probe_fn=failing)
+            finally:
+                manager.stop()
+
+        self.assertEqual("rescued", result)
+        # vpngate-1 answers, vpngate-0 (the dead pin) and vpngate-2 do not.
+        self.assertEqual("vpngate-1", manager.preferred_tag)
+        self.assertIn(41001, measured)
+
     def test_a_fresh_pin_is_not_judged_dead(self) -> None:
         """A pin that was just set is inside the warm-up grace: a failed
         handshake must not move it, because the new node still needs to come
