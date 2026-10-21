@@ -1,6 +1,6 @@
 name: Chain acceptance (rotate cold start + self-heal)
 
-# Temporary cloud end-to-end acceptance for the rotate-mode chain.
+# Permanent cloud regression guard for the rotate-mode chain.
 #
 # It proves two things on a real container (real sing-box, real VPNGate
 # nodes, real traffic), both of which the unit tests cannot show:
@@ -20,15 +20,19 @@ name: Chain acceptance (rotate cold start + self-heal)
 #        * /ws-chain: a real exit IP, different from the container's own IP
 #        * the container log: no "verify failed for ..." line (that string
 #          is printed by measure_exit_ip, i.e. by a verify-by-dial)
-#        * a process watcher inside the container: no throwaway sing-box
-#          client dialed a VPNGate node while the pin was decided
+#        * a process watcher inside the container: no client dialed a
+#          VPNGate node while the pin was decided (a client that only rides
+#          our own loopback opens no VPNGate session and is the healthy
+#          shape - see 2983573)
 #   2. SELF-HEAL: killing the pin must move the chain through the Clash API
-#      (a hot switch), with no config rewrite and no sing-box restart.
+#      (a hot switch) within 120s, with no config rewrite and no sing-box
+#      restart, and the chain must carry traffic again. This is what caught
+#      the serving endpoints turning into corpses: the manager's own real
+#      dials opened a second VPNGate session and the serving side never
+#      retried (see 2983573 and 65db989).
 #
-# workflow_dispatch only: one run costs 30-45 minutes of real VPNGate
+# workflow_dispatch only: one run costs 25-45 minutes of real VPNGate
 # traffic, so a push must never trigger it.
-#
-# Delete this file once the acceptance run has been recorded.
 
 on:
   workflow_dispatch:
