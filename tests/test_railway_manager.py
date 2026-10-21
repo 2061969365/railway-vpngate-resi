@@ -95,6 +95,49 @@ def _snapshot_csv(*ips: str) -> str:
 # /tmp does not exist/writable on Windows, and POSIX still gets /tmp.
 _TMP = tempfile.gettempdir()
 
+_MODULE_PATCHES = []
+
+
+def setUpModule() -> None:
+    """Keep the suite hermetic: no network, no real timers.
+
+    - The rescue path triggers a background refresh, and that refresh uses
+      the manager's fetcher: the real `default_fetch` pulled the live
+      VPNGate snapshot on every run (and, on a machine with sing-box
+      installed, opened real OpenVPN sessions to real nodes). It also
+      swapped the node list under a running test.
+    - `measure_real_latency` is the default dial: without sing-box it
+      fails and returns None, so the stub keeps that behaviour everywhere
+      instead of depending on what the machine has installed.
+    - `probe_tcp_latency` really connects to TEST-NET-3 addresses and
+      waits out the 5s timeout on some platforms. The stub keeps the suite
+      fast and deterministic; the tests that care about a live handshake
+      patch it themselves.
+    - The supervise and health timers must not fire in the middle of a
+      test (the health monitor's body is covered by calling
+      `check_pinned_health` directly).
+    """
+    _MODULE_PATCHES.extend([
+        mock.patch("railway_manager.default_fetch",
+                   side_effect=AssertionError(
+                       "the test suite must not use the network")),
+        mock.patch("railway_manager.measure_real_latency",
+                   return_value=None),
+        mock.patch("railway_manager.probe_tcp_latency", return_value=0),
+        mock.patch("railway_manager.SUPERVISE_INTERVAL", 3600),
+        mock.patch.object(RailwayManager, "_health_monitor_loop",
+                          return_value=None),
+    ])
+    for patcher in _MODULE_PATCHES:
+        patcher.start()
+
+
+def tearDownModule() -> None:
+    for patcher in reversed(_MODULE_PATCHES):
+        patcher.stop()
+    _MODULE_PATCHES.clear()
+
+
 class ClassifyTests(unittest.TestCase):
     def test_socks5_greeting(self) -> None:
         self.assertEqual("socks5", classify_first_bytes(b"\x05\x01\x00"))
@@ -278,9 +321,9 @@ class RefreshTests(unittest.TestCase):
     def _manager(self, **kwargs):
         defaults = dict(port=0, mixed_port=get_free_port(), start_singbox=False,
                         auto_refresh=False, fetch_on_start=False,
-                        config_path=f"{_TMP}/railway-test-{id(self)}.json",
-                        nodes_path=f"{_TMP}/railway-test-{id(self)}-nodes.json",
-                        state_path=f"{_TMP}/railway-test-{id(self)}-state.json")
+                        config_path=f"{_TMP}/railway-test-{id(self)}-{os.getpid()}.json",
+                        nodes_path=f"{_TMP}/railway-test-{id(self)}-{os.getpid()}-nodes.json",
+                        state_path=f"{_TMP}/railway-test-{id(self)}-{os.getpid()}-state.json")
         defaults.update(kwargs)
         return RailwayManager(**defaults)
 
@@ -447,9 +490,9 @@ class FullProbeTests(unittest.TestCase):
         defaults = dict(port=0, mixed_port=get_free_port(), start_singbox=False,
                         auto_refresh=False, fetch_on_start=False,
                         admin_token=self.TOKEN,
-                        config_path=f"{_TMP}/railway-probe-{id(self)}.json",
-                        nodes_path=f"{_TMP}/railway-probe-{id(self)}-nodes.json",
-                        state_path=f"{_TMP}/railway-probe-{id(self)}-state.json")
+                        config_path=f"{_TMP}/railway-probe-{id(self)}-{os.getpid()}.json",
+                        nodes_path=f"{_TMP}/railway-probe-{id(self)}-{os.getpid()}-nodes.json",
+                        state_path=f"{_TMP}/railway-probe-{id(self)}-{os.getpid()}-state.json")
         defaults.update(kwargs)
         return RailwayManager(**defaults)
 
@@ -591,9 +634,9 @@ class FullProbeWorkersTests(unittest.TestCase):
         defaults = dict(port=0, mixed_port=get_free_port(), start_singbox=False,
                         auto_refresh=False, fetch_on_start=False,
                         admin_token=self.TOKEN,
-                        config_path=f"{_TMP}/railway-fpw-{id(self)}.json",
-                        nodes_path=f"{_TMP}/railway-fpw-{id(self)}-nodes.json",
-                        state_path=f"{_TMP}/railway-fpw-{id(self)}-state.json")
+                        config_path=f"{_TMP}/railway-fpw-{id(self)}-{os.getpid()}.json",
+                        nodes_path=f"{_TMP}/railway-fpw-{id(self)}-{os.getpid()}-nodes.json",
+                        state_path=f"{_TMP}/railway-fpw-{id(self)}-{os.getpid()}-state.json")
         defaults.update(kwargs)
         return RailwayManager(**defaults)
 
@@ -678,9 +721,9 @@ class SingleProbeTests(unittest.TestCase):
         defaults = dict(port=0, mixed_port=get_free_port(), start_singbox=False,
                         auto_refresh=False, fetch_on_start=False,
                         admin_token=self.TOKEN,
-                        config_path=f"{_TMP}/railway-single-{id(self)}.json",
-                        nodes_path=f"{_TMP}/railway-single-{id(self)}-nodes.json",
-                        state_path=f"{_TMP}/railway-single-{id(self)}-state.json")
+                        config_path=f"{_TMP}/railway-single-{id(self)}-{os.getpid()}.json",
+                        nodes_path=f"{_TMP}/railway-single-{id(self)}-{os.getpid()}-nodes.json",
+                        state_path=f"{_TMP}/railway-single-{id(self)}-{os.getpid()}-state.json")
         defaults.update(kwargs)
         return RailwayManager(**defaults)
 
@@ -1018,9 +1061,9 @@ class DialWorkersPlumbingTests(unittest.TestCase):
             port=0, mixed_port=get_free_port(), start_singbox=False,
             auto_refresh=False, fetch_on_start=False,
             admin_token=self.TOKEN, dial_workers=10,
-            config_path=f"{_TMP}/railway-dw-{id(self)}.json",
-            nodes_path=f"{_TMP}/railway-dw-{id(self)}-nodes.json",
-            state_path=f"{_TMP}/railway-dw-{id(self)}-state.json")
+            config_path=f"{_TMP}/railway-dw-{id(self)}-{os.getpid()}.json",
+            nodes_path=f"{_TMP}/railway-dw-{id(self)}-{os.getpid()}-nodes.json",
+            state_path=f"{_TMP}/railway-dw-{id(self)}-{os.getpid()}-state.json")
         try:
             with mock.patch("railway_manager.snapshot_to_nodes",
                             side_effect=lambda *a, **k: seen.update(k) or []):
@@ -1785,9 +1828,9 @@ class VerifyApiTests(unittest.TestCase):
         defaults = dict(port=0, mixed_port=get_free_port(), start_singbox=False,
                         auto_refresh=False, fetch_on_start=False,
                         admin_token=self.TOKEN,
-                        config_path=f"{_TMP}/railway-verify-{id(self)}.json",
-                        nodes_path=f"{_TMP}/railway-verify-{id(self)}-nodes.json",
-                        state_path=f"{_TMP}/railway-verify-{id(self)}-state.json")
+                        config_path=f"{_TMP}/railway-verify-{id(self)}-{os.getpid()}.json",
+                        nodes_path=f"{_TMP}/railway-verify-{id(self)}-{os.getpid()}-nodes.json",
+                        state_path=f"{_TMP}/railway-verify-{id(self)}-{os.getpid()}-state.json")
         defaults.update(kwargs)
         return RailwayManager(**defaults)
 
@@ -1865,9 +1908,9 @@ class ProcessHygieneTests(unittest.TestCase):
         defaults = dict(port=0, mixed_port=get_free_port(), start_singbox=False,
                         auto_refresh=False, fetch_on_start=False,
                         admin_token=self.TOKEN,
-                        config_path=f"{_TMP}/railway-hyg-{id(self)}.json",
-                        nodes_path=f"{_TMP}/railway-hyg-{id(self)}-nodes.json",
-                        state_path=f"{_TMP}/railway-hyg-{id(self)}-state.json")
+                        config_path=f"{_TMP}/railway-hyg-{id(self)}-{os.getpid()}.json",
+                        nodes_path=f"{_TMP}/railway-hyg-{id(self)}-{os.getpid()}-nodes.json",
+                        state_path=f"{_TMP}/railway-hyg-{id(self)}-{os.getpid()}-state.json")
         defaults.update(kwargs)
         return RailwayManager(**defaults)
 
@@ -2009,9 +2052,9 @@ class HalfPacketTests(unittest.TestCase):
             port=0, mixed_port=get_free_port(), start_singbox=False,
             auto_refresh=False, fetch_on_start=False,
             admin_token="test-admin-token-0123456789abcdef",
-            config_path=f"{_TMP}/railway-half-{id(self)}.json",
-            nodes_path=f"{_TMP}/railway-half-{id(self)}-nodes.json",
-            state_path=f"{_TMP}/railway-half-{id(self)}-state.json")
+            config_path=f"{_TMP}/railway-half-{id(self)}-{os.getpid()}.json",
+            nodes_path=f"{_TMP}/railway-half-{id(self)}-{os.getpid()}-nodes.json",
+            state_path=f"{_TMP}/railway-half-{id(self)}-{os.getpid()}-state.json")
 
     def test_split_get_reaches_http(self) -> None:
         manager = self._manager()
@@ -2087,9 +2130,9 @@ class RefreshMutexTests(unittest.TestCase):
             port=0, mixed_port=get_free_port(), start_singbox=False,
             auto_refresh=False, fetch_on_start=False,
             admin_token="test-admin-token-0123456789abcdef",
-            config_path=f"{_TMP}/railway-mtx-{id(self)}.json",
-            nodes_path=f"{_TMP}/railway-mtx-{id(self)}-nodes.json",
-            state_path=f"{_TMP}/railway-mtx-{id(self)}-state.json")
+            config_path=f"{_TMP}/railway-mtx-{id(self)}-{os.getpid()}.json",
+            nodes_path=f"{_TMP}/railway-mtx-{id(self)}-{os.getpid()}-nodes.json",
+            state_path=f"{_TMP}/railway-mtx-{id(self)}-{os.getpid()}-state.json")
         manager.retry_delays = ()
         try:
             worker = threading.Thread(
@@ -2123,9 +2166,9 @@ class LoopSurvivalTests(unittest.TestCase):
         defaults = dict(port=0, mixed_port=get_free_port(), start_singbox=False,
                         auto_refresh=False, fetch_on_start=False,
                         admin_token=self.TOKEN,
-                        config_path=f"{_TMP}/railway-loop-{id(self)}.json",
-                        nodes_path=f"{_TMP}/railway-loop-{id(self)}-nodes.json",
-                        state_path=f"{_TMP}/railway-loop-{id(self)}-state.json")
+                        config_path=f"{_TMP}/railway-loop-{id(self)}-{os.getpid()}.json",
+                        nodes_path=f"{_TMP}/railway-loop-{id(self)}-{os.getpid()}-nodes.json",
+                        state_path=f"{_TMP}/railway-loop-{id(self)}-{os.getpid()}-state.json")
         defaults.update(kwargs)
         return RailwayManager(**defaults)
 
@@ -3279,9 +3322,9 @@ class FullProbeOrderTests(unittest.TestCase):
         defaults = dict(port=0, mixed_port=get_free_port(), start_singbox=False,
                         auto_refresh=False, fetch_on_start=False,
                         admin_token=self.TOKEN,
-                        config_path=f"{_TMP}/railway-ord-{id(self)}.json",
-                        nodes_path=f"{_TMP}/railway-ord-{id(self)}-nodes.json",
-                        state_path=f"{_TMP}/railway-ord-{id(self)}-state.json")
+                        config_path=f"{_TMP}/railway-ord-{id(self)}-{os.getpid()}.json",
+                        nodes_path=f"{_TMP}/railway-ord-{id(self)}-{os.getpid()}-nodes.json",
+                        state_path=f"{_TMP}/railway-ord-{id(self)}-{os.getpid()}-state.json")
         defaults.update(kwargs)
         return RailwayManager(**defaults)
 
@@ -3321,19 +3364,24 @@ class FullProbeOrderTests(unittest.TestCase):
                 started.append(node["server"])
             return 50
 
-        manager = self._manager(dial_fn=dial, full_probe_workers=1)
+        # The exit-IP verify is stubbed: the default one starts a real
+        # sing-box client, which under the mocked Popen spins out its whole
+        # timeout and leaves the probe thread running past the test.
+        manager = self._manager(dial_fn=dial, full_probe_workers=1,
+                                verify_fn=lambda ep: ("9.9.9.9", 11))
         try:
             self._seed_nodes(manager, ("203.0.113.11", 300),
                              ("203.0.113.12", 100), ("203.0.113.13", 200))
             with _fake_singbox():
                 self._post(manager, "/api/full_probe")
                 manager._full_probe_thread.join(timeout=30)
+                self.assertFalse(manager._full_probe_thread.is_alive(),
+                                 "the probe thread must finish inside the test")
         finally:
             manager.stop()
 
         self.assertEqual(["203.0.113.12", "203.0.113.13", "203.0.113.11"],
                          started)
-
 
 class RefreshAutoProbeTests(unittest.TestCase):
     """Every successful refresh kicks off a background full probe."""
@@ -3341,9 +3389,9 @@ class RefreshAutoProbeTests(unittest.TestCase):
     def _manager(self, **kwargs):
         defaults = dict(port=0, mixed_port=get_free_port(), start_singbox=False,
                         auto_refresh=False, fetch_on_start=False,
-                        config_path=f"{_TMP}/railway-rap-{id(self)}.json",
-                        nodes_path=f"{_TMP}/railway-rap-{id(self)}-nodes.json",
-                        state_path=f"{_TMP}/railway-rap-{id(self)}-state.json")
+                        config_path=f"{_TMP}/railway-rap-{id(self)}-{os.getpid()}.json",
+                        nodes_path=f"{_TMP}/railway-rap-{id(self)}-{os.getpid()}-nodes.json",
+                        state_path=f"{_TMP}/railway-rap-{id(self)}-{os.getpid()}-state.json")
         defaults.update(kwargs)
         return RailwayManager(**defaults)
 
@@ -3394,9 +3442,9 @@ class RefreshGateTests(unittest.TestCase):
     def _manager(self, **kwargs):
         defaults = dict(port=0, mixed_port=get_free_port(), start_singbox=False,
                         auto_refresh=False, fetch_on_start=False,
-                        config_path=f"{_TMP}/railway-rgate-{id(self)}.json",
-                        nodes_path=f"{_TMP}/railway-rgate-{id(self)}-nodes.json",
-                        state_path=f"{_TMP}/railway-rgate-{id(self)}-state.json")
+                        config_path=f"{_TMP}/railway-rgate-{id(self)}-{os.getpid()}.json",
+                        nodes_path=f"{_TMP}/railway-rgate-{id(self)}-{os.getpid()}-nodes.json",
+                        state_path=f"{_TMP}/railway-rgate-{id(self)}-{os.getpid()}-state.json")
         defaults.update(kwargs)
         return RailwayManager(**defaults)
 
@@ -3513,9 +3561,9 @@ class AutoPinTests(unittest.TestCase):
         defaults = dict(port=0, mixed_port=get_free_port(), start_singbox=False,
                         auto_refresh=False, fetch_on_start=False,
                         admin_token=self.TOKEN,
-                        config_path=f"{_TMP}/railway-ap-{id(self)}.json",
-                        nodes_path=f"{_TMP}/railway-ap-{id(self)}-nodes.json",
-                        state_path=f"{_TMP}/railway-ap-{id(self)}-state.json")
+                        config_path=f"{_TMP}/railway-ap-{id(self)}-{os.getpid()}.json",
+                        nodes_path=f"{_TMP}/railway-ap-{id(self)}-{os.getpid()}-nodes.json",
+                        state_path=f"{_TMP}/railway-ap-{id(self)}-{os.getpid()}-state.json")
         defaults.update(kwargs)
         return RailwayManager(**defaults)
 
@@ -3787,9 +3835,9 @@ class ProgressivePinTests(unittest.TestCase):
         defaults = dict(port=0, mixed_port=get_free_port(), start_singbox=False,
                         auto_refresh=False, fetch_on_start=False,
                         admin_token=self.TOKEN,
-                        config_path=f"{_TMP}/railway-pp-{id(self)}.json",
-                        nodes_path=f"{_TMP}/railway-pp-{id(self)}-nodes.json",
-                        state_path=f"{_TMP}/railway-pp-{id(self)}-state.json")
+                        config_path=f"{_TMP}/railway-pp-{id(self)}-{os.getpid()}.json",
+                        nodes_path=f"{_TMP}/railway-pp-{id(self)}-{os.getpid()}-nodes.json",
+                        state_path=f"{_TMP}/railway-pp-{id(self)}-{os.getpid()}-state.json")
         defaults.update(kwargs)
         return RailwayManager(**defaults)
 
@@ -3831,14 +3879,21 @@ class ProgressivePinTests(unittest.TestCase):
                  mock.patch.object(manager, "verify_fn",
                                    side_effect=lambda ep: ("9.9.9.9", 11)):
                 self._post(manager, "/api/full_probe")
-                seen: set = set()
+                # The probe commits the pin first and flips the state to done
+                # afterwards (D13: "done" must mean "the republish is over"),
+                # so the state flag cannot be the completion signal here. The
+                # invariant is: the pin never appears before every node was
+                # measured.
+                premature: list[tuple] = []
                 deadline = time.monotonic() + 20
                 while manager._full_probe_thread.is_alive():
-                    # Only sample while dials are still in flight: once
-                    # full_probe.state flips to done, _auto_pin_best may
-                    # already have committed (thread teardown window).
-                    if manager.status["full_probe"]["state"] != "done":
-                        seen.add(manager.preferred_tag)
+                    with manager._lock:
+                        state = manager.status["full_probe"]["state"]
+                        done = manager.status["full_probe"]["done"]
+                        total = manager.status["full_probe"]["total"]
+                        tag = manager.preferred_tag
+                    if state != "done" and tag is not None and done < total:
+                        premature.append((tag, done, total))
                     if time.monotonic() > deadline:
                         break
                     time.sleep(0.05)
@@ -3851,8 +3906,8 @@ class ProgressivePinTests(unittest.TestCase):
         self.assertIn("vpngate-2", [n["endpoint"]["tag"]
                                     for n in manager._nodes
                                     if n["real_latency_ms"] == 10])
-        self.assertEqual({None}, seen,
-                         f"pin happened before completion: {seen}")
+        self.assertEqual([], premature,
+                         f"the pin appeared before the probe finished: {premature}")
         self.assertNotIn("auto-pin-first", events)
         self.assertEqual("vpngate-2", manager.preferred_tag)
         self.assertEqual("vpngate-1", manager.backup_tag)
@@ -4129,9 +4184,9 @@ class DialTimeoutPlumbingTests(unittest.TestCase):
     def _manager(self, **kwargs):
         defaults = dict(port=0, mixed_port=get_free_port(), start_singbox=False,
                         auto_refresh=False, fetch_on_start=False,
-                        config_path=f"{_TMP}/railway-dtp-{id(self)}.json",
-                        nodes_path=f"{_TMP}/railway-dtp-{id(self)}-nodes.json",
-                        state_path=f"{_TMP}/railway-dtp-{id(self)}-state.json")
+                        config_path=f"{_TMP}/railway-dtp-{id(self)}-{os.getpid()}.json",
+                        nodes_path=f"{_TMP}/railway-dtp-{id(self)}-{os.getpid()}-nodes.json",
+                        state_path=f"{_TMP}/railway-dtp-{id(self)}-{os.getpid()}-state.json")
         defaults.update(kwargs)
         return RailwayManager(**defaults)
 
@@ -4194,9 +4249,9 @@ class AutoPinFlagTests(unittest.TestCase):
         defaults = dict(port=0, mixed_port=get_free_port(), start_singbox=False,
                         auto_refresh=False, fetch_on_start=False,
                         admin_token=self.TOKEN,
-                        config_path=f"{_TMP}/railway-apf-{id(self)}.json",
-                        nodes_path=f"{_TMP}/railway-apf-{id(self)}-nodes.json",
-                        state_path=f"{_TMP}/railway-apf-{id(self)}-state.json")
+                        config_path=f"{_TMP}/railway-apf-{id(self)}-{os.getpid()}.json",
+                        nodes_path=f"{_TMP}/railway-apf-{id(self)}-{os.getpid()}-nodes.json",
+                        state_path=f"{_TMP}/railway-apf-{id(self)}-{os.getpid()}-state.json")
         defaults.update(kwargs)
         return RailwayManager(**defaults)
 
@@ -4311,9 +4366,9 @@ class VerifyAttributionTests(unittest.TestCase):
         defaults = dict(port=0, mixed_port=get_free_port(), start_singbox=False,
                         auto_refresh=False, fetch_on_start=False,
                         admin_token=self.TOKEN,
-                        config_path=f"{_TMP}/railway-verifyattr-{id(self)}.json",
-                        nodes_path=f"{_TMP}/railway-verifyattr-{id(self)}-nodes.json",
-                        state_path=f"{_TMP}/railway-verifyattr-{id(self)}-state.json")
+                        config_path=f"{_TMP}/railway-verifyattr-{id(self)}-{os.getpid()}.json",
+                        nodes_path=f"{_TMP}/railway-verifyattr-{id(self)}-{os.getpid()}-nodes.json",
+                        state_path=f"{_TMP}/railway-verifyattr-{id(self)}-{os.getpid()}-state.json")
         defaults.update(kwargs)
         return RailwayManager(**defaults)
 
@@ -4707,9 +4762,9 @@ class ConcurrentStartTests(unittest.TestCase):
         defaults = dict(port=0, mixed_port=get_free_port(), start_singbox=False,
                         auto_refresh=False, fetch_on_start=False,
                         admin_token=self.TOKEN,
-                        config_path=f"{_TMP}/railway-race-{id(self)}.json",
-                        nodes_path=f"{_TMP}/railway-race-{id(self)}-nodes.json",
-                        state_path=f"{_TMP}/railway-race-{id(self)}-state.json")
+                        config_path=f"{_TMP}/railway-race-{id(self)}-{os.getpid()}.json",
+                        nodes_path=f"{_TMP}/railway-race-{id(self)}-{os.getpid()}-nodes.json",
+                        state_path=f"{_TMP}/railway-race-{id(self)}-{os.getpid()}-state.json")
         defaults.update(kwargs)
         return RailwayManager(**defaults)
 
@@ -4828,9 +4883,9 @@ class SingleProbeWritebackTests(unittest.TestCase):
         defaults = dict(port=0, mixed_port=get_free_port(), start_singbox=False,
                         auto_refresh=False, fetch_on_start=False,
                         admin_token=self.TOKEN,
-                        config_path=f"{_TMP}/railway-spw-{id(self)}.json",
-                        nodes_path=f"{_TMP}/railway-spw-{id(self)}-nodes.json",
-                        state_path=f"{_TMP}/railway-spw-{id(self)}-state.json")
+                        config_path=f"{_TMP}/railway-spw-{id(self)}-{os.getpid()}.json",
+                        nodes_path=f"{_TMP}/railway-spw-{id(self)}-{os.getpid()}-nodes.json",
+                        state_path=f"{_TMP}/railway-spw-{id(self)}-{os.getpid()}-state.json")
         defaults.update(kwargs)
         return RailwayManager(**defaults)
 
@@ -4949,9 +5004,9 @@ class ProbeWritebackFollowupsTests(unittest.TestCase):
         defaults = dict(port=0, mixed_port=get_free_port(), start_singbox=False,
                         auto_refresh=False, fetch_on_start=False,
                         admin_token=self.TOKEN,
-                        config_path=f"{_TMP}/railway-pwf-{id(self)}.json",
-                        nodes_path=f"{_TMP}/railway-pwf-{id(self)}-nodes.json",
-                        state_path=f"{_TMP}/railway-pwf-{id(self)}-state.json")
+                        config_path=f"{_TMP}/railway-pwf-{id(self)}-{os.getpid()}.json",
+                        nodes_path=f"{_TMP}/railway-pwf-{id(self)}-{os.getpid()}-nodes.json",
+                        state_path=f"{_TMP}/railway-pwf-{id(self)}-{os.getpid()}-state.json")
         defaults.update(kwargs)
         return RailwayManager(**defaults)
 
