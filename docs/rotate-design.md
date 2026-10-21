@@ -1017,8 +1017,47 @@ serving 入口测量**（轮换的 loopback inbound，和 `_chain_probe_ok` / `_
 登录同一节点就被拒 ⇒ 10 个 serving 端点变僵尸。
 
 这一版用**最省事**的办法降低伤害，而不是消灭入口：给 openvpn 端点加
-`"auth-retry": "nointeract"`（sing-box 的默认值是 `none` = 登录被拒即终态，日志里那行
+`"auth_retry": "nointeract"`（sing-box 的默认值是 `none` = 登录被拒即终态，日志里那行
 `(auth-retry none)` 就是它）⇒ serving 端在对方会话消失后**自己重试登录**，节点从尸体
 复活。彻底消灭这个入口要改成"先落 serving 配置、再经 serving 端测量"的两段式发布，
 改动面大得多，留待需要时再做。
+
+**注意**：探针与 serving 端点共用同一个 endpoint 模板，所以 `auth_retry` 必须**分角色**：
+
+| 角色 | `auth_retry` | 理由 |
+|---|---|---|
+| serving 端点 | `nointeract` | 长期会话，被顶掉后自己重试登录 |
+| throwaway 探针 | `none` | 探针只用来测：抢不到那个节点唯一的 CN 就**快速失败**⇒ 调用方跳过该节点 |
+
+两者都用 `nointeract` 的话，探针会卡在登录里直到自己超时（慢，而且方向相反）。
+
+### 12.20 "跑久了 chain 挂了"：容器验收一路挖到第 4 层
+
+云端端到端验收（`.github/workflows/test-chain-acceptance.yml`，**常驻回归守卫**，
+`workflow_dispatch` 手动触发）把这个问题从"感觉"变成了可复现的机制。前 7 轮冷启动断言
+全绿（本文要验的改动），杀 pin 轮则一路照出四层：
+
+| 层 | 现象 | 状态 |
+|---|---|---|
+| ① 冷启动选 pin 时 verify 直拨 | 另起 OpenVPN 客户端 ⇒ 第二个 VPNGate 会话 ⇒ 踢掉正在服务的那条 | **已修**（`46c5953`）：rotate 冷启动直接采用 `best`，不走 verify 循环。验收 7 轮全绿 |
+| ② serving 端点被自家真拨踢成尸体 | `client terminated: authentication failed: terminal (auth-retry none)` ⇒ 节点永远是死的 | **已修**（`2983573` + `auth_retry: nointeract`）：真拨改走节点自己的 serving 入口（骑 mux，不开新会话）；`authentication failed: terminal` 实测 **11 → 0** |
+| ③ 探针被上一版修复的副作用卡住 | 探针也变成"不放弃"⇒ 抢不到 CN 的节点要重试到超时 | **已修**（`31dfab8`）：探针固定 `auth_retry: none`（快速失败⇒跳过该节点） |
+| ④ 候选 endpoint 连上了却不出货 | 链的隧道探针 0/2、1/2 全灭，Clash delay 也失败，轮换探针同样"no serving endpoint answered"；但候选的 endpoint 是活的（per-node `not ready yet` 只剩被 kill 的那个节点 3227 条，其余各 15 条） | **未收口**：自愈仍 369s/363s（判据 ≤120s）。机制面全对（配置 md5 不变、sing-box pid 不变、4 次 hot switch、pin 确实换人） |
+
+第 ④ 层下一步的观测清单（已交给验收负责人）：每 5s 采 ①Clash selector 的 `now` 与
+`all`、②**分别**测 `chain` 与一个从不换人的健康节点的 delay（区分"选择器/路由问题"与
+"节点/会话问题"）、③`/ws-chain` 的真实出口 IP 抓取结果、④候选节点的 sing-box 出站日志
+（"没连上 / 被踢 / 连上但隧道里出不去"三者分别可辨）、⑤容器内 `iptables -S OUTPUT`
+（证明只封了被 kill 的那一个 (ip,port)）、⑥serving 进程到各 VPNGate 端口的连接状态。
+
+**CI 侧的护栏**（都已在 main 上）：
+
+- `unit-tests.yml` 的 `pytest` job：3.12/3.13 × 3 遍 = 6 个 job，每遍跑全套，并且**测试不许
+  在仓库里留文件**；
+- 同 workflow 的 `sing-box accepts a generated config` job：装**真的 sing-box 1.14.0**，
+  用仓库的 builder 生成一份 rotate 配置再 `sing-box check -c`——单测只看得到 dict，
+  字段名写错（例如 `auth-retry` 应为 `auth_retry`）单测全绿、容器里却整条产品链死掉，
+  这个 job 把它挡在 push 之前；
+- `test-chain-acceptance.yml`：常驻回归守卫，手动触发，守"冷启动不得靠直拨选 pin"与
+  "杀 pin 后链必须 120s 内自愈"。
 
