@@ -268,14 +268,10 @@ def ovpn_to_endpoint(
         # "nointeract" retries the authentication instead, so the endpoint
         # recovers as soon as the other session is gone.
         "auth_retry": "nointeract",
-        # Keep the session alive and let a dead one reconnect by itself.
-        # sing-box has no default receive timeout for TCP endpoints ("No
-        # default receive timeout is used for TCP"), and VPNGate hands out
-        # TCP, so without these a session that stops carrying traffic stays
-        # "connected" for good: the cloud acceptance measured 15 of 16
-        # serving endpoints with their TCP up and their tunnel silent.
-        "ping_interval": "20s",
-        "ping_restart": "60s",
+        # The keepalive comes from the .ovpn itself (see _keepalive_fields,
+        # which falls back to 10s/60s). It is deliberately NOT overridden
+        # here: the server-pushed values win, and they are the ones the
+        # server actually honours.
         **_keepalive_fields(config_text),
         **({"remote_random": True} if _REMOTE_RANDOM_RE.search(config_text) else {}),
         "system": False,
