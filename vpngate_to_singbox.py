@@ -258,6 +258,16 @@ def ovpn_to_endpoint(
         "data_ciphers": data_ciphers,
         "data_ciphers_fallback": data_ciphers[0],
         "auth": auth,
+        # VPNGate hands out ONE OpenVPN session per node (duplicate-cn is
+        # off), so a second login for the same node - the manager's own
+        # refresh probe, for instance - gets the serving session rejected
+        # ("authentication failed: terminal"). With the default
+        # "auth-retry: none" that rejection is final and the serving
+        # endpoint stays dead ("endpoint is not ready yet"), which is how a
+        # healthy node turns into a corpse the chain has to walk past.
+        # "nointeract" retries the authentication instead, so the endpoint
+        # recovers as soon as the other session is gone.
+        "auth-retry": "nointeract",
         **_keepalive_fields(config_text),
         **({"remote_random": True} if _REMOTE_RANDOM_RE.search(config_text) else {}),
         "system": False,

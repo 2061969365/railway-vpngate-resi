@@ -81,6 +81,12 @@ class ConvertTcpTests(unittest.TestCase):
         self.assertIn("AES-128-CBC", ep["data_ciphers"])
         self.assertEqual("SHA1", ep["auth"])
         self.assertIn("BEGIN CERTIFICATE", ep["tls"]["certificate"])
+        # VPNGate gives one OpenVPN session per node, so a second login for
+        # the same node (the manager's own refresh probe) gets the serving
+        # session rejected. With the default "none" that rejection is final
+        # and the serving endpoint stays dead; the endpoint must retry the
+        # authentication instead.
+        self.assertEqual("nointeract", ep["auth-retry"])
 
     def test_udp_only_config_raises(self) -> None:
         with self.assertRaises(ValueError):
