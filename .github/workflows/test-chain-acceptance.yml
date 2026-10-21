@@ -151,13 +151,15 @@ jobs:
           `sing-box run -c /app/singbox-railway.json`; every OTHER sing-box
           client is a throwaway one, and its config names the node it dials.
           """
-          import json, os, time, urllib.request
+          import json, os, re, time, urllib.request
 
           TOKEN = os.environ.get("ADMIN_TOKEN", "")
           SERVING = "/app/singbox-railway.json"
+          LOG = SERVING + ".stderr.log"
           OUT = "/tmp/dial_events.jsonl"
           MARK = "/tmp/watch_markers.json"
           DEADLINE = time.time() + 3600
+          HZ = os.sysconf("SC_CLK_TCK")
 
           def status():
               req = urllib.request.Request("http://127.0.0.1:3000/api/status",
@@ -219,12 +221,53 @@ jobs:
                           out[item["server"]] = ep.get("tag")
               return out
 
+          def proc_started(pid):
+              """Exact start time of a process (epoch seconds), not the poll time."""
+              try:
+                  with open("/proc/uptime", "r", encoding="utf-8") as fh:
+                      up = float(fh.read().split()[0])
+                  with open("/proc/%s/stat" % pid, "rb") as fh:
+                      data = fh.read()
+              except (OSError, ValueError):
+                  return None
+              tail = data[data.rfind(b")") + 2:].split()
+              try:
+                  ticks = int(tail[19])      # field 22 (starttime) after field 3
+              except (IndexError, ValueError):
+                  return None
+              return time.time() - up + ticks / HZ
+
+          def log_stats():
+              """(count, tags) of the duplicate-cn signature in the serving log.
+
+              `client terminated: authentication failed: terminal` is what the
+              serving sing-box prints when its openvpn session is kicked by a
+              second session on the same VPNGate node.
+              """
+              count = 0
+              tags = []
+              for path in (LOG, LOG + ".prev"):
+                  try:
+                      with open(path, "rb") as fh:
+                          data = fh.read()
+                  except OSError:
+                      continue
+                  for line in data.split(b"\n"):
+                      if b"authentication failed: terminal" in line:
+                          count += 1
+                          found = re.search(rb"openvpn-client\[([^\]]+)\]", line)
+                          tags.append(found.group(1).decode("utf-8", "replace") if found else "?")
+              return count, tags
+
           seen = set()
           verified = {}
-          markers = {"dialing_done": None, "pin": None, "pin_tag": None}
+          markers = {"dialing_done": None, "pin": None, "pin_tag": None,
+                     "auth_fail_at_dialing_done": None, "auth_fail_at_pin": None,
+                     "auth_fail_total": 0, "terminated_tags": []}
           with open(OUT, "a", buffering=1) as sink:
               while time.time() < DEADLINE:
                   stamp = time.time()
+                  auth_fail, terminated = log_stats()
                   try:
                       st = status()
                   except Exception:
@@ -235,9 +278,11 @@ jobs:
                       done = fp.get("done") or 0
                       if markers["dialing_done"] is None and total > 0 and done >= total:
                           markers["dialing_done"] = stamp
+                          markers["auth_fail_at_dialing_done"] = auth_fail
                       if markers["pin"] is None and st.get("preferred_tag"):
                           markers["pin"] = stamp
                           markers["pin_tag"] = st.get("preferred_tag")
+                          markers["auth_fail_at_pin"] = auth_fail
                       # The nodes the manager has already really dialed
                       # (real_latency_ms is only set after a real dial). A
                       # throwaway client that dials one of them opens a
@@ -247,10 +292,13 @@ jobs:
                       for ep in (st.get("endpoints") or []):
                           if ep.get("real_latency_ms") is not None and ep.get("server"):
                               verified[ep["server"]] = ep.get("tag")
-                      with open(MARK, "w", encoding="utf-8") as fh:
-                          json.dump(markers, fh)
+                  markers["auth_fail_total"] = auth_fail
+                  markers["terminated_tags"] = terminated[-20:]
+                  with open(MARK, "w", encoding="utf-8") as fh:
+                      json.dump(markers, fh)
                   smap = serving_map()
                   for pid, cfg_path in clients():
+                      started = proc_started(pid) or stamp
                       for target in vpngate_targets(cfg_path):
                           key = (pid, tuple(target))
                           if key in seen:
@@ -258,7 +306,7 @@ jobs:
                           seen.add(key)
                           host = target[0]
                           sink.write(json.dumps({
-                              "t": stamp, "pid": pid, "config": cfg_path,
+                              "t": started, "seen": stamp, "pid": pid, "config": cfg_path,
                               "target": target, "serving_tag": smap.get(host),
                               "verified_tag": verified.get(host),
                           }) + "\n")
@@ -524,37 +572,52 @@ jobs:
           raw = pathlib.Path("/tmp/dial_events.jsonl").read_text().splitlines()
           events = [json.loads(line) for line in raw if line.strip()]
           markers = json.loads(pathlib.Path("/tmp/watch_markers.json").read_text())
-          print("markers:", markers)
+          print("markers:", json.dumps(markers, indent=1))
           print("throwaway sing-box clients that dialed a VPNGate node:", len(events))
           for e in events:
-              print("  t=%.1f pid=%s target=%s serving_tag=%s verified_tag=%s" % (
+              print("  t=%.3f pid=%s target=%s serving_tag=%s verified_tag=%s" % (
                   e["t"], e["pid"], e.get("target"), e.get("serving_tag"), e.get("verified_tag")))
           assert events, "the watcher saw no throwaway client at all: no evidence"
           pin_t = markers.get("pin")
           assert pin_t, markers
           done_t = markers.get("dialing_done")
-          # The rule is the product's own: a throwaway client may dial a node
-          # the manager has NOT really dialed yet (that is the full probe
-          # filling the pool), but it must never dial a node that is already
-          # measured - that node holds the only VPNGate session it is allowed
-          # to have, and a second one kicks it (duplicate-cn). The pre-fix
-          # cold start did exactly that: verify_fn on the measured candidates.
-          violations = [e for e in events if e.get("verified_tag")]
-          start = (done_t if done_t is not None else pin_t - 15.0)
+          # The pin decision window: the full probe finished -> the pin is set.
+          # Everything the full probe itself dialed started before the probe
+          # finished, so it is outside the window; only a dial that happens
+          # *while the pin is decided* can be a verify-by-dial.
+          start = (done_t - 1.0) if done_t is not None else (pin_t - 15.0)
           end = pin_t + 30.0
           inside = [e for e in events if start <= e["t"] <= end]
-          print("pin decision window: %.1f .. %.1f" % (start, end))
+          print("pin decision window: %.3f .. %.3f" % (start, end))
           print("throwaway VPNGate dials inside the pin window: %d" % len(inside))
           for e in inside:
-              print("  in-window t=%.1f target=%s serving_tag=%s verified_tag=%s" % (
+              print("  in-window t=%.3f target=%s serving_tag=%s verified_tag=%s" % (
                   e["t"], e.get("target"), e.get("serving_tag"), e.get("verified_tag")))
-          print("throwaway dials of an ALREADY MEASURED node: %d" % len(violations))
-          for e in violations:
-              print("  VIOLATION t=%.1f target=%s serving_tag=%s verified_tag=%s" % (
-                  e["t"], e.get("target"), e.get("serving_tag"), e.get("verified_tag")))
+          # (1) A throwaway client must never dial a node the manager has
+          #     already really measured: that node holds the only VPNGate
+          #     session it may have, and a second one kicks it (duplicate-cn).
+          #     The pre-fix cold start did exactly that (verify_fn on the
+          #     measured candidates).
+          violations = [e for e in inside if e.get("verified_tag")]
+          # (2) The duplicate-cn signature itself: the serving sing-box must
+          #     not lose a session while the pin is decided. (The same line
+          #     shows up outside this window when the full probe legitimately
+          #     dials a node the urltest group holds a session on, so the
+          #     count is compared across the window, not against zero.)
+          a0 = markers.get("auth_fail_at_dialing_done")
+          a1 = markers.get("auth_fail_at_pin")
+          kicked = None
+          if a0 is not None and a1 is not None:
+              kicked = a1 - a0
+          print("'authentication failed: terminal' in the serving log: total=%s, during the pin decision=%s" % (
+              markers.get("auth_fail_total"), kicked))
+          print("terminated session tags:", markers.get("terminated_tags"))
           assert not violations, (
               "a throwaway client dialed a node the manager had already measured "
               "(a second VPNGate session for a node that is serving)", violations)
+          assert kicked in (None, 0), (
+              "a serving session was kicked while the pin was decided", kicked,
+              markers.get("terminated_tags"))
           print("NO DIAL-TO-PIN OK: the cold start pinned without a verify-by-dial")
           EOF
 
@@ -584,6 +647,9 @@ jobs:
           echo "=== chosen tag log lines ==="
           NOW=$(docker exec rotate-trial python3 /tmp/diag.py selector 2>/dev/null | sed 's/now=\([^ ]*\).*/\1/' || true)
           docker exec rotate-trial sh -c "grep -a 'endpoint/openvpn-client\[$NOW\]' /app/singbox-railway.json.stderr.log | tail -n 25" || true
+          echo "=== duplicate-cn signature in the serving sing-box log ==="
+          docker exec rotate-trial sh -c 'cat /app/singbox-railway.json.stderr.log /app/singbox-railway.json.stderr.log.prev 2>/dev/null | grep -ac "authentication failed: terminal"' || echo "(no log)"
+          docker exec rotate-trial sh -c 'cat /app/singbox-railway.json.stderr.log /app/singbox-railway.json.stderr.log.prev 2>/dev/null | grep -a "authentication failed: terminal" | tail -n 20' || true
           echo "=== not ready / terminated ==="
           docker exec rotate-trial sh -c "grep -aE 'not ready yet|client terminated|client started' /app/singbox-railway.json.stderr.log | tail -n 25" || true
           echo "=== config rewrites ==="
