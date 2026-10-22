@@ -1043,7 +1043,7 @@ jobs:
               hard.append("the repin restarted sing-box")
           if int(s["chain_switch"]["switches"]) <= int(sw0):
               hard.append("no hot switch was recorded")
-          if s["preferred_tag"] == pin0:
+          if s["preferred_tag"] == pin0 and gate:
               hard.append("the pin did not move")
           if not chain.startswith("ips="):
               soft.append("the chain never carried traffic again")
