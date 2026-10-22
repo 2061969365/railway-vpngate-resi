@@ -853,75 +853,31 @@ jobs:
           NOW=$(docker exec rotate-trial python3 /tmp/diag.py selector 2>/dev/null | sed 's/now=\([^ ]*\).*/\1/')
           docker exec rotate-trial sh -c "grep -a 'openvpn-client\[$NOW\]' /app/singbox-railway.json.stderr.log | tail -n 30" || true
 
-      - name: The on_demand experiment (sing-box 1.15, container only)
+      - name: The product brings on_demand (no container surgery)
         run: |
-          # sing-box 1.15 can disconnect an idle endpoint ("on_demand"), which
-          # would release the node's single VPNGate session - the dead
-          # sessions are exactly what keeps the pool stale. 1.14 does not know
-          # the field, so this experiment needs 1.15, installed in the container
-          # only; the repository is not touched.
+          # The product now puts on_demand on every serving endpoint and the
+          # image carries sing-box 1.15 - so an idle endpoint can disconnect,
+          # the node's single VPNGate session is released and a fresh client
+          # can take the node over. Nothing is changed in the container here;
+          # the step only proves that the running stack has both.
           echo "=== the sing-box in the image ==="
           docker exec rotate-trial sh -c 'sing-box version | head -n 2'
-          # 1.15.0 stable is not out yet; the alpha carries the on_demand field.
-          SB115_URL="https://github.com/SagerNet/sing-box/releases/download/v1.15.0-alpha.12/sing-box-1.15.0-alpha.12-linux-amd64.tar.gz"
-          docker exec rotate-trial sh -c "cp /usr/local/bin/sing-box /usr/local/bin/sing-box-1.14"
-          if docker exec rotate-trial sh -c "curl -Ls '$SB115_URL' | tar xz -C /tmp && mv /tmp/sing-box-1.15.0-alpha.12-linux-amd64/sing-box /usr/local/bin/sing-box-1.15 && chmod +x /usr/local/bin/sing-box-1.15"; then
-            docker exec rotate-trial sh -c 'sing-box-1.15 version | head -n 2'
-          else
-            echo "COULD NOT INSTALL 1.15 - the experiment is skipped, the run continues"
-            exit 0
-          fi
-          echo "=== does 1.15 accept our current config? ==="
-          if docker exec rotate-trial sh -c 'cp /app/singbox-railway.json /tmp/check-1.15.json && /usr/local/bin/sing-box-1.15 check -c /tmp/check-1.15.json'; then
-            echo "1.15 ACCEPTS the current config"
-          else
-            echo "1.15 REJECTS the current config - the experiment is skipped, the run continues"
-            exit 0
-          fi
-          echo "=== on_demand on every openvpn-client endpoint ==="
-          docker exec -i rotate-trial python3 - <<'PY'
-          import json
-          path = "/app/singbox-railway.json"
-          cfg = json.load(open(path))
-          n = 0
-          for ep in cfg.get("endpoints") or []:
-              if ep.get("type") == "openvpn-client":
-                  ep["on_demand"] = True
-                  n += 1
-          with open(path, "w", encoding="utf-8") as fh:
-              json.dump(cfg, fh, indent=2)
-          print("on_demand set on", n, "endpoints")
-          PY
-          # `cp` over a running binary is refused by the kernel (ETXTBSY), so
-          # the replacement is a rename: the running process keeps the old
-          # inode and the next start uses the new file.
-          docker exec rotate-trial sh -c 'cp /usr/local/bin/sing-box /usr/local/bin/sing-box-1.14; mv /usr/local/bin/sing-box-1.15 /usr/local/bin/sing-box; sing-box version | head -n 2' || true
-          PID=$(docker exec rotate-trial sh -c 'for p in /proc/[0-9]*; do pid=${p#/proc/}; [ -r "$p/cmdline" ] || continue; exe=$(readlink "$p/exe" 2>/dev/null) || continue; case "$exe" in *sing-box*) ;; *) continue;; esac; c=$(tr "\0" " " < "$p/cmdline" 2>/dev/null); case "$c" in *singbox-railway.json*) case "$c" in */tmp/*) continue;; esac; echo "$pid"; break;; esac; done')
-          echo "restarting the serving sing-box (pid $PID) so it reads the edited config with 1.15"
-          docker exec rotate-trial kill -9 "$PID" || true
-          for i in $(seq 1 90); do
-            if docker exec rotate-trial python3 /tmp/diag.py clashapi 2>/dev/null | grep -q "version=ok"; then
-              echo "the serving stack answers again after ~$((i * 5))s"
-              break
-            fi
-            sleep 5
-          done
-          docker exec rotate-trial sh -c 'sing-box version | head -n 2; ps -ef | grep "[s]ing-box" | head -n 3' || true
-          echo "=== the endpoints now ==="
+          echo "=== does the running sing-box accept the published config? ==="
+          docker exec rotate-trial sh -c 'cp /app/singbox-railway.json /tmp/check.json && sing-box check -c /tmp/check.json && echo "the config is accepted"' || echo "THE CONFIG IS REJECTED by the shipped sing-box"
+          echo "=== the serving endpoints ==="
           docker exec rotate-trial python3 -c "
           import json
           cfg = json.load(open('/app/singbox-railway.json'))
-          for ep in (cfg.get('endpoints') or [])[:4]:
+          for ep in (cfg.get('endpoints') or [])[:8]:
               print('   %-12s on_demand=%s ping_interval=%s ping_restart=%s' % (
                   ep.get('tag'), ep.get('on_demand'), ep.get('ping_interval'), ep.get('ping_restart')))
           " || true
-          echo "=== the on_demand experiment is set up ==="
 
       - name: Let the pin and sing-box settle before the kill
         run: |
           prev=""
           for i in $(seq 1 60); do
-            pid=$(docker exec rotate-trial sh -c 'for p in /proc/[0-9]*/cmdline; do c=$(tr "\0" " " < "$p" 2>/dev/null); case "$c" in *sing-box*run*/app/singbox-railway.json*) echo "$p" | cut -d/ -f3; break;; esac; done')
+            pid=$(docker exec rotate-trial sh -c 'for p in /proc/[0-9]*; do pid=${p#/proc/}; [ -r "$p/cmdline" ] || continue; exe=$(readlink "$p/exe" 2>/dev/null) || continue; case "$exe" in *sing-box*) ;; *) continue;; esac; c=$(tr "\0" " " < "$p/cmdline" 2>/dev/null); case "$c" in *singbox-railway.json*) case "$c" in */tmp/*) continue;; esac; echo "$pid"; break;; esac; done')
             md5=$(docker exec rotate-trial sh -c 'md5sum /app/singbox-railway.json | cut -d" " -f1')
             recent=$(docker logs --since 60s rotate-trial 2>&1 | grep -c "config rewritten" || true)
             cur="$pid/$md5"
