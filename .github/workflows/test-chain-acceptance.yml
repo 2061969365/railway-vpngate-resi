@@ -896,7 +896,7 @@ jobs:
           # the replacement is a rename: the running process keeps the old
           # inode and the next start uses the new file.
           docker exec rotate-trial sh -c 'cp /usr/local/bin/sing-box /usr/local/bin/sing-box-1.14; mv /usr/local/bin/sing-box-1.15 /usr/local/bin/sing-box; sing-box version | head -n 2' || true
-          PID=$(docker exec rotate-trial sh -c 'for p in /proc/[0-9]*; do pid=${p#/proc/}; [ -r "$p/cmdline" ] || continue; exe=$(readlink "$p/exe" 2>/dev/null) || continue; case "$exe" in */sing-box) ;; *) continue;; esac; c=$(tr "\0" " " < "$p/cmdline" 2>/dev/null); case "$c" in *singbox-railway.json*) case "$c" in */tmp/*) continue;; esac; echo "$pid"; break;; esac; done')
+          PID=$(docker exec rotate-trial sh -c 'for p in /proc/[0-9]*; do pid=${p#/proc/}; [ -r "$p/cmdline" ] || continue; exe=$(readlink "$p/exe" 2>/dev/null) || continue; case "$exe" in *sing-box*) ;; *) continue;; esac; c=$(tr "\0" " " < "$p/cmdline" 2>/dev/null); case "$c" in *singbox-railway.json*) case "$c" in */tmp/*) continue;; esac; echo "$pid"; break;; esac; done')
           echo "restarting the serving sing-box (pid $PID) so it reads the edited config with 1.15"
           docker exec rotate-trial kill -9 "$PID" || true
           for i in $(seq 1 90); do
@@ -959,7 +959,7 @@ jobs:
               pid=${p#/proc/}
               [ -r "$p/cmdline" ] || continue
               exe=$(readlink "$p/exe" 2>/dev/null) || continue
-              case "$exe" in */sing-box) ;; *) continue;; esac
+              case "$exe" in *sing-box*) ;; *) continue;; esac
               c=$(tr "\0" " " < "$p/cmdline" 2>/dev/null)
               case "$c" in *singbox-railway.json*) case "$c" in */tmp/*) continue;; esac; echo "$pid"; break;; esac
             done'
@@ -1288,7 +1288,7 @@ jobs:
           auto = [o for o in cfg["outbounds"] if o.get("tag") == "auto"][0]
           print("the 'auto' group now has", len(auto.get("outbounds") or []), "member(s), interval", auto.get("interval"))
           PY
-          PID=$(docker exec rotate-trial sh -c 'for p in /proc/[0-9]*; do pid=${p#/proc/}; [ -r "$p/cmdline" ] || continue; exe=$(readlink "$p/exe" 2>/dev/null) || continue; case "$exe" in */sing-box) ;; *) continue;; esac; c=$(tr "\0" " " < "$p/cmdline" 2>/dev/null); case "$c" in *singbox-railway.json*) case "$c" in */tmp/*) continue;; esac; echo "$pid"; break;; esac; done')
+          PID=$(docker exec rotate-trial sh -c 'for p in /proc/[0-9]*; do pid=${p#/proc/}; [ -r "$p/cmdline" ] || continue; exe=$(readlink "$p/exe" 2>/dev/null) || continue; case "$exe" in *sing-box*) ;; *) continue;; esac; c=$(tr "\0" " " < "$p/cmdline" 2>/dev/null); case "$c" in *singbox-railway.json*) case "$c" in */tmp/*) continue;; esac; echo "$pid"; break;; esac; done')
           echo "restarting the serving sing-box (pid $PID) so it reads the edited config"
           docker exec rotate-trial kill -9 "$PID" || true
           for i in $(seq 1 90); do
