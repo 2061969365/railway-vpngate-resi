@@ -138,9 +138,24 @@ jobs:
               print("ips=%s" % ",".join(got["ips"]))
 
 
+          def clashapi():
+              # The Clash API's own state: /version and /proxies/chain, with the
+              # error type when it does not answer. A failing delay test is a
+              # different thing: the API can answer while the proxy is dead.
+              out = []
+              for path in ("/version", "/proxies/chain"):
+                  try:
+                      got = clash(path)
+                      out.append("%s=ok(%s)" % (path, (got.get("now") or got.get("version") or "?")))
+                  except Exception as exc:
+                      out.append("%s=error:%s" % (path, type(exc).__name__))
+              print(" ".join(out))
+
+
           if __name__ == "__main__":
               {"selector": selector,
                "clash": lambda: print(json.dumps(clash("/proxies/chain"))),
+               "clashapi": clashapi,
                "chain": lambda: probe("/ws-chain"),
                "chainfast": lambda: probe_fast("/ws-chain"),
                "node": lambda: probe("/ws-node"),
@@ -828,6 +843,55 @@ jobs:
           NOW=$(docker exec rotate-trial python3 /tmp/diag.py selector 2>/dev/null | sed 's/now=\([^ ]*\).*/\1/')
           docker exec rotate-trial sh -c "grep -a 'openvpn-client\[$NOW\]' /app/singbox-railway.json.stderr.log | tail -n 30" || true
 
+      - name: The on_demand experiment (sing-box 1.15, container only)
+        run: |
+          # sing-box 1.15 can disconnect an idle endpoint ("on_demand"), which
+          # would release the node's single VPNGate session - the dead
+          # sessions are exactly what keeps the pool stale. 1.14 does not know
+          # the field, so this experiment needs 1.15, installed in the container
+          # only; the repository is not touched.
+          echo "=== the sing-box in the image ==="
+          docker exec rotate-trial sh -c 'sing-box version | head -n 2'
+          docker exec rotate-trial sh -c 'cp /usr/local/bin/sing-box /usr/local/bin/sing-box-1.14'
+          docker exec rotate-trial sh -c 'curl -Ls https://github.com/SagerNet/sing-box/releases/download/v1.15.0/sing-box-1.15.0-linux-amd64.tar.gz | tar xz -C /tmp && mv /tmp/sing-box-1.15.0-linux-amd64/sing-box /usr/local/bin/sing-box-1.15 && chmod +x /usr/local/bin/sing-box-1.15'
+          docker exec rotate-trial sh -c 'sing-box-1.15 version | head -n 2' || echo "(could not install 1.15)"
+          echo "=== does 1.15 accept our current config? ==="
+          docker exec rotate-trial sh -c 'cp /app/singbox-railway.json /tmp/check-1.15.json && /usr/local/bin/sing-box-1.15 check -c /tmp/check-1.15.json && echo "1.15 ACCEPTS the current config"' || echo "1.15 REJECTS the current config (the experiment cannot run)"
+          echo "=== on_demand on every openvpn-client endpoint ==="
+          docker exec -i rotate-trial python3 - <<'PY'
+          import json
+          path = "/app/singbox-railway.json"
+          cfg = json.load(open(path))
+          n = 0
+          for ep in cfg.get("endpoints") or []:
+              if ep.get("type") == "openvpn-client":
+                  ep["on_demand"] = True
+                  n += 1
+          with open(path, "w", encoding="utf-8") as fh:
+              json.dump(cfg, fh, indent=2)
+          print("on_demand set on", n, "endpoints")
+          PY
+          docker exec rotate-trial sh -c 'cp /usr/local/bin/sing-box-1.15 /usr/local/bin/sing-box && sing-box version | head -n 2'
+          PID=$(docker exec rotate-trial sh -c 'for p in /proc/[0-9]*; do pid=${p#/proc/}; [ -r "$p/cmdline" ] || continue; exe=$(readlink "$p/exe" 2>/dev/null) || continue; case "$exe" in */sing-box) ;; *) continue;; esac; c=$(tr "\0" " " < "$p/cmdline" 2>/dev/null); case "$c" in *singbox-railway.json*) case "$c" in */tmp/*) continue;; esac; echo "$pid"; break;; esac; done')
+          echo "restarting the serving sing-box (pid $PID) so it reads the edited config with 1.15"
+          docker exec rotate-trial kill -9 "$PID" || true
+          for i in $(seq 1 90); do
+            if docker exec rotate-trial python3 /tmp/diag.py clashapi 2>/dev/null | grep -q "version=ok"; then
+              echo "the serving stack answers again after ~$((i * 5))s"
+              break
+            fi
+            sleep 5
+          done
+          docker exec rotate-trial sh -c 'sing-box version | head -n 2; ps -ef | grep "[s]ing-box" | head -n 3'
+          echo "=== the endpoints now ==="
+          docker exec rotate-trial python3 -c "
+          import json
+          cfg = json.load(open('/app/singbox-railway.json'))
+          for ep in (cfg.get('endpoints') or [])[:4]:
+              print('   %-12s on_demand=%s ping_interval=%s ping_restart=%s' % (
+                  ep.get('tag'), ep.get('on_demand'), ep.get('ping_interval'), ep.get('ping_restart')))
+          " || true
+
       - name: Let the pin and sing-box settle before the kill
         run: |
           prev=""
@@ -957,7 +1021,8 @@ jobs:
                 echo "round $round: the serving sing-box changed pid $PID0 -> $PIDNOW"
                 curl -m 10 -s -H "$AUTH" http://127.0.0.1:3000/api/status | python3 -c "import json,sys;s=json.load(sys.stdin);print('  manager last_error:',s.get('last_error'));print('  history:',[(h['event'],h.get('detail')) for h in s.get('refresh_history',[])][-6:])" || true
               fi
-              echo "round $round t=$((SECONDS - T0))s $sel chain=$chain pid=$PIDNOW"
+              api=$(docker exec rotate-trial python3 /tmp/diag.py clashapi || true)
+              echo "round $round t=$((SECONDS - T0))s $sel chain=$chain pid=$PIDNOW api=[$api]"
               # The chain is only "healed" when it carries traffic again AND the
               # selector really moved off the killed pin.
               case "$chain" in
@@ -1080,8 +1145,14 @@ jobs:
           pernode = [s for s in samples if s.get("kind") == "pernode"]
           print("--- the per-node sweep: every node through its OWN rotate inbound ---")
           print("    (direct = riding our own session; fresh = a BRAND NEW client on that node)")
-          last = pernode[-1] if pernode else {}
-          counters = {}
+          for s in pernode:
+              print("  sweep t=%.0f" % s["t"])
+              for tag, res in sorted((s.get("results") or {}).items()):
+                  if not isinstance(res, dict):
+                      print("     %-12s %s" % (tag, res))
+                      continue
+                  print("     %-12s latency_ms=%-7s direct=%-18s fresh=%s" % (
+                      tag, (s.get("latency") or {}).get(tag), res.get("direct"), res.get("fresh")))
           for s in states:
               for tag, book in (s.get("counters") or {}).items():
                   counters[tag] = book
@@ -1093,6 +1164,8 @@ jobs:
           for s in samples:
               if s.get("kind") == "logerror":
                   print("     sampler log thread error: %s" % s.get("error"))
+          last = pernode[-1] if pernode else {}
+          print("  the last sweep, with the serving log counters:")
           for tag, res in sorted((last.get("results") or {}).items()):
               if not isinstance(res, dict):
                   print("     %-12s %s" % (tag, res))
