@@ -1062,7 +1062,7 @@ jobs:
               hard.append("the pin did not move")
           if not chain.startswith("ips="):
               soft.append("the chain never carried traffic again")
-          if int(heal) > 120:
+          if int(heal) > 150:
               soft.append("the chain healed only after %ds (limit 150s)" % int(heal))
           problems = hard + (soft if gate else [])
           if not problems:
