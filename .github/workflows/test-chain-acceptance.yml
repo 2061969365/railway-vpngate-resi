@@ -885,15 +885,14 @@ jobs:
           docker exec rotate-trial sh -c 'cp /usr/local/bin/sing-box-1.15 /usr/local/bin/sing-box && sing-box version | head -n 2'
           PID=$(docker exec rotate-trial sh -c 'for p in /proc/[0-9]*; do pid=${p#/proc/}; [ -r "$p/cmdline" ] || continue; exe=$(readlink "$p/exe" 2>/dev/null) || continue; case "$exe" in */sing-box) ;; *) continue;; esac; c=$(tr "\0" " " < "$p/cmdline" 2>/dev/null); case "$c" in *singbox-railway.json*) case "$c" in */tmp/*) continue;; esac; echo "$pid"; break;; esac; done')
           echo "restarting the serving sing-box (pid $PID) so it reads the edited config with 1.15"
-          docker exec rotate-trial kill -9 "$PID" || true
-          for i in $(seq 1 90); do
+          docker exec rotate-trial kill -9 "$PID" || true          for i in $(seq 1 90); do
             if docker exec rotate-trial python3 /tmp/diag.py clashapi 2>/dev/null | grep -q "version=ok"; then
               echo "the serving stack answers again after ~$((i * 5))s"
               break
             fi
             sleep 5
           done
-          docker exec rotate-trial sh -c 'sing-box version | head -n 2; ps -ef | grep "[s]ing-box" | head -n 3'
+          docker exec rotate-trial sh -c 'sing-box version | head -n 2; ps -ef | grep "[s]ing-box" | head -n 3' || true
           echo "=== the endpoints now ==="
           docker exec rotate-trial python3 -c "
           import json
@@ -902,6 +901,7 @@ jobs:
               print('   %-12s on_demand=%s ping_interval=%s ping_restart=%s' % (
                   ep.get('tag'), ep.get('on_demand'), ep.get('ping_interval'), ep.get('ping_restart')))
           " || true
+          echo "=== the on_demand experiment is set up ==="
 
       - name: Let the pin and sing-box settle before the kill
         run: |
