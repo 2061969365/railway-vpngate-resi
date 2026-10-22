@@ -5352,6 +5352,39 @@ class DeadPinTests(unittest.TestCase):
         self.assertEqual("vpngate-1", manager.preferred_tag)
         self.assertIn(41001, measured)
 
+    def test_the_status_publishes_the_live_pool_size(self) -> None:
+        """The pool publishes how many members still carry traffic.
+
+        A node can be fast on paper and dead in reality, so the chain's
+        only honest witness is the rotation's exit-IP evidence. The
+        acceptance needs to tell "there was a live candidate" from "there
+        was none" - that is the difference between a real failure and the
+        state of the world.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = self._manager(tmpdir, resi_rotate=True,
+                                    vless_uuid="u-u-i-d")
+            try:
+                self._seed_nodes(manager, ("203.0.113.11", 100, 30),
+                                 ("203.0.113.12", 200, 40))
+                manager._set_resi_routes([("vpngate-0", 41000),
+                                          ("vpngate-1", 41001)])
+                now = time.monotonic()
+                with manager._lock:
+                    manager._resi_health["vpngate-1"] = {
+                        "down_until": 0.0, "exit_ip": "203.0.113.99",
+                        "checked_at": now, "error": None}
+                    manager._resi_health["vpngate-0"] = {
+                        "down_until": 0.0, "exit_ip": "203.0.113.98",
+                        "checked_at": now - 3600.0, "error": None}
+                    pool, _down, _eligible = manager._resi_pool_locked()
+                status = manager.status["resi"]
+            finally:
+                manager.stop()
+
+        self.assertEqual(1, status.get("pool_live"),
+                         "only the node that carried traffic recently is live")
+
     def test_a_fresh_pin_is_not_judged_dead(self) -> None:
         """A pin that was just set is inside the warm-up grace: a failed
         handshake must not move it, because the new node still needs to come

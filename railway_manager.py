@@ -47,6 +47,8 @@ MAX_MUX_CONNECTIONS = 100
 MAX_POST_CONNECTIONS = 16
 DRAIN_TIMEOUT = 10.0
 STALE_RUNNING_AFTER = 180.0
+# How long a pool member's exit-IP evidence stays "live".
+RESI_LIVE_WINDOW = 120.0
 HEALTH_CHECK_INTERVAL = 20
 PINNED_FAIL_THRESHOLD = 3
 # Rotate mode: a chain pin is only useful if the tunnel actually carries
@@ -3613,7 +3615,16 @@ class RailwayManager:
         limit = min(len(cands), 3)
         alive = [n for n in cands[:limit]
                  if self._chain_candidate_carries_traffic(n)]
-        return alive or cands[:1]
+        if not alive:
+            # Say it out loud: the chain cannot be moved onto a node that
+            # carries traffic, because there is none right now. That is a
+            # state of the pool, not a failure of the rescue.
+            self._record_history(
+                "chain-rescue-blind",
+                f"no candidate carries traffic right now "
+                f"({len(cands)} candidates asked)")
+            return cands[:1]
+        return alive
 
     def _probe_target_started_serving(self, tag: str) -> bool:
         """True when the node started serving while a probe was running.
@@ -3991,6 +4002,18 @@ class RailwayManager:
         resi_status = self.status.get("resi")
         if isinstance(resi_status, dict):
             resi_status["reserved"] = sum(1 for tag, _ in routes if tag in reserved)
+            # How many pool members carried traffic recently. The rotation's
+            # own exit-IP evidence, not a latency number: a node can be
+            # "fast" on paper and dead in reality.
+            now = time.monotonic()
+            live = 0
+            for tag, _port in eligible:
+                entry = self._resi_health.get(tag) or {}
+                checked = entry.get("checked_at")
+                if (entry.get("down_until", 0.0) <= now and checked
+                        and now - checked <= RESI_LIVE_WINDOW):
+                    live += 1
+            resi_status["pool_live"] = live
         if eligible:
             return len(eligible), len(parked), eligible
         if parked:
