@@ -1147,6 +1147,28 @@ reference 节点第一次测出了延迟**（29/188，此前每一轮都是 0/24
 + pin 换到能出货的节点 + 无配置重写 + 无 sing-box 重启"（后三条管"发生了"，150s 管"够快"；
 早期用 120s 会因 1 秒之差不断假红，假红会让人忽略真红）。
 
+**收口数据**（守卫 run 39730343172，连续三轮门禁都适用）：
+
+```
+cold start : ready → 首个真实出口 IP = 2s，ready → pin = 22s
+pool       : pool=10  pool_live=1  down=0  state=up      ← 有活候选（真红路径）
+round 1    : heal=34s  pin vpngate-0 → vpngate-1（1 次热切换）   verdict OK
+round 2    : heal=87s  pin vpngate-1 → vpngate-2（2 次热切换）   verdict OK
+两轮        : pid 相同（360）、配置 md5 相同（c6bb4ec7）⇒ 无配置重写、无重启 ✅
+kill 之后  : 链持续出货 17 次；delay chain 9/24、reference 7/24
+逐节点      : direct 16/16 全通（此前每一轮 16/16 全空）
+```
+
+⇒ 整条闭环：**"僵掉的 serving 端点占着节点唯一的 CN 不放 ⇒ 池子慢慢全僵 ⇒ 链没有可换的活
+节点、自愈要 6 分钟"** ⇒ 现在**池子随时有活候选、自愈 34~87s（1~2 分钟量级）、无配置重写、
+无重启**。
+
+⇒ **常驻回归守卫**（`.github/workflows/test-chain-acceptance.yml`，`workflow_dispatch` 手动
+触发、零 CI 占用、约 30 分钟成本）守两件事：① 冷启动不得靠直拨选 pin；② 有活候选时杀 pin
+后链必须自愈（恢复出货 + 换到能出货的节点 + 不重写配置 + 不重启）。它抓出过的真实缺陷：
+`auth_retry` 字段名（曾让产品整体不可用）、探针配置空 duration（所有探针起不来）、
+`on_demand` 缺失（池子慢慢全僵）——都是**部署前**抓到的。
+
 ⇒ `pool_live` 的口径同步修过：它现在数的是**与救援排序同一份证据**
 （`_resi_payload_at` 承载过流量 / `_resi_ok_at` 应答过，窗口 `RESI_LIVE_WINDOW=120s`）——
 "有活候选"对守卫和对救援必须是同一个意思，否则守卫会把"救援正在换到一个刚见过承载流量的
