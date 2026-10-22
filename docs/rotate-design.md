@@ -1114,7 +1114,30 @@ for TCP"** —— 我们的 ovpn 走 TCP ⇒ 很可能**restart 只对 UDP 生�
 ⇒ 正在验证的结构性解法：**sing-box 1.15 的 `on_demand`**（"Allow the endpoint to be
 disconnected when necessary"）⇒ 空闲的 serving 端点被主动断开 ⇒ **CN 被释放** ⇒
 全新客户端可以接管那个节点 ⇒ 池子能用新会话刷新；链要用哪个节点，sing-box 按需连上。
-（验法：容器内换 1.15 + 给端点加 `on_demand` + 重启，再采同样的一组数据。）
+
+**已落地并验证**（`4c01739`）：容器内换 1.15 + 给端点加 `on_demand` 后，**从来"不承载流量"的
+reference 节点第一次测出了延迟**（29/188，此前每一轮都是 0/246、0/183、0/125、0/188），
+链杀 pin 后也持续出货 7 次。产品侧同步做了三件事，缺一不可：
+
+- `on_demand` 写在**生成 endpoint 的地方**（`ovpn_to_endpoint`）——manager 每次重写配置都会
+  从自己的 endpoint dict 重建，手工加的字段会被抹掉（验收实测过：重写后 md5 变、字段丢）；
+- 镜像升到 `1.15.0-alpha.12`（**目前只有 alpha，没有正式版** ⇒ 版本精确 pin；风险与回滚
+  = 上一版镜像 tag，写在这里以免忘了）；
+- **CI 的 `singbox check` job 用同一个版本**校验 serving + 探针两份配置 ⇒ 部署二进制会拒的
+  配置在 push 前就红（这个 job 已经抓到我一次 `auth_retry` 拼错和一次探针空 duration）。
+
+产品侧复验（run 39722490053）：`direct` 不再 16/16 全空（被用到的节点出货 ✓），
+`resi.state` 从长期 `down / no serving endpoint answered` 变成 **`up`**（轮换探针又拿得到出口 IP）✓。
+
+⇒ `pool_live` 的口径同步修过：它现在数的是**与救援排序同一份证据**
+（`_resi_payload_at` 承载过流量 / `_resi_ok_at` 应答过，窗口 `RESI_LIVE_WINDOW=120s`）——
+"有活候选"对守卫和对救援必须是同一个意思，否则守卫会把"救援正在换到一个刚见过承载流量的
+节点"那一轮误判成"世界状态"。
+
+⇒ 另一条**正确的**新行为：没有能出货的候选时，救援**故意保持原 pin**（宁可链慢一点，
+也不重写配置 + 重启 sing-box 掉所有连接）⇒ history 里记 `chain-rescue-blind`。
+"热切换不可用就退回写配置+重启"那条路径**暂时不改**（这几轮它没触发，Clash API 都在应答，
+pid 与 md5 全程一致；等它再出现时按"宁可不动 pin"的方向修）。
 
 ⇒ 另一条量化结论：**保鲜期极短** —— 冷启动约 1 分钟后 `pool_live` 就一直是 0
 （账面 `pool=13`）⇒ 这就是"跑久了"的量化；产品侧的目标应当是"**池子里随时有实测能出货的
