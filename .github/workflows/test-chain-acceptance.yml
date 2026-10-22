@@ -852,11 +852,22 @@ jobs:
           # only; the repository is not touched.
           echo "=== the sing-box in the image ==="
           docker exec rotate-trial sh -c 'sing-box version | head -n 2'
-          docker exec rotate-trial sh -c 'cp /usr/local/bin/sing-box /usr/local/bin/sing-box-1.14'
-          docker exec rotate-trial sh -c 'curl -Ls https://github.com/SagerNet/sing-box/releases/download/v1.15.0/sing-box-1.15.0-linux-amd64.tar.gz | tar xz -C /tmp && mv /tmp/sing-box-1.15.0-linux-amd64/sing-box /usr/local/bin/sing-box-1.15 && chmod +x /usr/local/bin/sing-box-1.15'
-          docker exec rotate-trial sh -c 'sing-box-1.15 version | head -n 2' || echo "(could not install 1.15)"
+          # 1.15.0 stable is not out yet; the alpha carries the on_demand field.
+          SB115_URL="https://github.com/SagerNet/sing-box/releases/download/v1.15.0-alpha.12/sing-box-1.15.0-alpha.12-linux-amd64.tar.gz"
+          docker exec rotate-trial sh -c "cp /usr/local/bin/sing-box /usr/local/bin/sing-box-1.14"
+          if docker exec rotate-trial sh -c "curl -Ls '$SB115_URL' | tar xz -C /tmp && mv /tmp/sing-box-1.15.0-alpha.12-linux-amd64/sing-box /usr/local/bin/sing-box-1.15 && chmod +x /usr/local/bin/sing-box-1.15"; then
+            docker exec rotate-trial sh -c 'sing-box-1.15 version | head -n 2'
+          else
+            echo "COULD NOT INSTALL 1.15 - the experiment is skipped, the run continues"
+            exit 0
+          fi
           echo "=== does 1.15 accept our current config? ==="
-          docker exec rotate-trial sh -c 'cp /app/singbox-railway.json /tmp/check-1.15.json && /usr/local/bin/sing-box-1.15 check -c /tmp/check-1.15.json && echo "1.15 ACCEPTS the current config"' || echo "1.15 REJECTS the current config (the experiment cannot run)"
+          if docker exec rotate-trial sh -c 'cp /app/singbox-railway.json /tmp/check-1.15.json && /usr/local/bin/sing-box-1.15 check -c /tmp/check-1.15.json'; then
+            echo "1.15 ACCEPTS the current config"
+          else
+            echo "1.15 REJECTS the current config - the experiment is skipped, the run continues"
+            exit 0
+          fi
           echo "=== on_demand on every openvpn-client endpoint ==="
           docker exec -i rotate-trial python3 - <<'PY'
           import json
