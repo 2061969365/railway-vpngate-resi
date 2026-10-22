@@ -106,9 +106,11 @@ class ConvertTcpTests(unittest.TestCase):
 
         probe = next(e for e in config["endpoints"] if e["tag"] == "dial-probe")
         self.assertEqual("none", probe["auth_retry"])
-        # the probe must not wait for a keepalive or a reconnect
-        self.assertEqual("", probe["ping_interval"])
-        self.assertEqual("", probe["ping_restart"])
+        # the probe must not wait for a keepalive or a reconnect - and the
+        # keys must be absent, not empty: sing-box rejects an empty
+        # duration and the probe client would not start.
+        self.assertNotIn("ping_interval", probe)
+        self.assertNotIn("ping_restart", probe)
         self.assertTrue(probe["ping_restart_disabled"])
         # the serving endpoint keeps the retry
         self.assertEqual("nointeract", ep["auth_retry"])

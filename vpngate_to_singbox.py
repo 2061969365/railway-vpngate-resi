@@ -599,9 +599,12 @@ def _dial_probe_config(endpoint: dict, port: int) -> dict:
     probe_endpoint["tag"] = "dial-probe"
     probe_endpoint["auth_retry"] = "none"
     # A probe only measures: it must not wait for a keepalive ping or for a
-    # reconnect - "this node is taken" has to be a quick answer.
-    probe_endpoint["ping_interval"] = ""
-    probe_endpoint["ping_restart"] = ""
+    # reconnect - "this node is taken" has to be a quick answer. The keys are
+    # REMOVED, not set to an empty string: sing-box rejects an empty
+    # duration ("time: invalid duration") and the probe client would not
+    # start at all.
+    probe_endpoint.pop("ping_interval", None)
+    probe_endpoint.pop("ping_restart", None)
     probe_endpoint["ping_restart_disabled"] = True
     config = build_singbox_config([probe_endpoint], mixed_listen="127.0.0.1",
                                   mixed_port=port)

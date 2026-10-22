@@ -69,7 +69,9 @@ jobs:
           import json, sys
           sys.path.insert(0, "tests")
           from test_vpngate_to_singbox import TCP_OVPN
-          from vpngate_to_singbox import build_singbox_config, ovpn_to_endpoint
+          from vpngate_to_singbox import (_dial_probe_config,
+                                          build_singbox_config,
+                                          ovpn_to_endpoint)
           ep = ovpn_to_endpoint(TCP_OVPN, tag="vpngate-0")
           cfg = build_singbox_config(
               [ep], "127.0.0.1", 40000, mixed_users=[("u", "p")],
@@ -80,7 +82,15 @@ jobs:
               resi_rotate_tags=["vpngate-0"])
           with open("/tmp/rotate.json", "w", encoding="utf-8") as handle:
               json.dump(cfg, handle, indent=2)
-          print("endpoints:", [e["tag"] for e in cfg["endpoints"]])
-          print("outbounds:", [o.get("tag") for o in cfg["outbounds"]])
+          # The throwaway probe config is a second config sing-box has to
+          # accept: it is what every real dial and every exit-IP verify
+          # starts, and a field sing-box rejects there kills the measurement
+          # path silently.
+          probe = _dial_probe_config(ep, 40001)
+          with open("/tmp/probe.json", "w", encoding="utf-8") as handle:
+              json.dump(probe, handle, indent=2)
+          print("serving endpoints:", [e["tag"] for e in cfg["endpoints"]])
+          print("probe endpoints:", [e["tag"] for e in probe["endpoints"]])
           PY
           sing-box check -c /tmp/rotate.json
+          sing-box check -c /tmp/probe.json
