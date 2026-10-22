@@ -845,6 +845,17 @@ jobs:
             sleep 10
           done
           [ "$recent" = "0" ] || { echo "config never settled"; exit 1; }
+          # Give the rotation a chance to refresh the pool: the guard's real
+          # red path ("a candidate carried traffic and the chain did not heal
+          # onto it") can only be exercised when the pool has a live member.
+          echo "=== waiting for a live pool member (resi.pool_live > 0) ==="
+          for i in $(seq 1 60); do
+            curl -m 10 -s -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:3000/api/status -o /tmp/plive.json || true
+            LINE=$(python3 -c "import json;s=json.load(open('/tmp/plive.json'));r=s.get('resi') or {};print('pool=%s pool_live=%s down=%s state=%s' % (r.get('pool'), r.get('pool_live'), r.get('down'), r.get('state')))" 2>/dev/null || echo "(no status)")
+            echo "wait $i: $LINE"
+            case "$LINE" in *"pool_live=0"*|*"pool_live=None"*|"") ;; *) echo "the pool has a live member"; break;; esac
+            sleep 10
+          done
 
       - name: Kill the pin twice (the chain must hot-switch and heal)
         run: |
@@ -1015,6 +1026,7 @@ jobs:
           echo "=== iptables rules in the container ==="
           cat /tmp/iptables_r1.txt /tmp/iptables_r2.txt 2>/dev/null || echo "(none)"
           echo "=== the chain after the kill: did it carry traffic? ==="
+          docker exec rotate-trial cat /app/singbox-railway.json > /tmp/cfg_final.json || true
           echo "--- why the fresh (throwaway) client failed on those nodes ---"
           echo "(the probe path prints 'dial failed for <host>:<port>' plus the sing-box log tail)"
           docker exec rotate-trial sh -c 'cat /tmp/sampler_out_*.log 2>/dev/null' | grep -a -A 6 "dial failed for" | tail -n 60 || echo "(no failure in the sampler's output)"
@@ -1073,6 +1085,14 @@ jobs:
           for s in states:
               for tag, book in (s.get("counters") or {}).items():
                   counters[tag] = book
+          # The counters are cumulative per sampler process, so take the frame
+          # that has the most of them (the last sampler starts from zero).
+          best = max(states, key=lambda s: len(s.get("counters") or {}), default={})
+          for tag, book in (best.get("counters") or {}).items():
+              counters[tag] = book
+          for s in samples:
+              if s.get("kind") == "logerror":
+                  print("     sampler log thread error: %s" % s.get("error"))
           for tag, res in sorted((last.get("results") or {}).items()):
               if not isinstance(res, dict):
                   print("     %-12s %s" % (tag, res))
@@ -1086,6 +1106,15 @@ jobs:
           print("--- the serving log counters per node (outbound = sessions opened) ---")
           for tag, book in sorted(counters.items()):
               print("     %-12s %s" % (tag, book))
+          print("--- the effective keepalive of the serving endpoints ---")
+          try:
+              cfg = json.load(open("/tmp/cfg_final.json"))
+              for ep in (cfg.get("endpoints") or [])[:8]:
+                  print("     %-12s ping_interval=%-6s ping_restart=%-6s ping_restart_disabled=%s renegotiate=%s" % (
+                      ep.get("tag"), ep.get("ping_interval"), ep.get("ping_restart"),
+                      ep.get("ping_restart_disabled"), ep.get("renegotiate_interval")))
+          except Exception as exc:
+              print("     (no config: %s)" % exc)
           print("--- the rotation probe timeline (resi-probe events) ---")
           try:
               st = json.load(open("/tmp/final.json"))
