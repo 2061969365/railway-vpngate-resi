@@ -268,6 +268,15 @@ def ovpn_to_endpoint(
         # "nointeract" retries the authentication instead, so the endpoint
         # recovers as soon as the other session is gone.
         "auth_retry": "nointeract",
+        # Let sing-box disconnect an endpoint that nobody uses. Without it the
+        # endpoint keeps the node's single VPNGate session forever - even
+        # after the session died - so the node cannot be taken over by a
+        # fresh client and the rotation pool slowly goes stale (the cloud
+        # acceptance measured every serving endpoint connected but silent,
+        # and a fresh client could only get in on half of them). Needs
+        # sing-box >= 1.15 (the field does not exist in 1.14); the image
+        # pins the version and the CI checks the config with it.
+        "on_demand": True,
         # The keepalive comes from the .ovpn itself (see _keepalive_fields,
         # which falls back to 10s/60s). It is deliberately NOT overridden
         # here: the server-pushed values win, and they are the ones the

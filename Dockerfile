@@ -20,7 +20,7 @@
 #   8082: sing-box VLESS+WS /ws-chain -> chain-socks -> VPNGate exit
 FROM python:3.11-slim
 
-ARG SINGBOX_VERSION=1.14.0
+ARG SINGBOX_VERSION=1.15.0-alpha.12
 ARG CLOUDFLARED_VERSION=2026.8.3
 
 RUN apt-get update \

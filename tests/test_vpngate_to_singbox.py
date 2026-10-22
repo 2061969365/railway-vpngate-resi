@@ -87,6 +87,10 @@ class ConvertTcpTests(unittest.TestCase):
         # and the serving endpoint stays dead; the endpoint must retry the
         # authentication instead.
         self.assertEqual("nointeract", ep["auth_retry"])
+        # An idle endpoint has to be disconnectable, otherwise it keeps the
+        # node's single VPNGate session and the node cannot be taken over
+        # (the pool goes stale). Needs sing-box >= 1.15.
+        self.assertTrue(ep["on_demand"])
         # The keepalive comes from the .ovpn (10s/60s here), not from us.
         self.assertEqual("10s", ep["ping_interval"])
         self.assertEqual("60s", ep["ping_restart"])
