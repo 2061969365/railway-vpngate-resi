@@ -1016,8 +1016,9 @@ jobs:
           cat /tmp/iptables_r1.txt /tmp/iptables_r2.txt 2>/dev/null || echo "(none)"
           echo "=== the chain after the kill: did it carry traffic? ==="
           echo "--- why the fresh (throwaway) client failed on those nodes ---"
-          docker exec rotate-trial sh -c 'cat /tmp/sampler_out_*.log 2>/dev/null' | grep -a -A 4 "verify failed for" | tail -n 40 || echo "(no verify failure in the sampler's output)"
-          docker logs rotate-trial 2>&1 | grep -a -A 4 "verify failed for" | tail -n 20 || echo "(no verify failure in the container log)"
+          echo "(the probe path prints 'dial failed for <host>:<port>' plus the sing-box log tail)"
+          docker exec rotate-trial sh -c 'cat /tmp/sampler_out_*.log 2>/dev/null' | grep -a -A 6 "dial failed for" | tail -n 60 || echo "(no failure in the sampler's output)"
+          docker exec rotate-trial sh -c 'cat /tmp/sampler_out_*.log 2>/dev/null' | grep -a -A 6 "verify failed for" | tail -n 20 || echo "(no 'verify failed for' in the sampler's output)"
           docker exec rotate-trial sh -c 'cat /tmp/samples_r*.jsonl 2>/dev/null' > /tmp/samples.jsonl || true
           wc -l /tmp/samples.jsonl
           python3 - <<'EOF'
