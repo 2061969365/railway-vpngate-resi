@@ -379,6 +379,7 @@ jobs:
           ROUND = sys.argv[2] if len(sys.argv) > 2 else "0"
           OUT = "/tmp/samples_r%s.jsonl" % ROUND
           STOP = "/tmp/stop_sampler"
+          SWEEP_FLAG = "/tmp/sweep_enabled"
           LOG = "/app/singbox-railway.json.stderr.log"
           SERVING = "/app/singbox-railway.json"
           UUID = os.environ.get("VLESS_UUID", "")
@@ -547,7 +548,12 @@ jobs:
                       # traffic. If that one cannot ship either, the node is
                       # unusable for everybody right now (VPNGate's side); if it
                       # can, our serving session is the broken one.
-                      if not ips and endpoint:
+                      # It opens a SECOND VPNGate session, so it kicks the
+                      # serving one: it only runs when no kill observation is
+                      # in progress (the sweep flag is off during the rounds),
+                      # otherwise the probe would cause the staleness we are
+                      # measuring.
+                      if not ips and endpoint and os.path.exists(SWEEP_FLAG):
                           try:
                               got2 = measure_exit_ip(endpoint, timeout=8)
                               fresh = (got2 or (None, None))[0]
@@ -634,6 +640,10 @@ jobs:
           docker cp /tmp/watch.py rotate-trial:/tmp/watch.py
           docker cp /tmp/sampler.py rotate-trial:/tmp/sampler.py
           docker exec -e ADMIN_TOKEN="$ADMIN_TOKEN" -d rotate-trial python3 /tmp/watch.py
+          # The fresh (second session) probe only runs while this flag exists:
+          # it opens a second VPNGate session, so it must not overlap the kill
+          # observation - it would create the staleness we are measuring.
+          docker exec rotate-trial touch /tmp/sweep_enabled
           sleep 2
           docker exec rotate-trial sh -c 'ps -ef | grep -c "[w]atch.py"' || true
           echo "watcher started"
@@ -882,7 +892,10 @@ jobs:
               json.dump(cfg, fh, indent=2)
           print("on_demand set on", n, "endpoints")
           PY
-          docker exec rotate-trial sh -c 'cp /usr/local/bin/sing-box-1.15 /usr/local/bin/sing-box && sing-box version | head -n 2'
+          # `cp` over a running binary is refused by the kernel (ETXTBSY), so
+          # the replacement is a rename: the running process keeps the old
+          # inode and the next start uses the new file.
+          docker exec rotate-trial sh -c 'cp /usr/local/bin/sing-box /usr/local/bin/sing-box-1.14; mv /usr/local/bin/sing-box-1.15 /usr/local/bin/sing-box; sing-box version | head -n 2' || true
           PID=$(docker exec rotate-trial sh -c 'for p in /proc/[0-9]*; do pid=${p#/proc/}; [ -r "$p/cmdline" ] || continue; exe=$(readlink "$p/exe" 2>/dev/null) || continue; case "$exe" in */sing-box) ;; *) continue;; esac; c=$(tr "\0" " " < "$p/cmdline" 2>/dev/null); case "$c" in *singbox-railway.json*) case "$c" in */tmp/*) continue;; esac; echo "$pid"; break;; esac; done')
           echo "restarting the serving sing-box (pid $PID) so it reads the edited config with 1.15"
           docker exec rotate-trial kill -9 "$PID" || true          for i in $(seq 1 90); do
@@ -952,6 +965,8 @@ jobs:
           }
           cfg_md5() { docker exec rotate-trial sh -c 'md5sum /app/singbox-railway.json | cut -d" " -f1'; }
           for round in 1 2; do
+            # No fresh (second session) probe while the kill is observed.
+            docker exec rotate-trial rm -f /tmp/sweep_enabled
             curl -m 10 -s -H "$AUTH" http://127.0.0.1:3000/api/status -o /tmp/pre.json
             PIN=$(python3 -c "import json;print(json.load(open('/tmp/pre.json'))['preferred_tag'])")
             SW0=$(python3 -c "import json;print(json.load(open('/tmp/pre.json'))['chain_switch']['switches'])")
@@ -1099,6 +1114,10 @@ jobs:
             sleep 10
           done
           docker exec rotate-trial touch /tmp/stop_sampler || true
+          # the fresh (second session) probe may run again now that the
+          # observation is over - it was off during the rounds so it could not
+          # kick the serving sessions we were measuring
+          docker exec rotate-trial touch /tmp/sweep_enabled || true
           echo "=== iptables rules in the container ==="
           cat /tmp/iptables_r1.txt /tmp/iptables_r2.txt 2>/dev/null || echo "(none)"
           echo "=== the chain after the kill: did it carry traffic? ==="
