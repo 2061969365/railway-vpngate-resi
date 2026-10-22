@@ -4002,16 +4002,19 @@ class RailwayManager:
         resi_status = self.status.get("resi")
         if isinstance(resi_status, dict):
             resi_status["reserved"] = sum(1 for tag, _ in routes if tag in reserved)
-            # How many pool members carried traffic recently. The rotation's
-            # own exit-IP evidence, not a latency number: a node can be
-            # "fast" on paper and dead in reality.
+            # How many pool members are demonstrably alive - the SAME
+            # evidence the chain's rescue ranks candidates by ("carried
+            # rotation payload" or "answered recently"). A latency number
+            # is not evidence: a node can be fast on paper and dead in
+            # reality, which is how the chain used to walk dead candidates
+            # for six minutes.
             now = time.monotonic()
             live = 0
             for tag, _port in eligible:
-                entry = self._resi_health.get(tag) or {}
-                checked = entry.get("checked_at")
-                if (entry.get("down_until", 0.0) <= now and checked
-                        and now - checked <= RESI_LIVE_WINDOW):
+                payload = self._resi_payload_at.get(tag, 0.0)
+                answered = self._resi_ok_at.get(tag, 0.0)
+                if ((payload and now - payload <= RESI_LIVE_WINDOW)
+                        or (answered and now - answered <= RESI_LIVE_WINDOW)):
                     live += 1
             resi_status["pool_live"] = live
         if eligible:

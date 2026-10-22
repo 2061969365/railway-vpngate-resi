@@ -5353,13 +5353,14 @@ class DeadPinTests(unittest.TestCase):
         self.assertIn(41001, measured)
 
     def test_the_status_publishes_the_live_pool_size(self) -> None:
-        """The pool publishes how many members still carry traffic.
+        """The pool publishes how many members are demonstrably alive.
 
-        A node can be fast on paper and dead in reality, so the chain's
-        only honest witness is the rotation's exit-IP evidence. The
-        acceptance needs to tell "there was a live candidate" from "there
-        was none" - that is the difference between a real failure and the
-        state of the world.
+        The evidence is the one the chain's rescue ranks candidates by
+        ("carried rotation payload" / "answered recently"), not a latency
+        number: a node can be fast on paper and dead in reality. The guard
+        needs the same view of the world as the rescue, otherwise it calls
+        a run a world-state while the rescue was switching onto a node it
+        had just seen carry traffic.
         """
         with tempfile.TemporaryDirectory() as tmpdir:
             manager = self._manager(tmpdir, resi_rotate=True,
@@ -5371,19 +5372,15 @@ class DeadPinTests(unittest.TestCase):
                                           ("vpngate-1", 41001)])
                 now = time.monotonic()
                 with manager._lock:
-                    manager._resi_health["vpngate-1"] = {
-                        "down_until": 0.0, "exit_ip": "203.0.113.99",
-                        "checked_at": now, "error": None}
-                    manager._resi_health["vpngate-0"] = {
-                        "down_until": 0.0, "exit_ip": "203.0.113.98",
-                        "checked_at": now - 3600.0, "error": None}
-                    pool, _down, _eligible = manager._resi_pool_locked()
+                    manager._resi_payload_at["vpngate-1"] = now
+                    manager._resi_payload_at["vpngate-0"] = now - 3600.0
+                    _pool, _down, _eligible = manager._resi_pool_locked()
                 status = manager.status["resi"]
             finally:
                 manager.stop()
 
         self.assertEqual(1, status.get("pool_live"),
-                         "only the node that carried traffic recently is live")
+                         "only the member that carried traffic is live")
 
     def test_a_fresh_pin_is_not_judged_dead(self) -> None:
         """A pin that was just set is inside the warm-up grace: a failed
