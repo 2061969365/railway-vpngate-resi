@@ -566,35 +566,39 @@ jobs:
                   except OSError:
                       data = b""
                   for line in data.decode("utf-8", "replace").splitlines():
-                      if "openvpn-client[" in line:
+                      if "openvpn-client[" not in line:
+                          continue
+                      try:
                           tag = line.split("openvpn-client[")[1].split("]")[0]
-                          # "inbound packet connection" = the client got its
-                          # tunnel address (the tunnel is up); "not ready yet"
-                          # and "client terminated" = it is not.
-                          verdict = None
-                          if "not ready yet" in line or "client terminated" in line:
-                              verdict = "down"
-                          elif "inbound packet connection" in line:
-                              verdict = "up"
-                          with lock:
-                              log_lines.setdefault(tag, deque(maxlen=8)).append(line[-200:])
-                              if verdict:
-                                  tag_state[tag] = verdict
-                              book = counters.setdefault(tag, {"outbound": 0, "tunnel_err": 0,
-                                                               "not_ready": 0, "terminated": 0})
-                              if "outbound connection to " in line:
-                                  # one per session: more than one = the client
-                                  # reconnected at least once
-                                  book["outbound"] += 1
-                              elif "not ready yet" in line:
-                                  book["not_ready"] += 1
-                              elif "client terminated" in line:
-                                  book["terminated"] += 1
-                              elif ("i/o timeout" in line or "write tcp" in line
-                                    or "read tcp" in line or "connection reset" in line):
-                                  # an error INSIDE the tunnel: the tunnel is
-                                  # up but the traffic cannot leave
-                                  book["tunnel_err"] += 1
+                      except IndexError:
+                          continue
+                      # "inbound packet connection" = the client got its
+                      # tunnel address (the tunnel is up); "not ready yet"
+                      # and "client terminated" = it is not.
+                      verdict = None
+                      if "not ready yet" in line or "client terminated" in line:
+                          verdict = "down"
+                      elif "inbound packet connection" in line:
+                          verdict = "up"
+                      with lock:
+                          log_lines.setdefault(tag, deque(maxlen=8)).append(line[-200:])
+                          if verdict:
+                              tag_state[tag] = verdict
+                          book = counters.setdefault(tag, {"outbound": 0, "tunnel_err": 0,
+                                                           "not_ready": 0, "terminated": 0})
+                          if "outbound connection to " in line:
+                              # one per session: more than one = the client
+                              # reconnected at least once
+                              book["outbound"] += 1
+                          elif "not ready yet" in line:
+                              book["not_ready"] += 1
+                          elif "client terminated" in line:
+                              book["terminated"] += 1
+                          elif ("i/o timeout" in line or "write tcp" in line
+                                or "read tcp" in line or "connection reset" in line):
+                              # an error INSIDE the tunnel: the tunnel is
+                              # up but the traffic cannot leave
+                              book["tunnel_err"] += 1
                   now = current.get("now")
                   if now:
                       with lock:
@@ -994,6 +998,8 @@ jobs:
           echo "=== iptables rules in the container ==="
           cat /tmp/iptables_r1.txt /tmp/iptables_r2.txt 2>/dev/null || echo "(none)"
           echo "=== the chain after the kill: did it carry traffic? ==="
+          echo "--- why the fresh (throwaway) client failed on those nodes ---"
+          docker logs rotate-trial 2>&1 | grep -a -A 4 "verify failed for" | tail -n 40 || echo "(no verify failure in the container log)"
           docker exec rotate-trial sh -c 'cat /tmp/samples_r*.jsonl 2>/dev/null' > /tmp/samples.jsonl || true
           wc -l /tmp/samples.jsonl
           python3 - <<'EOF'
