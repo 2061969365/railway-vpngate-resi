@@ -1036,7 +1036,7 @@ jobs:
             docker exec rotate-trial sh -c 'cat /app/singbox-railway.json.stderr.log /app/singbox-railway.json.stderr.log.prev 2>/dev/null | grep -ao "\[[0-9]\{4\}\] endpoint/openvpn-client" | sort -u | tr "\n" " "' || true
             echo
             curl -m 10 -s -H "$AUTH" http://127.0.0.1:3000/api/status -o /tmp/post.json
-            python3 - "$PIN" "$SW0" "$PID0" "$PID1" "$MD50" "$MD51" "$round" "$chain" "$sel" "$HEAL" <<'EOF'
+            python3 - "$PIN" "$SW0" "$PID0" "$PID1" "$MD50" "$MD51" "$round" "$chain" "$sel" "$HEAL" <<'EOF' || true
           import json, pathlib, sys
           pin0, sw0, pid0, pid1, md50, md51, rnd, chain, sel, heal = sys.argv[1:11]
           s = json.load(open("/tmp/post.json"))
@@ -1100,7 +1100,7 @@ jobs:
           docker exec rotate-trial sh -c 'cat /tmp/sampler_out_*.log 2>/dev/null' | grep -a -A 6 "verify failed for" | tail -n 20 || echo "(no 'verify failed for' in the sampler's output)"
           docker exec rotate-trial sh -c 'cat /tmp/samples_r*.jsonl 2>/dev/null' > /tmp/samples.jsonl || true
           wc -l /tmp/samples.jsonl
-          python3 - <<'EOF'
+          python3 - <<'EOF' || true
           import json, pathlib
           raw = pathlib.Path("/tmp/samples.jsonl").read_text().splitlines()
           samples = [json.loads(l) for l in raw if l.strip()]
@@ -1216,7 +1216,12 @@ jobs:
                   print("  %-6s exit samples %3d: with an exit IP %3d" % (
                       label, len(part), len(ok)))
           EOF
-          echo "=== round results ==="; cat /tmp/round_results.txt 2>/dev/null || true
+          echo "=== round results ==="
+          cat /tmp/round_results.txt 2>/dev/null || true
+          # The verdict is the last thing this step does, and it must always
+          # run: a failure anywhere above (a python block, a grep with no
+          # match) must not take the verdict with it.
+          verdict=OK
           if grep -q "^round 1: OK$" /tmp/round_results.txt 2>/dev/null; then
             echo "ROUND 1 (the hard gate): OK - a candidate carried traffic and the chain healed onto it"
           elif grep -q "^round 1: WORLD STATE" /tmp/round_results.txt 2>/dev/null; then
@@ -1224,9 +1229,9 @@ jobs:
             echo "  carried traffic (pool_live = 0, the rescue was blind), so the heal time is a"
             echo "  fact, not a failure. The pool health of that round is printed above."
           else
+            verdict=FAIL
             echo "ROUND 1 (the hard gate): FAILED - a candidate carried traffic and the chain"
             echo "  did not heal onto it within 150s"
-            exit 1
           fi
           if grep -q "^round 2: OK$" /tmp/round_results.txt 2>/dev/null; then
             echo "ROUND 2: OK"
@@ -1234,6 +1239,10 @@ jobs:
             echo "ROUND 2 (a known item, not a gate): see the verdict above - by then the"
             echo "  rotation pool is stale, so there may be no node left that carries traffic."
           fi
+          echo "GUARD VERDICT: $verdict"
+          cat /tmp/round_results.txt 2>/dev/null || true
+          [ "$verdict" = "OK" ] || exit 1
+          exit 0
 
       - name: The urltest control experiment (container only, no product change)
         if: always()
