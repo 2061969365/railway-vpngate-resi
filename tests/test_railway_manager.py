@@ -1456,7 +1456,9 @@ class PinnedHealthTests(unittest.TestCase):
                                 "203.0.113.11", "203.0.113.12",
                                 "203.0.113.13")))
                     _settle_probes(manager)
-                    manager.switch(tag="vpngate-0")
+                    with mock.patch.object(manager, "_verify_served",
+                                           return_value=(True, "9.9.9.9", 20, True)):
+                        manager.switch(tag="vpngate-0")
                     # A pin from an earlier round, not a warm-up pin:
                     # otherwise CHAIN_SETTLE_GRACE suppresses the rescue.
                     manager._chain_pin_at = time.monotonic() - 3600.0
@@ -1502,7 +1504,9 @@ class PinnedHealthTests(unittest.TestCase):
                                 "203.0.113.11", "203.0.113.12",
                                 "203.0.113.13")))
                     _settle_probes(manager)
-                    manager.switch(tag="vpngate-0")
+                    with mock.patch.object(manager, "_verify_served",
+                                           return_value=(True, "9.9.9.9", 20, True)):
+                        manager.switch(tag="vpngate-0")
                     # A pin from an earlier round, not a warm-up pin: the
                     # grace must not depend on how long the machine is up.
                     manager._chain_pin_at = time.monotonic() - 3600.0
