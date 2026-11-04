@@ -70,15 +70,30 @@ def _settle_probes(manager) -> None:
     write the same dicts and the verdict depends on who wins the race - which
     is how a Windows run passed while a Linux CI run failed.
     """
-    for attr in ("_full_probe_thread", "_single_probe_thread"):
-        thread = getattr(manager, attr, None)
-        if thread is None or not thread.is_alive():
+    deadline = time.monotonic() + 30.0
+    while True:
+        active = [getattr(manager, attr, None)
+                  for attr in ("_full_probe_thread", "_single_probe_thread")]
+        active = [t for t in active if t is not None and t.is_alive()]
+        for thread in active:
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+            # A probe that does not finish would hand the race back silently
+            # and the test would become "whoever writes last" - fail instead.
+            assert not thread.is_alive(), (
+                "probe did not finish within 30s; the test would race it")
+        state = (manager.status.get("full_probe") or {}).get("state")
+        if state == "running" and time.monotonic() < deadline:
+            # `_start_full_probe` marks the state before it starts the thread;
+            # do not read "not alive yet" as "already done".
+            time.sleep(0.02)
             continue
-        thread.join(timeout=30)
-        # A probe that does not finish would hand the race back silently and
-        # the test would become "whoever writes last" - fail instead.
-        assert not thread.is_alive(), (
-            f"{attr} did not finish within 30s; the test would race it")
+        # Also catch a probe that starts just after this check.
+        time.sleep(0.02)
+        late = [getattr(manager, attr, None)
+                for attr in ("_full_probe_thread", "_single_probe_thread")]
+        if any(t is not None and t.is_alive() for t in late):
+            continue
+        break
 
 
 def _seed_alive_evidence(manager) -> None:
@@ -1441,7 +1456,6 @@ class PinnedHealthTests(unittest.TestCase):
                                 "203.0.113.11", "203.0.113.12",
                                 "203.0.113.13")))
                     _settle_probes(manager)
-                    _seed_alive_evidence(manager)
                     manager.switch(tag="vpngate-0")
                     # A pin from an earlier round, not a warm-up pin:
                     # otherwise CHAIN_SETTLE_GRACE suppresses the rescue.
@@ -1450,6 +1464,10 @@ class PinnedHealthTests(unittest.TestCase):
                     by_server["203.0.113.11"]["real_latency_ms"] = 70
                     by_server["203.0.113.12"]["real_latency_ms"] = 30
                     by_server["203.0.113.13"]["real_latency_ms"] = 50
+                    # Seal evidence after the switch: switch may wait out the
+                    # mixed inbound, and a late full probe must not overwrite it.
+                    _settle_probes(manager)
+                    _seed_alive_evidence(manager)
 
                     failing = lambda host, port, timeout=5: 0
                     # Handshake death needs PINNED_FAIL_THRESHOLD strikes; the
@@ -1484,7 +1502,6 @@ class PinnedHealthTests(unittest.TestCase):
                                 "203.0.113.11", "203.0.113.12",
                                 "203.0.113.13")))
                     _settle_probes(manager)
-                    _seed_alive_evidence(manager)
                     manager.switch(tag="vpngate-0")
                     # A pin from an earlier round, not a warm-up pin: the
                     # grace must not depend on how long the machine is up.
@@ -1495,6 +1512,10 @@ class PinnedHealthTests(unittest.TestCase):
                     by_server["203.0.113.11"]["real_latency_ms"] = 70
                     by_server["203.0.113.12"]["real_latency_ms"] = 30
                     by_server["203.0.113.13"]["real_latency_ms"] = 50
+                    # Seal evidence after the switch: switch may wait out the
+                    # mixed inbound, and a late full probe must not overwrite it.
+                    _settle_probes(manager)
+                    _seed_alive_evidence(manager)
 
                     failing = lambda host, port, timeout=5: 0
                     with mock.patch.object(manager, "dial_fn",
