@@ -81,6 +81,17 @@ def _settle_probes(manager) -> None:
             f"{attr} did not finish within 30s; the test would race it")
 
 
+def _seed_alive_evidence(manager) -> None:
+    """Give the synthetic TEST-NET nodes fresh tunnel evidence.
+
+    The background probe cannot reach 203.0.113.0/24. A rescue test must not
+    depend on whether that probe happened to run under the patched latency
+    helper, so seed the evidence explicitly.
+    """
+    for node in list(manager._nodes):
+        manager._record_evidence(node, True, "198.51.100.1", 20, None)
+
+
 def get_free_port() -> int:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.bind(("127.0.0.1", 0))
@@ -1430,6 +1441,7 @@ class PinnedHealthTests(unittest.TestCase):
                                 "203.0.113.11", "203.0.113.12",
                                 "203.0.113.13")))
                     _settle_probes(manager)
+                    _seed_alive_evidence(manager)
                     manager.switch(tag="vpngate-0")
                     # A pin from an earlier round, not a warm-up pin:
                     # otherwise CHAIN_SETTLE_GRACE suppresses the rescue.
@@ -1472,6 +1484,7 @@ class PinnedHealthTests(unittest.TestCase):
                                 "203.0.113.11", "203.0.113.12",
                                 "203.0.113.13")))
                     _settle_probes(manager)
+                    _seed_alive_evidence(manager)
                     manager.switch(tag="vpngate-0")
                     # A pin from an earlier round, not a warm-up pin: the
                     # grace must not depend on how long the machine is up.
