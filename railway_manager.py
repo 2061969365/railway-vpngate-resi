@@ -63,6 +63,14 @@ STALE_RUNNING_AFTER = 180.0
 # How long a pool member's exit-IP evidence stays "live".
 RESI_LIVE_WINDOW = 120.0
 HEALTH_CHECK_INTERVAL = 20
+# Fast liveness checks ride the Clash API delay endpoint: a real HTTP request
+# through the existing outbound, so they cost no second VPNGate session. The
+# full served-exit probe still runs on DEEP_HEALTH_INTERVAL (and immediately
+# after a failed/silent delay check), which keeps "fast" from becoming "blind".
+FAST_HEALTH_INTERVAL = 5
+DEEP_HEALTH_INTERVAL = 30
+# Upper bound for the Clash delay request used by the fast health tick.
+FAST_DELAY_TIMEOUT_MS = 2500
 PINNED_FAIL_THRESHOLD = 3
 # Rotate mode: a chain pin is only useful if the tunnel actually carries
 # traffic. VPNGate nodes routinely accept the TCP handshake and then refuse or
@@ -78,7 +86,7 @@ CHAIN_RESCUE_COOLDOWN_MAX = 120.0
 # chain can carry traffic. Judging it inside that window repinned the chain in
 # a loop (every probe "failed", the pool walked node by node, and the chain
 # never settled) - so a new pin gets this much grace before probes may fail it.
-CHAIN_SETTLE_GRACE = 45.0
+CHAIN_SETTLE_GRACE = 20.0
 # A pin that just failed the end-to-end probe must not be picked again for a
 # while: with two dead nodes at the top of the ranking the rescue used to
 # bounce A -> B -> A forever while the cooldown grew to five minutes, i.e. the
@@ -137,6 +145,9 @@ def _int_env(env: dict, name: str, default: int, min_val: int | None = None, max
         _safe_print(f"refusing to start: {name}={val} above maximum {max_val}", flush=True)
         raise SystemExit(2)
     return val
+def _clamped_int_env(env: dict, name: str, default: int, min_val: int, max_val: int) -> int:
+    val = _int_env(env, name, default)
+    return min(max_val, max(min_val, val))
 def _env_bool(env: dict, name: str, default: bool) -> bool:
     raw = env.get(name)
     if raw is None:
@@ -294,7 +305,12 @@ def build_config_from_env(env: dict) -> dict:
         "probe_workers": _int_env(env, "PROBE_WORKERS", 15, 1, 30),
         "dial_timeout": _int_env(env, "DIAL_TIMEOUT", 15, 5, 60),
         "auto_rescue": _env_bool(env, "AUTO_RESCUE", True),
+        "persist_pinned": _env_bool(env, "OPENVPN_PERSIST_PINNED", True),
         "health_check_interval": _int_env(env, "HEALTH_CHECK_INTERVAL", 20, 5, 300),
+        "fast_health_interval": _int_env(env, "FAST_HEALTH_INTERVAL", FAST_HEALTH_INTERVAL, 1, 60),
+        "deep_health_interval": _int_env(env, "DEEP_HEALTH_INTERVAL", DEEP_HEALTH_INTERVAL, 5, 300),
+        "chain_settle_grace": _clamped_int_env(env, "CHAIN_SETTLE_GRACE", int(CHAIN_SETTLE_GRACE), 5, 120),
+        "fast_delay_timeout_ms": _clamped_int_env(env, "FAST_DELAY_TIMEOUT_MS", FAST_DELAY_TIMEOUT_MS, 500, 5000),
         "max_mux_connections": _int_env(env, "MAX_MUX_CONNECTIONS", 100, 1, 1000),
         # Loopback Clash API: how the chain is repinned without rewriting the
         # config / restarting sing-box. 0 disables the hot switch.
@@ -605,7 +621,11 @@ class RailwayManager:
         auto_refresh: bool = True, fetch_on_start: bool = True, retry_delays: tuple = (5, 10),
         max_mux_connections: int = MAX_MUX_CONNECTIONS, health_check_interval: int = HEALTH_CHECK_INTERVAL, fetcher=None,
         clash_api_port: int = 9090, edge_metrics_url: str = "",
-        bind_host: str = "0.0.0.0") -> None:
+        bind_host: str = "0.0.0.0", fast_health_interval: int = FAST_HEALTH_INTERVAL,
+        deep_health_interval: int = DEEP_HEALTH_INTERVAL,
+        chain_settle_grace: float = CHAIN_SETTLE_GRACE,
+        fast_delay_timeout_ms: int = FAST_DELAY_TIMEOUT_MS,
+        persist_pinned: bool = True) -> None:
         self.port = port; self.mixed_port = mixed_port; self.username = username; self.password = password
         self.admin_token = admin_token; self.snapshot_url = snapshot_url
         self.snapshot_urls = list(snapshot_urls) if snapshot_urls else [snapshot_url]
@@ -613,6 +633,7 @@ class RailwayManager:
         self.dial_fn = (dial_fn if dial_fn is not None else (lambda node: measure_real_latency(node["endpoint"], self.singbox_bin, self.dial_timeout)))
         self.dial_workers = dial_workers; self.full_probe_workers = max(1, full_probe_workers); self.probe_workers = probe_workers
         self.dial_timeout = dial_timeout; self.auto_repin = auto_repin; self.auto_rescue = auto_rescue
+        self.persist_pinned = bool(persist_pinned)
         self._verify_custom = verify_fn is not None
         self.verify_fn = (verify_fn if verify_fn is not None else (lambda endpoint: measure_exit_ip(endpoint, self.singbox_bin, self.dial_timeout)))
         self.config_path = config_path; self.nodes_path = nodes_path; self.state_path = state_path; self.settings_path = settings_path
@@ -719,6 +740,12 @@ class RailwayManager:
         self.status["resi"]["mux_limit"] = self._resi_mux_cap
         self.status["resi"]["throttled"] = 0
         self._post_slots = threading.BoundedSemaphore(MAX_POST_CONNECTIONS); self._health_check_interval = health_check_interval
+        self._fast_health_interval = max(1, int(fast_health_interval))
+        self._deep_health_interval = max(self._fast_health_interval, int(deep_health_interval))
+        self._chain_settle_grace = min(120.0, max(5.0, float(chain_settle_grace)))
+        self._fast_delay_timeout_ms = min(5000, max(500, int(fast_delay_timeout_ms)))
+        self._last_deep_chain_probe = 0.0
+        self._deep_fail_pending = False
         self._listener = None; self._singbox_proc = None; self._stderr_handle = None; self.bound_port = port
         self.load_settings()
         if self.resi is not None:
@@ -1540,11 +1567,28 @@ class RailwayManager:
         return "restarted"
 
     def _health_monitor_loop(self) -> None:
-        while not self._stop_event.wait(self._health_check_interval):
+        interval = (self._fast_health_interval if self.probe is not None
+                    else self._health_check_interval)
+        next_tick = time.monotonic() + interval
+        while not self._stop_event.is_set():
+            delay = next_tick - time.monotonic()
+            if delay > 0 and self._stop_event.wait(delay):
+                return
+            if self._stop_event.is_set():
+                return
             try:
-                self.check_pinned_health()
+                if self.probe is not None:
+                    self.check_fast_health()
+                else:
+                    self.check_pinned_health()
             except Exception as exc:
                 self._log(f"health monitor error: {type(exc).__name__}: {exc}", flush=True)
+            next_tick += interval
+            now = time.monotonic()
+            if next_tick <= now:
+                # The check overran its slot. Do not catch up with a burst of
+                # immediate checks; restart the cadence from here instead.
+                next_tick = now + interval
     def _trigger_bg_refresh(self, reason: str) -> None:
         try:
             started = self._start_refresh_bg()
@@ -1650,12 +1694,34 @@ class RailwayManager:
                                  "switches": chain.get("switches")},
             }
 
-    def _probe_delays(self, tags: list[str]) -> dict[str, int] | None:
+    def _probe_delays(self, tags: list[str], timeout_ms: int | None = None) -> dict[str, int] | None:
         probe = getattr(self, "probe", None)
         if probe is None or not tags:
             return None
         try:
-            got = probe.delays(list(tags))
+            if timeout_ms is None:
+                got = probe.delays(list(tags))
+            else:
+                got = probe.delays(list(tags), timeout_ms=timeout_ms)
+        except Exception:
+            return None
+        return got if isinstance(got, dict) else None
+
+    def _probe_delay_status(
+            self, tags: list[str], timeout_ms: int | None = None) -> dict[str, bool] | None:
+        """Explicit per-tag liveness from the sidecar, or None when unknown.
+
+        Missing tags deliberately stay unknown: only a present False may
+        prevalidate a rescue candidate as dead.
+        """
+        probe = getattr(self, "probe", None)
+        if probe is None or not tags:
+            return None
+        try:
+            if timeout_ms is None:
+                got = probe.delay_status(list(tags))
+            else:
+                got = probe.delay_status(list(tags), timeout_ms=timeout_ms)
         except Exception:
             return None
         return got if isinstance(got, dict) else None
@@ -1978,6 +2044,35 @@ class RailwayManager:
         # Bounded: a dead pool must not make one health tick walk 100 nodes at
         # two multi-second probes each. Six best candidates fit in ~60s.
         cands = cands[:6]
+        if getattr(self, "probe", None) is not None:
+            candidate_tags = [
+                (node.get("endpoint") or {}).get("tag") for node in cands]
+            status = self._probe_delay_status(
+                [tag for tag in candidate_tags if tag],
+                timeout_ms=self._fast_delay_timeout_ms)
+            if status is not None:
+                live: list[dict] = []
+                for node, candidate_tag in zip(cands, candidate_tags):
+                    if candidate_tag and status.get(candidate_tag) is False:
+                        continue
+                    live.append(node)
+                if not live:
+                    # A delay probe that answers "dead" for every candidate is
+                    # enough to skip this rescue, but never enough to rewrite
+                    # the config: keep the current pin and let a refresh
+                    # replenish the pool.
+                    with self._lock:
+                        self._chain_rescue_attempts += 1
+                        self._chain_rescue_at = now
+                    self._record_history(
+                        "chain-rescue-skipped",
+                        f"{reason}: all candidates delay-dead")
+                    self._log(
+                        f"chain rescue skipped: {reason}: all candidates delay-dead",
+                        flush=True)
+                    self._trigger_bg_refresh(f"{reason}: no delay-alive candidate")
+                    return "pinned"
+                cands = live
         deadline = time.monotonic() + 60.0
         touched = False
         last_hot = False
@@ -2030,6 +2125,8 @@ class RailwayManager:
                             self._resi_ok_at.pop(tag, None)
                         self._chain_dead_until.pop(best, None)
                     self._invalidate_verify(f"chain rescue to {best}")
+                    if hot:
+                        self._reconcile_persistent_tags()
                     self._set_pin_health("ok")
                     self._record_history("chain-rescue", f"{reason}: {tag} -> {best}" + (" (hot)" if hot else ""))
                     self._log(f"chain rescue: {reason}: {tag} -> {best}" + (" (hot switch)" if hot else ""), flush=True)
@@ -2064,8 +2161,63 @@ class RailwayManager:
         self._set_pin_health("degraded", "no candidate verified for the chain")
         return "pinned"
 
+    def check_fast_health(self) -> str:
+        """Cheap liveness check for the pinned node.
+
+        `ProbeClient.delays` asks the Clash API for a real HTTP request through
+        the node's *existing* outbound, so it detects a dead data channel
+        without opening a second VPNGate session. A dead or silent delay falls
+        through to the full served-exit check; a successful one only stands in
+        until the next deep check, so it cannot hide a tunnel that still exits
+        nowhere.
+        """
+        with self._lock:
+            tag = self.preferred_tag
+            last_deep = self._last_deep_chain_probe
+            deep_failed = self._deep_fail_pending
+        if tag is None:
+            return "no-preferred"
+        if self.probe is None:
+            return "unknown"
+        delays = self._probe_delays([tag], timeout_ms=self._fast_delay_timeout_ms)
+        now = time.monotonic()
+        if delays is not None and tag in delays:
+            if self.want_singbox and not self._serving_ok():
+                return self.check_pinned_health()
+            if (now - last_deep < self._deep_health_interval
+                    and not deep_failed):
+                retry_deep = False
+                with self._lock:
+                    if self.preferred_tag != tag:
+                        # A switch committed while the delay was in flight;
+                        # let the next tick judge the new pin.
+                        return "pinned"
+                    if self._deep_fail_pending:
+                        # A deep failure landed while the delay was in
+                        # flight: do not let this older success erase it.
+                        retry_deep = True
+                    else:
+                        self._chain_fail_streak = 0
+                        self._chain_rescue_attempts = 0
+                        self._chain_dead_until.pop(tag, None)
+                        self._pinned_fail_streak = 0
+                        self._pinned_standby_noted = None
+                        # Keep the status update in this lock: otherwise a
+                        # switch can commit in the gap and leave "ok" on the
+                        # new pin before it has been judged.
+                        self._set_pin_health("ok")
+                if retry_deep:
+                    return self.check_pinned_health()
+                return "pinned"
+        elif (delays is None and now - last_deep < self._deep_health_interval
+              and not deep_failed):
+            # The sidecar did not answer. The last deep check is still recent,
+            # so do not spin an expensive full probe every fast tick.
+            return "unknown"
+        return self.check_pinned_health()
+
     def check_pinned_health(self, probe_fn=None) -> str:
-        """Judge the pin on handshake + served exit, every tick, every mode.
+        """Judge the pin on handshake + served exit (the deep check).
 
         Handshake death needs PINNED_FAIL_THRESHOLD strikes; tunnel death needs
         CHAIN_FAIL_THRESHOLD. A None probe result (no verifier / Clash or the
@@ -2077,7 +2229,7 @@ class RailwayManager:
             node = next((n for n in self._nodes if n.get("endpoint", {}).get("tag") == tag), None) if tag else None
             self._rescue_round += 1
             round_id = self._rescue_round
-            warmed = (time.monotonic() - self._chain_pin_at) < CHAIN_SETTLE_GRACE
+            warmed = (time.monotonic() - self._chain_pin_at) < self._chain_settle_grace
         if tag is None:
             self._set_pin_health("unpinned")
             return "no-preferred"
@@ -2106,6 +2258,15 @@ class RailwayManager:
         # Served-chain evidence in gateway AND rotate mode. None means the
         # verifier itself is unavailable, which must not trigger a rescue.
         chain_ok = self._chain_probe_ok()
+        if chain_ok is True:
+            # A failed/unknown deep check deliberately does not advance this:
+            # the next fast tick must confirm the failure, not trust a delay.
+            with self._lock:
+                self._last_deep_chain_probe = time.monotonic()
+                self._deep_fail_pending = False
+        elif chain_ok is False and not warmed:
+            with self._lock:
+                self._deep_fail_pending = True
         if alive:
             with self._lock:
                 node["latency_ms"] = hand
@@ -2236,6 +2397,7 @@ class RailwayManager:
                 self.preferred_tag = None; self.backup_tag = None; self._auto_pinned = True
                 self.status["preferred_tag"] = None; self.status["backup_tag"] = None; self.status["auto_pinned"] = True
                 self._rescue_round += 1
+                self._deep_fail_pending = False
                 self._persist_state(); self._invalidate_verify(f"unpinned after {tag} failed")
             self._apply_config(final="auto")
         self._record_history("auto-unpin", f"{tag} handshake failed {PINNED_FAIL_THRESHOLD}x")
@@ -2249,6 +2411,7 @@ class RailwayManager:
                 return False
             self.preferred_tag = best; self.backup_tag = second; self._auto_pinned = True
             self._chain_pin_at = time.monotonic()
+            self._deep_fail_pending = False
             self.status["preferred_tag"] = best; self.status["backup_tag"] = second; self.status["auto_pinned"] = True
             self._persist_state()
             return True
@@ -2302,6 +2465,7 @@ class RailwayManager:
                 self._rescue_round += 1
                 self._persist_state()
                 self._pinned_fail_streak = 0; self._chain_fail_streak = 0
+                self._deep_fail_pending = False
             if old_preferred is not None:
                 self._invalidate_verify("pin-cleared")
             self._set_pin_health("unpinned")
@@ -2343,8 +2507,11 @@ class RailwayManager:
             self.status["auto_pinned"] = False
             self._chain_pin_at = time.monotonic()
             self._pinned_fail_streak = 0; self._chain_fail_streak = 0
+            self._deep_fail_pending = False
             self._rescue_round += 1
             self._persist_state()
+        if hot:
+            self._reconcile_persistent_tags()
         if old_preferred != target:
             self._invalidate_verify(f"pin-changed to {target}")
         self._set_pin_health("ok")
@@ -2500,7 +2667,10 @@ class RailwayManager:
         hot = self._repin_runtime(tag, reason)
         with self._config_lock:
             if hot:
-                return self._commit_rescue(round_id, tag, None)
+                committed = self._commit_rescue(round_id, tag, None)
+                if committed:
+                    self._reconcile_persistent_tags_locked()
+                return committed
             if not self._apply_config(final="auto", preferred=tag, backup=None):
                 return False
             return self._commit_rescue(round_id, tag, None)
@@ -2522,6 +2692,89 @@ class RailwayManager:
                 pass
             time.sleep(0.5)
 
+    def _reconcile_persistent_tags(self) -> bool:
+        """Update the on-disk on_demand flags after a hot pin change.
+
+        A hot switch moves only the live Clash selector; the config file still
+        names the rewrite-time preference. Reconcile it under the config lock
+        without restarting sing-box. Residual: the already running process
+        keeps the old on_demand flags until its next restart - deliberately,
+        because a restart here would kill every live connection. The file is
+        correct for the next restart and for any config reader.
+        """
+        if not self.persist_pinned:
+            return False
+        if not self._config_lock.acquire(timeout=5):
+            self._log("persist-tags reconcile skipped: config lock busy", flush=True)
+            return False
+        try:
+            return self._reconcile_persistent_tags_locked()
+        finally:
+            try:
+                self._config_lock.release()
+            except Exception:
+                pass
+
+    def _reconcile_persistent_tags_locked(self) -> bool:
+        """Locked form of `_reconcile_persistent_tags`; no restart, no rebuild."""
+        if not self.persist_pinned:
+            return False
+        with self._lock:
+            preferred = self.preferred_tag
+            backup = self.backup_tag
+            config_path = self.config_path
+            last_good_path = self.last_good_path
+        persistent = {tag for tag in (preferred, backup) if tag}
+        try:
+            with open(config_path, encoding="utf-8") as handle:
+                config = json.load(handle)
+        except (OSError, ValueError) as exc:
+            self._log(f"persist-tags reconcile skipped: {type(exc).__name__}: {exc}", flush=True)
+            return False
+        if not isinstance(config, dict) or not isinstance(config.get("endpoints"), list):
+            self._log("persist-tags reconcile skipped: malformed config", flush=True)
+            return False
+        changed = False
+        for endpoint in config["endpoints"]:
+            if not isinstance(endpoint, dict):
+                self._log("persist-tags reconcile skipped: malformed endpoint", flush=True)
+                return False
+            desired = endpoint.get("tag") not in persistent
+            if endpoint.get("on_demand") != desired:
+                endpoint["on_demand"] = desired
+                changed = True
+        if not changed:
+            return True
+        tmp_path = f"{config_path}.persist-{os.getpid()}"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as handle:
+                json.dump(config, handle, indent=2)
+                handle.write("\n")
+            try:
+                os.chmod(tmp_path, 0o600)
+            except OSError:
+                pass
+            os.replace(tmp_path, config_path)
+        except OSError as exc:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            self._log(f"persist-tags reconcile failed: {type(exc).__name__}: {exc}", flush=True)
+            return False
+        try:
+            with open(config_path, "rb") as src:
+                payload = src.read()
+            with open(last_good_path, "wb") as dst:
+                dst.write(payload)
+            try:
+                os.chmod(last_good_path, 0o600)
+            except OSError:
+                pass
+        except OSError:
+            pass
+        return True
+
     def _apply_config(self, final: str = "auto", preferred: str | None = None, backup: str | None = None) -> bool:
         serving = self._ordered_serving()
         resi_outbound = self._resi_outbound()
@@ -2537,12 +2790,15 @@ class RailwayManager:
                           "secret": self.clash_api_secret}
                          if (self.clash_api_port and want_singbox) else None)
             candidates = self._chain_selector_tags() if self.resi_rotate else None
+        persistent_tags = ([tag for tag in (preferred, backup) if tag]
+                           if self.persist_pinned else None)
         config = build_singbox_config(endpoints, "127.0.0.1", mixed_port, mixed_users=[(username, password)],
             final=final, preferred=preferred, backup=backup, vless_uuid=vless_uuid,
             vless_direct_port=direct_port, vless_chain_port=chain_port,
             resi=resi_outbound, resi_port=resi_port, resi_path=resi_path,
             resi_rotate=self.resi_rotate, resi_rotate_tags=rotate_tags,
-            chain_candidates=candidates, clash_api=clash_api)
+            chain_candidates=candidates, clash_api=clash_api,
+            persistent_tags=persistent_tags)
         if self.resi_rotate:
             self._set_resi_routes(rotate_routes)
         if want_singbox and self._serving_config_unchanged(config):
@@ -2763,6 +3019,7 @@ class RailwayManager:
                 self.preferred_tag = next_preferred; self.backup_tag = next_backup
                 if pin_changed:
                     self._rescue_round += 1
+                    self._deep_fail_pending = False
                 self.status["endpoints"] = [self._endpoint_row(ep, n)
                                             for ep, n in zip(endpoints, nodes)]
                 self.status["countries"] = self._countries()
@@ -3097,9 +3354,12 @@ class RailwayManager:
                             self.status["backup_tag"] = None
                             self.status["auto_pinned"] = True
                             self._rescue_round += 1
+                            self._deep_fail_pending = False
                             self._persist_state()
                             committed = True
                             skip = ""
+                    if committed and hot:
+                        self._reconcile_persistent_tags_locked()
                 if committed:
                     self._invalidate_verify(f"auto-pinned to {tag}")
                     self._set_pin_health("ok")
@@ -3162,6 +3422,7 @@ class RailwayManager:
                             return
                         self.preferred_tag = pinned; self.backup_tag = None; self._auto_pinned = True
                         self._chain_pin_at = time.monotonic()
+                        self._deep_fail_pending = False
                         self.status["preferred_tag"] = pinned; self.status["backup_tag"] = None
                         self.status["auto_pinned"] = True
                         self._rescue_round += 1
@@ -3183,6 +3444,7 @@ class RailwayManager:
                     return
                 self.preferred_tag = pinned; self.backup_tag = pinned_second; self._auto_pinned = True
                 self._chain_pin_at = time.monotonic()
+                self._deep_fail_pending = False
                 self.status["preferred_tag"] = pinned
                 self.status["backup_tag"] = pinned_second
                 self.status["auto_pinned"] = True
@@ -3926,7 +4188,12 @@ def main() -> int:
         admin_token=cfg["admin_token"], snapshot_url=cfg["snapshot_url"], snapshot_urls=cfg["snapshot_urls"],
         refresh_seconds=cfg["refresh_seconds"], limit=cfg["limit"], real_topk=cfg["real_topk"], dial_workers=cfg["dial_workers"],
         full_probe_workers=cfg["full_probe_workers"], probe_workers=cfg["probe_workers"], dial_timeout=cfg["dial_timeout"],
-        auto_rescue=cfg["auto_rescue"], health_check_interval=cfg["health_check_interval"], max_mux_connections=cfg["max_mux_connections"],
+        auto_rescue=cfg["auto_rescue"], persist_pinned=cfg["persist_pinned"],
+        health_check_interval=cfg["health_check_interval"],
+        fast_health_interval=cfg["fast_health_interval"], deep_health_interval=cfg["deep_health_interval"],
+        chain_settle_grace=cfg["chain_settle_grace"],
+        fast_delay_timeout_ms=cfg["fast_delay_timeout_ms"],
+        max_mux_connections=cfg["max_mux_connections"],
         vless_uuid=cfg["vless_uuid"], vless_direct_port=cfg["vless_direct_port"], vless_chain_port=cfg["vless_chain_port"],
         resi=cfg["resi"], resi_port=cfg["resi_port"], resi_path=cfg["resi_path"],
         resi_rotate=cfg["resi_rotate"],

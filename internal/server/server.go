@@ -18,6 +18,11 @@ import (
 const (
 	maxRequestBody = 1 << 20
 	maxTimeoutMS   = 120_000
+	// delayFallbackBudget bounds the extra /version check after all delay
+	// probes failed. A slow delay batch already proves the Clash data path is
+	// unhealthy; spending the caller's remaining deadline on a second round
+	// trip would lose the per-tag failure data it can still use.
+	delayFallbackBudget = 500 * time.Millisecond
 )
 
 // ExitRunner is the real exit-IP measurement (implemented by *probe.Exiter).
@@ -209,13 +214,6 @@ func (s *Server) handleDelay(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, errorPayload{Error: "clash unavailable"})
 		return
 	}
-	checkCtx, cancel := context.WithTimeout(r.Context(), s.clashCheckTimeout)
-	err := s.clash.Version(checkCtx)
-	cancel()
-	if err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, errorPayload{Error: "clash unavailable"})
-		return
-	}
 	probeURL := strings.TrimSpace(request.URL)
 	if probeURL == "" {
 		probeURL = probe.DefaultDelayURL
@@ -227,7 +225,14 @@ func (s *Server) handleDelay(w http.ResponseWriter, r *http.Request) {
 	if timeoutMS > maxTimeoutMS {
 		timeoutMS = maxTimeoutMS
 	}
+	started := time.Now()
 	results := s.clash.Delays(r.Context(), request.Tags, probeURL, timeoutMS, s.concurrency)
+	if len(results) == 0 || allDelaysFailed(results) {
+		if time.Since(started) < delayFallbackBudget && !s.clashReachable(r.Context()) {
+			writeJSON(w, http.StatusServiceUnavailable, errorPayload{Error: "clash unavailable"})
+			return
+		}
+	}
 	payload := delayPayload{OK: true, Results: make([]delayResultPayload, 0, len(results))}
 	for _, result := range results {
 		payload.Results = append(payload.Results, delayResultPayload{
@@ -238,6 +243,28 @@ func (s *Server) handleDelay(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	writeJSON(w, http.StatusOK, payload)
+}
+
+// allDelaysFailed reports whether every delay attempt failed. The caller uses
+// it to decide whether a Clash /version check is worth doing: a healthy API
+// with a few dead tags still returns per-tag errors, while an unreachable API
+// fails every attempt.
+func allDelaysFailed(results []probe.DelayResult) bool {
+	for _, result := range results {
+		if result.Alive {
+			return false
+		}
+	}
+	return true
+}
+
+// clashReachable confirms the Clash API itself answers /version. It is only
+// consulted after every delay attempt failed, so healthy /v1/delay calls pay
+// no extra round trip.
+func (s *Server) clashReachable(ctx context.Context) bool {
+	checkCtx, cancel := context.WithTimeout(ctx, s.clashCheckTimeout)
+	defer cancel()
+	return s.clash.Version(checkCtx) == nil
 }
 
 func (s *Server) decode(w http.ResponseWriter, r *http.Request, destination any) bool {

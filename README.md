@@ -120,7 +120,7 @@ hijack + 每连接两个 goroutine，减少了 Python 线程模型的 header、�
        直接 `python railway_manager.py` 会无 VLESS）、`NEZHA_SERVER`/`NEZHA_KEY`、
        `LIMIT`（默认 100，0=全量、上限 100）、`REAL_TOPK`（默认 30，真拨 TopK）、
        `DIAL_WORKERS`（默认 2，真测并发；1GB 内存够用，OOM 就往小调）、`FULL_PROBE_WORKERS`（默认 3，
-       全量真测并发；和 DIAL_WORKERS 叠加受全局 dial gate 上限 10 约束）、`REFRESH_SECONDS`（默认 3600，每小时拉新快照并补测新/被踢节点）、`PROBE_WORKERS`（默认 15，握手并发）、`DIAL_TIMEOUT`（默认 15，真拨超时秒）、`AUTO_REPIN`（默认开，每小时自动重 pin 最优）、`AUTO_RESCUE`（默认开，手动 pin 挂了自动救最优）、`HEALTH_CHECK_INTERVAL`（默认 20s）、`MAX_MUX_CONNECTIONS`（默认 100）、`NEZHA_URL`（可选）、`SNAPSHOT_URLS`（可选，逗号分隔的快照镜像，主源失败自动顺延）
+       全量真测并发；和 DIAL_WORKERS 叠加受全局 dial gate 上限 10 约束）、`REFRESH_SECONDS`（默认 3600，每小时拉新快照并补测新/被踢节点）、`PROBE_WORKERS`（默认 15，握手并发）、`DIAL_TIMEOUT`（默认 15，真拨超时秒）、`AUTO_REPIN`（默认开，每小时自动重 pin 最优）、`AUTO_RESCUE`（默认开，手动 pin 挂了自动救最优）、`HEALTH_CHECK_INTERVAL`（默认 20s，无 probe sidecar 时的全量探活；有 sidecar 时改用 `FAST_HEALTH_INTERVAL` 默认 5s 快探 + `DEEP_HEALTH_INTERVAL` 默认 30s 真出口深探，固定节拍、检查超时不补跑；快探超时由 `FAST_DELAY_TIMEOUT_MS` 控制，默认 2500ms、钳制 500..5000）、`CHAIN_SETTLE_GRACE`（默认 20s，新 pin 预热宽限，钳制 5..120）、`OPENVPN_PERSIST_PINNED`（默认 1，preferred/backup 端点空闲也保持 OpenVPN 会话；0 恢复按需释放）、`MAX_MUX_CONNECTIONS`（默认 100）、`NEZHA_URL`（可选）、`SNAPSHOT_URLS`（可选，逗号分隔的快照镜像，主源失败自动顺延）
      - 第三出口（默认开启、节点轮换、零配置；只有要接外部住宅网关才需要下面这些）：
        `RESI_GATEWAY`（`host:port`，固定 backconnect 网关，**永远只连这个地址**；填了就切到住宅模式）、
        `RESI_USER`、`RESI_PASS`、
@@ -376,11 +376,19 @@ Python 回退。sing-box 运行时**绝不再起临时客户端去拨第二个�
 **阈值与救援**：
 
 - 握手连续 **3** 次失败（`PINNED_FAIL_THRESHOLD=3`）才把 pin 判死；隧道端到端探针连续
-  **2** 次失败（`CHAIN_FAIL_THRESHOLD=2`）才救援；新 pin 有 45 秒
-  （`CHAIN_SETTLE_GRACE`）预热宽限，宽限内失败不判死。
+  **2** 次失败（`CHAIN_FAIL_THRESHOLD=2`）才救援；新 pin 有 20 秒
+  （`CHAIN_SETTLE_GRACE`，默认 20、钳制 5..120）预热宽限，宽限内失败不判死。
 - 救援只切到**当下真实出口验证通过**的候选（最多试 6 个、60 秒预算）；失败候选进
   900 秒死记忆，连续救援会沿池子往下走。没有候选通过时**保留原 pin**、标 `degraded`，
   并触发后台刷新——绝不拿没验证的节点顶上。
+- 候选预检（有 sidecar 时）：救援前先对最多 6 个候选做一次批量 delay；只有明确返回
+  `alive=false` 的候选才跳过，`unknown`/缺失/无 sidecar 仍照常尝试。全部候选都明确
+  delay-dead 时保留原 pin、触发后台刷新，不写配置、不记死记忆——delay 失败本身从不判死。
+- 健康循环是固定节拍：有 sidecar 时每 5 秒 fast tick、每 30 秒 deep 真出口；某次检查
+  超时不会补跑，只从当前时刻重新计时。实际发现时间仍受 delay/exit 探针超时约束
+  （快探默认 2500ms，`FAST_DELAY_TIMEOUT_MS` 可调 500..5000）。
+- `OPENVPN_PERSIST_PINNED=1`（默认）让 preferred/backup 端点带 `on_demand=false`，
+  空闲时也保持各自的 OpenVPN 会话；其余节点仍是 `on_demand=true`。设 `0` 则全部按需释放。
 - 握手已死但链路仍能真实出口：视为 `ok`（热切换已经把 selector 移走），不重写配置。
 - 手动 pin 在刷新/自动测速后保持不变；`AUTO_REPIN` 只重 pin 自动轨道。
 - 轮换模式（未配 `RESI_GATEWAY`）在所有候选握手都死时**保留死 pin**并标 `dead`
@@ -392,7 +400,7 @@ Python 回退。sing-box 运行时**绝不再起临时客户端去拨第二个�
 | 现象 | 可能原因 | 处理 |
 |---|---|---|
 | 日志 `vpngate-probe disabled or not installed` / 边车缺失 | `PROBE_SERVICE=0`、镜像里没二进制或启动即崩 | 管理器会回退 Python 验证；看 `/tmp/probe.log`，确认 `PROBE_LISTEN` 是回环且端口空闲 |
-| `pin_health=degraded` | 握手/隧道连败未到阈值、serving 短暂不可达、或无候选通过验证 | 健康循环每 20 秒重试；看 `/api/status` 的 `pin_health.error` 与 `/tmp/probe.log` |
+| `pin_health=degraded` | 握手/隧道连败未到阈值、serving 短暂不可达、或无候选通过验证 | 有 sidecar 时快探每 5 秒重试（无 sidecar 每 20 秒）；看 `/api/status` 的 `pin_health.error` 与 `/tmp/probe.log` |
 | `pin_health=dead` | 轮换模式下所有候选握手都死，按设计保留 pin | 不是崩溃；等刷新补测或手动切换，必要时 `POST /api/full_probe` |
 | 所有节点 `alive`/`exit_ip` 为 `null`、`verify_fresh=false` | 冷启动尚未测完，或没有验证器 | 等全量真测；确认边车/回退可用，或 `POST /api/full_probe` |
 | 面板提示「服务出口探测不可用」 | 没有验证器（边车与 Python 回退都不可用）或 mixed 正在重启 | 恢复边车/等待 sing-box 起来；`unknown` 不会触发救援，勿据此判死 |

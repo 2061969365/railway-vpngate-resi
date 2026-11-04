@@ -20,6 +20,7 @@ class _State:
         self.mode = "ok"
         self.delay = 0.0
         self.token = ""
+        self.delay_results = None
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -72,12 +73,15 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if method == "POST" and self.path == "/v1/delay":
             sent = json.loads(raw or b"{}")
-            results = []
-            if sent.get("tags"):
-                results = [
-                    {"tag": "a", "alive": True, "ms": 180, "error": None},
-                    {"tag": "b", "alive": False, "ms": None, "error": "timeout"},
-                ]
+            if state.delay_results is not None:
+                results = state.delay_results
+            else:
+                results = []
+                if sent.get("tags"):
+                    results = [
+                        {"tag": "a", "alive": True, "ms": 180, "error": None},
+                        {"tag": "b", "alive": False, "ms": None, "error": "timeout"},
+                    ]
             self._send(200, {"ok": True, "results": results})
             return
         self._send(404, {"ok": False, "error": "not found"})
@@ -198,6 +202,27 @@ class ProbeClientTests(unittest.TestCase):
     def test_delays_service_error_returns_none(self) -> None:
         self.server.state.mode = "server_error"
         self.assertIsNone(self.client.delays(["a"]))
+
+    def test_delay_status_reports_alive_and_dead(self) -> None:
+        got = self.client.delay_status(["a", "b"], timeout_ms=500)
+        self.assertEqual(got, {"a": True, "b": False})
+        sent = json.loads(self.server.state.requests[-1]["body"])
+        self.assertEqual(sent["tags"], ["a", "b"])
+        self.assertEqual(sent["timeout_ms"], 500)
+
+    def test_delay_status_omits_missing_tags(self) -> None:
+        self.server.state.delay_results = [{"tag": "a", "alive": True, "ms": 180}]
+        got = self.client.delay_status(["a", "c"])
+        self.assertEqual(got, {"a": True})
+        self.assertNotIn("c", got)
+
+    def test_delay_status_service_error_returns_none(self) -> None:
+        self.server.state.mode = "server_error"
+        self.assertIsNone(self.client.delay_status(["a"]))
+
+    def test_delay_status_malformed_returns_none(self) -> None:
+        self.server.state.mode = "malformed"
+        self.assertIsNone(self.client.delay_status(["a"]))
 
     def test_unauthorized_returns_none(self) -> None:
         self.server.state.token = "secret"

@@ -86,6 +86,19 @@ Response 200:
 If the Clash API is unreachable, return 503 `{"ok": false, "error": "clash unavailable"}`.
 Bound concurrency with `PROBE_CONCURRENCY`.
 
+A healthy call does **not** probe Clash `/version`: the sidecar only calls it (2 s
+cap) after an empty or all-failed delay batch, and only when that batch finished
+within a 500 ms budget; a slower batch returns the per-tag `alive=false` rows
+directly instead of adding another round trip. The per-tag delay context is
+`timeout_ms + 1.5 s`, keeping even the slow path below the Python caller's
+`timeout_ms + 2 s` deadline. There is no `/version` cache; there is simply no
+per-request round trip.
+
+The manager uses this endpoint for its fast health tick with
+`FAST_DELAY_TIMEOUT_MS` (default 2500 ms, clamped 500..5000). `delay_status`
+(see below) preserves an explicit `alive=false`; tags absent from the response
+stay unknown, never dead.
+
 ## Python client (`probe_client.py`)
 
 `ProbeClient.from_env()` reads `PROBE_LISTEN` (base URL) and `PROBE_TOKEN`; it
@@ -98,8 +111,43 @@ breaker) so the caller can fall back to the Python implementation. Methods:
 - `exit_ip(host, port, username, password, timeout_ms=8000) -> dict | None`
 - `delays(tags, url=..., timeout_ms=5000) -> dict[str, int] | None`
   (returns only alive tags mapped to their ms)
+- `delay_status(tags, url=..., timeout_ms=5000) -> dict[str, bool] | None`
+  (explicit per-tag verdict; missing tags stay unknown)
+
+`RailwayManager.check_fast_health()` runs on a fixed-rate fast tick every
+`FAST_HEALTH_INTERVAL` (default 5 s; a check that overruns restarts the cadence
+instead of catching up) and calls `delays([pinned_tag])` with
+`FAST_DELAY_TIMEOUT_MS` (default 2500 ms, clamped 500..5000). A live delay is a
+real request through the existing outbound, so it proves the data channel
+without a second VPNGate session. A missing tag immediately triggers the full
+served-exit check; when the sidecar itself does not answer and the last deep
+check is younger than `DEEP_HEALTH_INTERVAL` (default 30 s), the tick returns
+`unknown` and waits instead of spinning a full probe every 5 s. A live tag only
+suppresses the deep served-exit check until it is due (`DEEP_HEALTH_INTERVAL`,
+default 30 s), so a dead exit cannot hide behind a healthy delay.
 
 Python fallback (must exist even when the sidecar is absent):
 `vpngate_to_singbox.measure_mixed_exit_ip(host, port, username, password,
 timeout=8) -> (ip, ms) | (None, None)`, HTTP CONNECT + TLS + same exit-IP
 targets, no subprocess.
+
+## Rescue candidate prevalidation
+
+With a sidecar, `_rescue_chain_impl` prevalidates up to six candidates with one
+batched `/v1/delay` call using `FAST_DELAY_TIMEOUT_MS`. Only an explicit
+`alive=false` row removes a candidate from this rescue; unknown/missing tags
+(and the no-sidecar path) are still tried. If every candidate is explicitly
+delay-dead, the rescue keeps the current pin, triggers a background refresh and
+writes nothing — delay failure alone never marks a node dead or rewrites the
+config. Candidates that fail the subsequent real served-exit verification go
+into the 900 s dead-memory as before.
+
+## Persistent pinned/backup sessions
+
+When `OPENVPN_PERSIST_PINNED=1` (the default), the manager passes
+`persistent_tags=[preferred, backup]` to `build_singbox_config()`; those
+endpoints are emitted with `on_demand=false`, so they hold their OpenVPN session
+while idle. Every other endpoint stays `on_demand=true` and is released on idle
+as before. Set `OPENVPN_PERSIST_PINNED=0` to restore on-demand release for all
+endpoints. The sidecar never manages sessions; this is purely a
+config-generation concern.

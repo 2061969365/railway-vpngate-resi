@@ -1,5 +1,6 @@
 """Tests for minimal VPNGate .ovpn -> sing-box openvpn-client converter."""
 import base64
+import json
 import socket
 import ssl
 import threading
@@ -97,6 +98,12 @@ class ConvertTcpTests(unittest.TestCase):
         # The keepalive comes from the .ovpn (10s/60s here), not from us.
         self.assertEqual("10s", ep["ping_interval"])
         self.assertEqual("60s", ep["ping_restart"])
+
+    def test_pinned_endpoint_can_hold_its_session(self) -> None:
+        ep = ovpn_to_endpoint(TCP_OVPN, tag="vpngate-pin", on_demand=False)
+
+        self.assertFalse(ep["on_demand"])
+        self.assertEqual("vpngate-pin", ep["tag"])
 
     def test_the_probe_does_not_retry_a_rejected_login(self) -> None:
         """The serving endpoint retries a rejected login; the throwaway probe
@@ -961,6 +968,106 @@ class DualPinConfigTests(unittest.TestCase):
 
         chain = next(o for o in cfg["outbounds"] if o["tag"] == "chain")
         self.assertEqual(["vpngate-0", "auto"], chain["outbounds"])
+
+
+class PersistentEndpointTests(unittest.TestCase):
+    """Pinned/backup tags hold their session; every other endpoint releases."""
+
+    def _two(self):
+        return [
+            ovpn_to_endpoint(TCP_OVPN, tag="vpngate-0"),
+            ovpn_to_endpoint(
+                TCP_OVPN.replace("203.0.113.1", "203.0.113.2"),
+                tag="vpngate-1"),
+        ]
+
+    @staticmethod
+    def _by_tag(config):
+        return {ep["tag"]: ep for ep in config["endpoints"]}
+
+    def test_default_and_empty_keep_every_endpoint_on_demand(self) -> None:
+        for persistent in (None, []):
+            config = build_singbox_config(
+                self._two(), persistent_tags=persistent)
+            self.assertEqual(
+                {"vpngate-0": True, "vpngate-1": True},
+                {tag: ep["on_demand"]
+                 for tag, ep in self._by_tag(config).items()})
+
+    def test_persistent_tag_holds_its_session_only(self) -> None:
+        config = build_singbox_config(self._two(),
+                                      persistent_tags=["vpngate-1"])
+        by_tag = self._by_tag(config)
+
+        self.assertFalse(by_tag["vpngate-1"]["on_demand"])
+        self.assertTrue(by_tag["vpngate-0"]["on_demand"])
+
+    def test_unknown_persistent_tag_has_no_effect(self) -> None:
+        config = build_singbox_config(self._two(),
+                                      persistent_tags=["vpngate-9"])
+
+        self.assertTrue(all(ep["on_demand"] for ep in config["endpoints"]))
+
+    def test_non_persistent_endpoint_keeps_its_on_demand_false(self) -> None:
+        endpoints = [
+            ovpn_to_endpoint(TCP_OVPN, tag="vpngate-0", on_demand=False),
+            ovpn_to_endpoint(TCP_OVPN, tag="vpngate-1"),
+        ]
+        config = build_singbox_config(endpoints,
+                                      persistent_tags=["vpngate-1"])
+        by_tag = self._by_tag(config)
+
+        self.assertFalse(by_tag["vpngate-0"]["on_demand"])
+        self.assertFalse(by_tag["vpngate-1"]["on_demand"])
+
+    def test_unknown_only_list_preserves_mixed_existing_values(self) -> None:
+        endpoints = [
+            ovpn_to_endpoint(TCP_OVPN, tag="vpngate-0", on_demand=False),
+            ovpn_to_endpoint(TCP_OVPN, tag="vpngate-1"),
+        ]
+        config = build_singbox_config(endpoints,
+                                      persistent_tags=["vpngate-9"])
+
+        self.assertEqual(
+            {"vpngate-0": False, "vpngate-1": True},
+            {tag: ep["on_demand"]
+             for tag, ep in self._by_tag(config).items()})
+
+    def test_none_and_empty_preserve_mixed_existing_values(self) -> None:
+        endpoints = [
+            ovpn_to_endpoint(TCP_OVPN, tag="vpngate-0", on_demand=False),
+            ovpn_to_endpoint(TCP_OVPN, tag="vpngate-1"),
+        ]
+        for persistent in (None, []):
+            config = build_singbox_config(endpoints,
+                                          persistent_tags=persistent)
+            self.assertEqual(
+                {"vpngate-0": False, "vpngate-1": True},
+                {tag: ep["on_demand"]
+                 for tag, ep in self._by_tag(config).items()})
+
+    def test_absent_on_demand_defaults_true(self) -> None:
+        endpoint = ovpn_to_endpoint(TCP_OVPN, tag="vpngate-0")
+        del endpoint["on_demand"]
+        config = build_singbox_config([endpoint],
+                                      persistent_tags=["vpngate-9"])
+
+        self.assertTrue(config["endpoints"][0]["on_demand"])
+
+    def test_config_is_json_serializable_and_shape_is_unchanged(self) -> None:
+        endpoints = self._two()
+        before_keys = [set(ep) for ep in endpoints]
+        config = build_singbox_config(endpoints,
+                                      persistent_tags=["vpngate-1"])
+
+        json.dumps(config)
+        self.assertEqual(before_keys,
+                         [set(ep) for ep in config["endpoints"]])
+        by_tag = self._by_tag(config)
+        self.assertIsInstance(by_tag["vpngate-1"]["on_demand"], bool)
+        self.assertEqual(["proxy", "auto", "direct"],
+                         [outbound["tag"] for outbound in config["outbounds"]])
+        self.assertEqual("auto", config["route"]["final"])
 
 
 class ExitIpFallbackTests(unittest.TestCase):

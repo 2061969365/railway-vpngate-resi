@@ -442,17 +442,18 @@ UUID 保护的公开端点，不是 API），并把 mux 已经读到的握手字
   - `_chain_probe_ok()` 通过**自己的 mux** 拨一次 `/ws-chain` 并取出口 IP（复用
     `measure_resi_rotate`，走的是 chain 已持有的那条会话，不会新建 VPNGate 会话，
     也就不触发 duplicate-cn）。
-  - 连续 `CHAIN_FAIL_THRESHOLD=2` 轮（约 40 秒，健康循环 20 秒一次）失败 ⇒
+  - 连续 `CHAIN_FAIL_THRESHOLD=2` 轮失败 ⇒
     `_rescue_chain()`：只在**真拨验证过**（`real_latency_ms is not None`）且不是当前
     pin/backup 的节点里挑最快的一个重新钉住；**仍然不 unpin**（unpin 会把 chain 交给
     urltest，D9 复现）。
-  - 防抖：rescue 有 45 秒起步、逐次翻倍的冷却（上限 300 秒）；没有已验证的备选时只记
+  - 防抖：rescue 有冷却（D10 当时 45 秒起步、上限 300 秒；现行 30 秒起、上限 120 秒，
+    见 §12.9f）；没有已验证的备选时只记
     `chain-rescue-skipped` 不折腾；每次 `_apply_config` 成功后清空失败计数（重启后首个
     探测是跟 endpoint 起来赛跑，不该算数）。日志与状态历史里分别是
     `chain rescue: ...`、`chain-rescue` / `chain-rescue-skipped`。
 - 代价：pin 换人必须重写配置并重启 sing-box（D6 的边界），所以一次 chain rescue 会掉
   三条路的既有连接——但这是"死锁 8 分钟"与"重连一次"之间的选择，且冷却把频率压到
-  最多一次/45 秒、失败备选不存在时为零。
+  最多一次/45 秒（当时）、失败备选不存在时为零；现行上限见 §12.9f。
 - 证据：`test_rotate_mode_rescues_a_tcp_alive_but_tunnel_dead_pin`、
   `test_rotate_mode_keeps_the_pin_while_the_chain_carries_traffic`、
   `test_chain_rescue_without_an_alternative_keeps_the_pin`。
@@ -619,7 +620,7 @@ VPNGate 一个节点只允许一个会话，预留即意味着轮换永远不能
   候选集按 tag 排序写进配置（字节稳定，不会因为排序变化触发重写）。
 - 换 pin = `PUT /proxies/chain {"name": tag}`（Clash API 绑 `127.0.0.1:$CLASH_API_PORT`，
   带随机 secret）。**不写文件、不重启、不断连接**，所以轮换侧完全无感。
-- **新 pin 有 45s 预热宽限**（`CHAIN_SETTLE_GRACE`）：刚切过去的 endpoint 还要建立自己的
+- **新 pin 有 20s 预热宽限**（`CHAIN_SETTLE_GRACE`，默认 20、钳制 5..120）：刚切过去的 endpoint 还要建立自己的
   OpenVPN 会话，宽限期内探针失败不算数。没有这条时每次切换都在"新节点还没连上"时被判死，
   于是整池逐个走一遍、chain 永远不收敛（云端验收第一次就是这么挂的）。
 - chain 探针超时从 8s 提到 12s，给首包留余量。
@@ -650,9 +651,19 @@ round 2  iptables 拒 vpngate-1  → t=128/155s chain 全失败
   （旧 state.json 里的 backup 会在加载时清掉）。
 - 热切换失败时退回 D13 的"写配置 + 重启"，所以功能不依赖 Clash API 可用。
 
-代价与取舍：热切换要等 chain 探针连续失败 2 次（约 40s）才触发，比 urltest 的 15s 慢，
-但**代价是 0 连带伤害**（不重启、不掐连接、不占第二个节点）；而 D14 的 15s 是拿
-"resi 池 -1 且常驻两条探测会话"换来的。`CLASH_API_PORT=0` 可整体关闭热切换。
+代价与取舍：有 sidecar 时 fast tick 每 5s 快探、失败立即补一次真出口深探，连续 2 次
+隧道失败通常 15-30 秒触发（最坏叠加探针超时与 20s 预热宽限），比 urltest 的 15s 仍慢
+一点，但**代价是 0 连带伤害**（不重启、不掐连接、不占第二个节点）；而 D14 的 15s 是拿
+"resi 池 -1 且常驻两条探测会话"换来的。无 sidecar 时回退到 20s 全量探活。`CLASH_API_PORT=0`
+可整体关闭热切换。
+- **pinned/backup 常驻会话**（`OPENVPN_PERSIST_PINNED=1`，默认）：`_apply_config` 把
+  `preferred`/`backup` 作为 `persistent_tags` 传给 `build_singbox_config`，这两个 endpoint
+  以 `on_demand=false` 生成，空闲也不释放会话；其余节点仍 `on_demand=true`。设 `0` 恢复全部
+  按需释放。
+- **rescue 候选预检**：有 sidecar 时先对最多 6 个候选做一次批量 delay
+  （`FAST_DELAY_TIMEOUT_MS`，默认 2500ms）；只有明确 `alive=false` 的候选被跳过，
+  missing/unknown 仍照常尝试。全部候选明确 delay-dead 时保留当前 pin、触发后台 refresh，
+  不写配置、不记死记忆——delay 失败本身从不判死。
 
 证据：真 sing-box 1.14.0 上 `PUT /proxies/chain` → 204、`now` 立即切换、错误 tag 优雅
 失败；单测覆盖"热切换不写配置文件"（`_apply_config` 断言未被调用）与"API 不可用时回退"。
@@ -772,12 +783,16 @@ route rules: 100 {'inbound': 'resi-rot-0', 'outbound': 'vpngate-0'} ... 'resi-ro
    `chain rescue: {原因}: {旧 tag} -> {新 tag}`（rotate 下没有 `backup=…`），
    且新 pin 是最近真的传过 payload 的节点，而不是延迟数字最小的那个。
    历史里若出现连续的 `chain-rescue` 且 pin 反复回到同一个 tag，说明失败记忆失效（回归）。
-9. **恢复时间的上限**（别按 ≤30 秒考核）：健康回路每 `HEALTH_CHECK_INTERVAL=20s` 判一次，
-   而刚 pin 上的节点有 `CHAIN_SETTLE_GRACE=45s` 的预热豁免（宽限期内不判死）。
-   ⇒ 握手已死 ⇒ 最坏 ≈45+20 = **65 秒**；握手还活着但隧道死（VPNGate 会话过期的典型形态）
-   ⇒ 还要 `CHAIN_FAIL_THRESHOLD=2` 次连续探针 ⇒ 最坏 ≈ **85 秒**。
-   冷启动（容器刚起、无 pin）时 pin 的是"最近真拨过"的节点，正常几秒内就能出出口 IP；
-   上面是**最坏情况**（恰好 pin 了一个已经死掉的节点）。
+9. **恢复时间**：有 probe sidecar 时，健康回路按固定节拍运行：每
+   `FAST_HEALTH_INTERVAL=5s` 用 Clash delay 快探一次（timeout
+   `FAST_DELAY_TIMEOUT_MS=2500ms`，可调 500..5000；走现有出站、不新建 VPNGate 会话），
+   每 `DEEP_HEALTH_INTERVAL=30s` 再做一次真出口深探；没有 sleep-after 漂移，某次检查
+   超时不会补跑。快探失败立即补一次真出口检查，连续 `CHAIN_FAIL_THRESHOLD=2` 次失败
+   就 rescue ⇒ 稳态下通常约 **15-30 秒**发现（探针超时越短越快）。
+   刚 pin 上的节点有 `CHAIN_SETTLE_GRACE=20s` 的预热豁免（默认 20、钳制 5..120；
+   宽限期内不判死），所以"pin 完立刻就死"的最坏情况还要叠加预热期和数轮探针超时；
+   无 sidecar 时回退到 `HEALTH_CHECK_INTERVAL=20s` 的全量探活（最坏 ≈65/85 秒）。
+   冷启动（容器刚起、无 pin）时 pin 的是"最近真拨过"的节点，正常几秒内就能出出口 IP。
 
 ### 12.14 manager 测试契约迁移（16 条历史红灯 → 现行机制，2026-10-21）
 
@@ -867,7 +882,7 @@ backup 恒为 `None`，事件仍是 `auto-pin-unverified`。代码里不再留"�
 - 换 pin 之后**落盘 + 写进配置**现在有断言：`status["preferred_tag"]`、`state.json` 里的
   `preferred_tag`、发布配置里 chain 选择器的 `outbounds[0]`。
 - 暖机豁免不再依赖"机器开机多久"：用例里用 `time.monotonic() - 3600.0` 表达"这是一个老 pin"，
-  否则开机不到 45 秒时 `CHAIN_SETTLE_GRACE` 反而会把要测的"判死"豁免掉（偶发红）。
+  否则开机不到 20 秒时 `CHAIN_SETTLE_GRACE` 反而会把要测的"判死"豁免掉（偶发红）。
 
 **一条契约变更（老保证在现行机制下无法实现）**
 
@@ -901,7 +916,7 @@ push 到 main 与 PR 都跑，Python 3.12 + 3.13 双版本）。
 
 修法：用例在写测量值之前先 `_settle_probes(manager)` 等后台探测结束；暖机豁免也不再
 依赖"机器开机多久"（`manager._chain_pin_at = 0.0` 改成 `time.monotonic() - 3600.0`，
-否则刚开机的 runner 落在 45s 豁免窗口里，会把用例要测的"判死"直接豁免掉）。
+否则刚开机的 runner 落在 20s 豁免窗口里，会把用例要测的"判死"直接豁免掉）。
 
 **2) 后台线程在解释器收尾时打日志 ⇒ 整个进程被 SIGABRT**
 
@@ -971,11 +986,13 @@ pytest 3.13 run 1/2/3   573 passed, 2 skipped in 64~65s
 - `/ws-chain` 在容器 ready 后 90s 内拿到**真实出口 IP**，且该 IP ≠ 容器自身出口。
 
 **一个必须写下来的最坏情况**：当**所有**候选节点都死了（例如验收脚本按整片 IP 封禁，
-把共用同一出口 IP 的多个节点一起打死），救援会**逐个试尸体**——每个候选要 2 次隧道探针
-失败（`CHAIN_FAIL_THRESHOLD=2`，约 40s）才换下一个，实测链自愈用了 **376s**。
-这是"池子空了"的最坏情况，不是常态：只死一个节点、其余健康时，救援命中
-"最近答过话"的节点（`_chain_candidates_locked` 的 proven/answered 桶），应远快于此。
-若要缩短这个最坏情况，方向是**并发试探多个候选**，而不是改判定阈值。
+把共用同一出口 IP 的多个节点一起打死），有 sidecar 时先做批量 delay 预检：全部明确
+`alive=false` 会立即保留原 pin 并触发 refresh（不写配置）；只有"delay 看起来活、真实出口
+却死"的候选才会进入逐个验证。救援最多取 6 个候选、总预算 60s（最后一个候选的验证可能
+略微超出），失败/超时后保留原 pin + 后台刷新，不会无限走完整个池子。旧版没有这两个上限，
+曾实测自愈 376s；现在的上界是一个救援回合 + 冷却（30s 起、上限 120s），不再随池子大小
+线性增长。只死一个节点、其余健康时，救援会命中"最近答过话"的节点
+（`_chain_candidates_locked` 的 proven/answered 桶），应远快于此。
 
 ### 12.19 真拨踢掉 serving 端 ⇒ 链只能试尸体（2026-10-21，验收实测）
 
@@ -996,7 +1013,7 @@ duplicate-cn 把 serving 端那条踢掉（§12.9e D13 的同一条规则）。
 - 冷启动那轮真拨（refresh top-10 + full probe 6 个"从未验证过"的节点）把 serving 端
   同节点客户端踢掉 8 次 ⇒ 池子**账面 12~13 个、多数是僵尸**；
 - manager 自己的 rotation 探针开始报 `resi-probe: failed: no serving endpoint answered`；
-- pin 一死，链的候选全是僵尸 ⇒ 逐个试（每个 2 次隧道探针失败 ≈40s，冷却还翻倍）
+- pin 一死，链的候选全是僵尸 ⇒ 当时逐个试（每个 2 次隧道探针失败约 40s，冷却还翻倍）
   ⇒ **自愈实测 365~388s**。
 
 **修复**（`2983573`）：**rotate 模式下全量真拨不再真拨节点**，改成**经该节点自己的
@@ -1125,6 +1142,8 @@ reference 节点第一次测出了延迟**（29/188，此前每一轮都是 0/24
   = 上一版镜像 tag，写在这里以免忘了）；
 - **CI 的 `singbox check` job 用同一个版本**校验 serving + 探针两份配置 ⇒ 部署二进制会拒的
   配置在 push 前就红（这个 job 已经抓到我一次 `auth_retry` 拼错和一次探针空 duration）。
+- 例外：`OPENVPN_PERSIST_PINNED=1`（默认）时 `preferred`/`backup` 两个端点用
+  `on_demand=false` 常驻会话；其余端点仍 `on_demand=true`（空闲释放）。详见 §12.9g。
 
 产品侧复验（run 39722490053）：`direct` 不再 16/16 全空（被用到的节点出货 ✓），
 `resi.state` 从长期 `down / no serving endpoint answered` 变成 **`up`**（轮换探针又拿得到出口 IP）✓。

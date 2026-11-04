@@ -19,6 +19,21 @@ DEFAULT_DELAY_URL = "https://www.gstatic.com/generate_204"
 _DISABLED_VALUES = frozenset({"0", "false", "no", "off"})
 
 
+def _delay_results(body: dict | None) -> list[dict] | None:
+    """Validated result rows from a /v1/delay response, or None.
+
+    Every fail-open caller treats None as "the sidecar did not answer";
+    individual malformed rows are ignored so one bad entry cannot hide a
+    usable result for another tag.
+    """
+    if not body or body.get("ok") is not True:
+        return None
+    results = body.get("results")
+    if not isinstance(results, list):
+        return None
+    return [result for result in results if isinstance(result, dict)]
+
+
 class _Breaker:
     """Tiny consecutive-failure circuit breaker."""
 
@@ -130,20 +145,54 @@ class ProbeClient:
             }
             request_timeout = max(1.0, int(timeout_ms) / 1000.0 + 2.0)
             body = self._request("POST", "/v1/delay", payload, timeout=request_timeout)
-            if not body or body.get("ok") is not True:
-                return None
-            results = body.get("results")
-            if not isinstance(results, list):
+            results = _delay_results(body)
+            if results is None:
                 return None
             alive: dict[str, int] = {}
             for result in results:
-                if not isinstance(result, dict) or result.get("alive") is not True:
+                if result.get("alive") is not True:
                     continue
                 tag = result.get("tag")
                 ms = result.get("ms")
                 if isinstance(tag, str) and isinstance(ms, int) and not isinstance(ms, bool):
                     alive[tag] = ms
             return alive
+        except Exception:
+            return None
+
+    def delay_status(
+        self,
+        tags,
+        url: str = DEFAULT_DELAY_URL,
+        timeout_ms: int = 5000,
+    ) -> dict[str, bool] | None:
+        """Per-tag liveness from the sidecar, or None when it did not answer.
+
+        Only results present in the response get an entry: True for an
+        explicit alive=true, False for alive=false. Absent tags stay unknown
+        (never dead), and malformed rows are ignored. Callers may therefore
+        prevalidate candidates without inventing deaths for tags the sidecar
+        could not reach.
+        """
+        try:
+            tags = [str(tag) for tag in (tags or [])]
+            payload = {
+                "tags": tags,
+                "url": url or DEFAULT_DELAY_URL,
+                "timeout_ms": int(timeout_ms),
+            }
+            request_timeout = max(1.0, int(timeout_ms) / 1000.0 + 2.0)
+            body = self._request("POST", "/v1/delay", payload, timeout=request_timeout)
+            results = _delay_results(body)
+            if results is None:
+                return None
+            status: dict[str, bool] = {}
+            for result in results:
+                tag = result.get("tag")
+                alive = result.get("alive")
+                if isinstance(tag, str) and isinstance(alive, bool):
+                    status[tag] = alive
+            return status
         except Exception:
             return None
 

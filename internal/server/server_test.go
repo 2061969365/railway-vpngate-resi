@@ -13,30 +13,63 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/2061969365/railway-vpngate-combined/probe/internal/probe"
 )
 
-func newClashServer(t *testing.T, versionStatus int) *httptest.Server {
+func newClashServer(t *testing.T, status int) *httptest.Server {
 	t.Helper()
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(newClashHandler(status, nil))
+	t.Cleanup(server.Close)
+	return server
+}
+
+func newClashHandler(status int, versionCalls *atomic.Int64) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "read only", http.StatusMethodNotAllowed)
 			return
 		}
 		switch {
 		case r.URL.Path == "/version":
-			w.WriteHeader(versionStatus)
+			if versionCalls != nil {
+				versionCalls.Add(1)
+			}
+			w.WriteHeader(status)
 			_, _ = io.WriteString(w, `{"version":"1.15.0"}`)
 		case strings.HasPrefix(r.URL.Path, "/proxies/") && strings.HasSuffix(r.URL.Path, "/delay"):
+			w.WriteHeader(status)
 			_, _ = io.WriteString(w, `{"delay":42}`)
 		default:
 			http.NotFound(w, r)
 		}
-	}))
-	t.Cleanup(server.Close)
-	return server
+	})
+}
+
+func newSlowClashHandler(status int, delay time.Duration, versionCalls *atomic.Int64) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "read only", http.StatusMethodNotAllowed)
+			return
+		}
+		switch {
+		case r.URL.Path == "/version":
+			if versionCalls != nil {
+				versionCalls.Add(1)
+			}
+			w.WriteHeader(status)
+			_, _ = io.WriteString(w, `{"version":"1.15.0"}`)
+		case strings.HasPrefix(r.URL.Path, "/proxies/") && strings.HasSuffix(r.URL.Path, "/delay"):
+			time.Sleep(delay)
+			w.WriteHeader(status)
+			_, _ = io.WriteString(w, `{"delay":42}`)
+		default:
+			http.NotFound(w, r)
+		}
+	})
 }
 
 func TestHealth(t *testing.T) {
@@ -211,8 +244,40 @@ func TestDelayEndpoint(t *testing.T) {
 	}
 }
 
+func TestDelaySkipsVersionCheckWhenDelaysWork(t *testing.T) {
+	var versionCalls atomic.Int64
+	clash := httptest.NewServer(newClashHandler(http.StatusOK, &versionCalls))
+	t.Cleanup(clash.Close)
+	handler := New(Options{Clash: &probe.ClashClient{BaseURL: clash.URL}, Concurrency: 2})
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/delay",
+			strings.NewReader(`{"tags":["vpngate-1"],"timeout_ms":500}`)))
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("attempt %d status = %d, body = %s", attempt, recorder.Code, recorder.Body)
+		}
+		var payload delayPayload
+		if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+			t.Fatalf("attempt %d decode: %v", attempt, err)
+		}
+		if !payload.OK || len(payload.Results) != 1 || !payload.Results[0].Alive {
+			t.Fatalf("attempt %d payload = %+v", attempt, payload)
+		}
+		if payload.Results[0].MS == nil || *payload.Results[0].MS != 42 {
+			t.Fatalf("attempt %d result = %+v", attempt, payload.Results[0])
+		}
+	}
+
+	if calls := versionCalls.Load(); calls != 0 {
+		t.Fatalf("version calls = %d, want 0", calls)
+	}
+}
+
 func TestDelayEndpointClashUnavailable(t *testing.T) {
-	clash := newClashServer(t, http.StatusInternalServerError)
+	var versionCalls atomic.Int64
+	clash := httptest.NewServer(newClashHandler(http.StatusInternalServerError, &versionCalls))
+	t.Cleanup(clash.Close)
 	handler := New(Options{Clash: &probe.ClashClient{BaseURL: clash.URL}})
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/delay",
@@ -226,6 +291,65 @@ func TestDelayEndpointClashUnavailable(t *testing.T) {
 	}
 	if payload.OK || payload.Error != "clash unavailable" {
 		t.Fatalf("payload = %+v", payload)
+	}
+	if calls := versionCalls.Load(); calls != 1 {
+		t.Fatalf("version calls = %d, want 1", calls)
+	}
+}
+
+func TestDelaySlowFailuresSkipVersionFallback(t *testing.T) {
+	var versionCalls atomic.Int64
+	clash := httptest.NewServer(newSlowClashHandler(
+		http.StatusInternalServerError, 600*time.Millisecond, &versionCalls))
+	t.Cleanup(clash.Close)
+	handler := New(Options{Clash: &probe.ClashClient{BaseURL: clash.URL}})
+	recorder := httptest.NewRecorder()
+	started := time.Now()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/delay",
+		strings.NewReader(`{"tags":["vpngate-1"],"timeout_ms":100}`)))
+	elapsed := time.Since(started)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body)
+	}
+	var payload delayPayload
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !payload.OK || len(payload.Results) != 1 {
+		t.Fatalf("payload = %+v", payload)
+	}
+	result := payload.Results[0]
+	if result.Tag != "vpngate-1" || result.Alive || result.Error == nil {
+		t.Fatalf("result = %+v", result)
+	}
+	if calls := versionCalls.Load(); calls != 0 {
+		t.Fatalf("version calls = %d, want 0", calls)
+	}
+	if elapsed >= 2*time.Second {
+		t.Fatalf("elapsed = %s, want below the Python caller deadline", elapsed)
+	}
+}
+
+func TestDelayEmptyTagsStillChecksClash(t *testing.T) {
+	var versionCalls atomic.Int64
+	clash := httptest.NewServer(newClashHandler(http.StatusOK, &versionCalls))
+	t.Cleanup(clash.Close)
+	handler := New(Options{Clash: &probe.ClashClient{BaseURL: clash.URL}})
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/delay",
+		strings.NewReader(`{"tags":[]}`)))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body)
+	}
+	var payload delayPayload
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !payload.OK || len(payload.Results) != 0 {
+		t.Fatalf("payload = %+v", payload)
+	}
+	if calls := versionCalls.Load(); calls != 1 {
+		t.Fatalf("version calls = %d, want 1", calls)
 	}
 }
 

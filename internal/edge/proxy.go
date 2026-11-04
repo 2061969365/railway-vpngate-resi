@@ -17,7 +17,14 @@ import (
 	"time"
 )
 
-const copyBufferSize = 32 * 1024
+const (
+	copyBufferSize           = 32 * 1024
+	adminMaxIdleConnsPerHost = 32
+)
+
+var copyBufferPool = sync.Pool{
+	New: func() any { return make([]byte, copyBufferSize) },
+}
 
 // Proxy is the public data-plane HTTP handler.
 type Proxy struct {
@@ -54,6 +61,7 @@ func New(cfg Config, logger *log.Logger) (*Proxy, error) {
 		Proxy:                 nil,
 		DialContext:           (&net.Dialer{Timeout: cfg.DialTimeout, KeepAlive: 30 * time.Second}).DialContext,
 		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   adminMaxIdleConnsPerHost,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: time.Second,
@@ -214,7 +222,8 @@ func (p *Proxy) copyBidirectional(client net.Conn, clientReader io.Reader, clien
 }
 
 func copyStream(destination io.Writer, source io.Reader, activity *tunnelActivity) error {
-	buffer := make([]byte, copyBufferSize)
+	buffer := copyBufferPool.Get().([]byte)
+	defer copyBufferPool.Put(buffer)
 	for {
 		read, readErr := source.Read(buffer)
 		if read > 0 {

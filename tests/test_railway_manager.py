@@ -107,6 +107,28 @@ def _seed_alive_evidence(manager) -> None:
         manager._record_evidence(node, True, "198.51.100.1", 20, None)
 
 
+class _FakeDelayProbe:
+    """Minimal stand-in for ProbeClient.delays()/delay_status()."""
+
+    def __init__(self, result, status=None):
+        self.result = result
+        self.status = status
+        self.calls = []
+        self.timeouts = []
+        self.status_calls = []
+        self.status_timeouts = []
+
+    def delays(self, tags, timeout_ms=None):
+        self.calls.append(list(tags))
+        self.timeouts.append(timeout_ms)
+        return self.result
+
+    def delay_status(self, tags, timeout_ms=None):
+        self.status_calls.append(list(tags))
+        self.status_timeouts.append(timeout_ms)
+        return self.status
+
+
 def get_free_port() -> int:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.bind(("127.0.0.1", 0))
@@ -149,6 +171,8 @@ _TMP = tempfile.gettempdir()
 
 _MODULE_PATCHES = []
 
+
+_HEALTH_MONITOR_LOOP = RailwayManager._health_monitor_loop
 
 def setUpModule() -> None:
     """Keep the suite hermetic: no network, no real timers.
@@ -1211,6 +1235,49 @@ class EnvValidationTests(unittest.TestCase):
         self.assertEqual("http://127.0.0.1:39002/v1/traffic",
                          config["edge_metrics_url"])
 
+    def test_health_intervals_default_to_five_and_thirty(self) -> None:
+        config = build_config_from_env(self._env())
+
+        self.assertEqual(5, config["fast_health_interval"])
+        self.assertEqual(30, config["deep_health_interval"])
+
+    def test_health_intervals_env_override(self) -> None:
+        config = build_config_from_env(self._env(
+            FAST_HEALTH_INTERVAL="2", DEEP_HEALTH_INTERVAL="45"))
+
+        self.assertEqual(2, config["fast_health_interval"])
+        self.assertEqual(45, config["deep_health_interval"])
+
+    def test_persist_pinned_env_default_and_override(self) -> None:
+        self.assertTrue(build_config_from_env(self._env())["persist_pinned"])
+        for raw in ("0", "false", "off", "no"):
+            config = build_config_from_env(self._env(OPENVPN_PERSIST_PINNED=raw))
+            self.assertFalse(config["persist_pinned"], raw)
+
+    def test_health_grace_and_fast_timeout_defaults(self) -> None:
+        config = build_config_from_env(self._env())
+
+        self.assertEqual(20, config["chain_settle_grace"])
+        self.assertEqual(2500, config["fast_delay_timeout_ms"])
+
+    def test_health_grace_and_fast_timeout_env_override(self) -> None:
+        config = build_config_from_env(self._env(
+            CHAIN_SETTLE_GRACE="7", FAST_DELAY_TIMEOUT_MS="900"))
+
+        self.assertEqual(7, config["chain_settle_grace"])
+        self.assertEqual(900, config["fast_delay_timeout_ms"])
+
+    def test_health_grace_and_fast_timeout_clamped(self) -> None:
+        low = build_config_from_env(self._env(
+            CHAIN_SETTLE_GRACE="1", FAST_DELAY_TIMEOUT_MS="100"))
+        high = build_config_from_env(self._env(
+            CHAIN_SETTLE_GRACE="999", FAST_DELAY_TIMEOUT_MS="99999"))
+
+        self.assertEqual(5, low["chain_settle_grace"])
+        self.assertEqual(500, low["fast_delay_timeout_ms"])
+        self.assertEqual(120, high["chain_settle_grace"])
+        self.assertEqual(5000, high["fast_delay_timeout_ms"])
+
 
 class DialWorkersPlumbingTests(unittest.TestCase):
     """refresh_once must forward the configured dial concurrency."""
@@ -1667,6 +1734,71 @@ class SwitchRealLatencyTests(unittest.TestCase):
                 self.assertEqual(tag12, manager.preferred_tag)
             finally:
                 manager.stop()
+
+
+class PersistPinnedConfigTests(unittest.TestCase):
+    def _manager(self, tmpdir: str, **kwargs) -> RailwayManager:
+        defaults = dict(port=0, mixed_port=get_free_port(),
+                        start_singbox=False, auto_refresh=False,
+                        fetch_on_start=False,
+                        config_path=f"{tmpdir}/singbox.json",
+                        nodes_path=f"{tmpdir}/nodes.json",
+                        state_path=f"{tmpdir}/state.json")
+        defaults.update(kwargs)
+        return RailwayManager(**defaults)
+
+    def _seed(self, manager: RailwayManager) -> None:
+        manager._nodes = [
+            {"server": f"203.0.113.{i + 1}", "server_port": 443,
+             "endpoint": ovpn_to_endpoint(TCP_OVPN, tag=f"vpngate-{i}")}
+            for i in range(3)
+        ]
+
+    def _on_demand(self, manager: RailwayManager, **apply) -> dict:
+        with _fake_singbox(),              mock.patch.object(RailwayManager, "_restart_singbox"):
+            self.assertTrue(manager._apply_config(final="auto", **apply))
+        written = _read_json(manager.config_path)
+        json.dumps(written)
+        return {endpoint["tag"]: endpoint["on_demand"]
+                for endpoint in written["endpoints"]}
+
+    def test_pinned_and_backup_keep_their_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = self._manager(tmpdir)
+            try:
+                self._seed(manager)
+                on_demand = self._on_demand(
+                    manager, preferred="vpngate-0", backup="vpngate-1")
+            finally:
+                manager.stop()
+
+        self.assertEqual({"vpngate-0": False, "vpngate-1": False,
+                          "vpngate-2": True}, on_demand)
+
+    def test_unpinned_config_releases_every_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = self._manager(tmpdir)
+            try:
+                self._seed(manager)
+                on_demand = self._on_demand(manager)
+            finally:
+                manager.stop()
+
+        self.assertEqual({"vpngate-0": True, "vpngate-1": True,
+                          "vpngate-2": True}, on_demand)
+
+    def test_disabled_switch_leaves_every_endpoint_on_demand(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = self._manager(tmpdir, persist_pinned=False)
+            try:
+                self._seed(manager)
+                on_demand = self._on_demand(
+                    manager, preferred="vpngate-0", backup="vpngate-1")
+            finally:
+                manager.stop()
+
+        self.assertEqual({"vpngate-0": True, "vpngate-1": True,
+                          "vpngate-2": True}, on_demand)
 
 
 class ColdStartTests(unittest.TestCase):
@@ -6223,6 +6355,168 @@ class PinVerificationContractTests(unittest.TestCase):
                                         "server_port": 443}}
                           for i, (ip, hand, real) in enumerate(specs)]
 
+    def _write_endpoint_config(self, manager, persistent) -> None:
+        config = {"endpoints": [
+            {"tag": f"vpngate-{i}",
+             "on_demand": f"vpngate-{i}" not in persistent}
+            for i in range(len(manager._nodes))]}
+        with open(manager.config_path, "w", encoding="utf-8") as handle:
+            json.dump(config, handle, indent=2)
+            handle.write("\n")
+
+    def _config_flags(self, manager) -> dict:
+        with open(manager.config_path, encoding="utf-8") as handle:
+            config = json.load(handle)
+        return {ep["tag"]: ep["on_demand"] for ep in config["endpoints"]}
+
+    def test_reconcile_persistent_tags_rewrites_only_on_demand_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = self._manager(tmpdir, start_singbox=False)
+            try:
+                self._seed_nodes(manager, ("203.0.113.11", 100, 20),
+                                 ("203.0.113.12", 200, 30),
+                                 ("203.0.113.13", 300, 40))
+                self._write_endpoint_config(manager, ["vpngate-0"])
+                manager.preferred_tag = "vpngate-1"
+                manager.backup_tag = "vpngate-2"
+                with mock.patch.object(
+                        manager, "_restart_singbox",
+                        side_effect=AssertionError("must not restart")):
+                    ok = manager._reconcile_persistent_tags()
+                flags = self._config_flags(manager)
+                with open(manager.last_good_path, encoding="utf-8") as handle:
+                    last_good = json.load(handle)
+            finally:
+                manager.stop()
+
+        self.assertTrue(ok)
+        self.assertEqual({"vpngate-0": True, "vpngate-1": False,
+                          "vpngate-2": False}, flags)
+        self.assertEqual(flags, {ep["tag"]: ep["on_demand"]
+                                 for ep in last_good["endpoints"]})
+
+    def test_hot_manual_switch_reconciles_persistent_flags_without_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = self._manager(tmpdir, start_singbox=False)
+            try:
+                self._seed_nodes(manager, ("203.0.113.11", 100, 20),
+                                 ("203.0.113.12", 200, 30),
+                                 ("203.0.113.13", 300, 40))
+                self._write_endpoint_config(manager, ["vpngate-0"])
+                manager._deep_fail_pending = True
+                with mock.patch.object(manager, "_repin_runtime",
+                                       return_value=True), \
+                     mock.patch.object(
+                         manager, "_apply_config",
+                         side_effect=AssertionError("hot switch must not rewrite")), \
+                     mock.patch.object(
+                         manager, "_restart_singbox",
+                         side_effect=AssertionError("hot switch must not restart")):
+                    ok, effective = manager.switch(tag="vpngate-1")
+                flags = self._config_flags(manager)
+                pin = manager.preferred_tag
+                pending = manager._deep_fail_pending
+            finally:
+                manager.stop()
+
+        self.assertTrue(ok)
+        self.assertEqual("chain", effective)
+        self.assertEqual("vpngate-1", pin)
+        self.assertFalse(pending)
+        self.assertEqual({"vpngate-0": True, "vpngate-1": False,
+                          "vpngate-2": True}, flags)
+
+    def test_hot_chain_rescue_reconciles_persistent_flags_without_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = self._manager(tmpdir, start_singbox=False)
+            try:
+                self._seed_nodes(manager, ("203.0.113.11", 100, 20),
+                                 ("203.0.113.12", 200, 30))
+                manager.preferred_tag = "vpngate-0"
+                manager.status["preferred_tag"] = "vpngate-0"
+                manager._chain_pin_at = time.monotonic() - 3600.0
+                manager.probe = None
+                manager.auto_rescue = True
+                self._write_endpoint_config(manager, ["vpngate-0"])
+                manager._deep_fail_pending = True
+                with mock.patch.object(manager, "_repin_runtime",
+                                       return_value=True), \
+                     mock.patch.object(
+                         manager, "_apply_config",
+                         side_effect=AssertionError("hot rescue must not rewrite")):
+                    result = manager._rescue_chain_impl(
+                        "test", manager._rescue_round)
+                flags = self._config_flags(manager)
+                pin = manager.preferred_tag
+                pending = manager._deep_fail_pending
+            finally:
+                manager.stop()
+
+        self.assertEqual("rescued", result)
+        self.assertEqual("vpngate-1", pin)
+        self.assertFalse(pending)
+        self.assertEqual({"vpngate-0": True, "vpngate-1": False}, flags)
+
+    def test_fast_delay_cannot_erase_a_pending_deep_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = self._manager(tmpdir, start_singbox=False)
+            try:
+                self._seed_nodes(manager, ("203.0.113.11", 100, 20))
+                manager.preferred_tag = "vpngate-0"
+                manager.status["preferred_tag"] = "vpngate-0"
+                manager._chain_pin_at = time.monotonic() - 3600.0
+                manager._last_deep_chain_probe = time.monotonic()
+                manager.probe = _FakeDelayProbe({"vpngate-0": 25})
+                seen: list[int] = []
+
+                def _deep():
+                    seen.append(manager._chain_fail_streak)
+                    return False if len(seen) == 1 else None
+
+                with mock.patch("railway_manager.probe_tcp_latency",
+                                return_value=100), \
+                     mock.patch.object(manager, "_chain_probe_ok",
+                                       side_effect=_deep):
+                    first = manager.check_pinned_health()
+                    pending = manager._deep_fail_pending
+                    second = manager.check_fast_health()
+                    pending_after = manager._deep_fail_pending
+                streak = manager._chain_fail_streak
+            finally:
+                manager.stop()
+
+        self.assertEqual("pinned", first)
+        self.assertEqual("pinned", second)
+        self.assertEqual([0, 1], seen,
+                         "the fast delay must not reset the failed deep streak")
+        self.assertTrue(pending)
+        self.assertTrue(pending_after)
+        self.assertEqual(1, streak)
+
+    def test_successful_deep_probe_clears_pending_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = self._manager(tmpdir, start_singbox=False)
+            try:
+                self._seed_nodes(manager, ("203.0.113.11", 100, 20))
+                manager.preferred_tag = "vpngate-0"
+                manager.status["preferred_tag"] = "vpngate-0"
+                manager._chain_pin_at = time.monotonic() - 3600.0
+                manager._deep_fail_pending = True
+                before = manager._last_deep_chain_probe
+                with mock.patch("railway_manager.probe_tcp_latency",
+                                return_value=100), \
+                     mock.patch.object(manager, "_chain_probe_ok",
+                                       return_value=True):
+                    result = manager.check_pinned_health()
+                pending = manager._deep_fail_pending
+                after = manager._last_deep_chain_probe
+            finally:
+                manager.stop()
+
+        self.assertEqual("pinned", result)
+        self.assertFalse(pending)
+        self.assertGreater(after, before)
+
     def test_switch_from_unpinned_commits_after_served_exit(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             manager = self._manager(tmpdir)
@@ -6305,6 +6599,132 @@ class PinVerificationContractTests(unittest.TestCase):
         self.assertIn("chain-rescue-skipped", events)
         self.assertNotIn("auto-rescue-stale", events)
 
+    def test_rescue_skips_only_delay_dead_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = self._manager(tmpdir, start_singbox=False)
+            try:
+                self._seed_nodes(manager, ("203.0.113.11", 100, 20),
+                                 ("203.0.113.12", 200, 30),
+                                 ("203.0.113.13", 300, 40))
+                manager.preferred_tag = "vpngate-0"
+                manager.status["preferred_tag"] = "vpngate-0"
+                manager._auto_pinned = True
+                manager._chain_pin_at = time.monotonic() - 3600.0
+                probe = _FakeDelayProbe(
+                    {"vpngate-0": 25},
+                    status={"vpngate-1": False, "vpngate-2": True})
+                manager.probe = probe
+                applied: list[str] = []
+                with mock.patch.object(
+                        manager, "_apply_config",
+                        side_effect=lambda **kw: applied.append(
+                            kw["preferred"]) or True):
+                    with mock.patch.object(
+                            manager, "_trigger_bg_refresh") as refresh:
+                        result = manager._rescue_chain_impl(
+                            "test", manager._rescue_round)
+            finally:
+                manager.stop()
+
+        self.assertEqual("rescued", result)
+        self.assertEqual("vpngate-2", manager.preferred_tag)
+        self.assertEqual(["vpngate-2"], applied)
+        self.assertEqual([["vpngate-1", "vpngate-2"]], probe.status_calls)
+        self.assertEqual([manager._fast_delay_timeout_ms],
+                         probe.status_timeouts)
+        refresh.assert_not_called()
+
+    def test_rescue_all_delay_dead_keeps_pin_and_refreshes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = self._manager(tmpdir, start_singbox=False)
+            try:
+                self._seed_nodes(manager, ("203.0.113.11", 100, 20),
+                                 ("203.0.113.12", 200, 30),
+                                 ("203.0.113.13", 300, 40))
+                manager.preferred_tag = "vpngate-0"
+                manager.status["preferred_tag"] = "vpngate-0"
+                manager._auto_pinned = True
+                manager._chain_pin_at = time.monotonic() - 3600.0
+                probe = _FakeDelayProbe(
+                    {"vpngate-0": 25},
+                    status={"vpngate-1": False, "vpngate-2": False})
+                manager.probe = probe
+                with mock.patch.object(manager, "_apply_config") as apply_config:
+                    with mock.patch.object(
+                            manager, "_trigger_bg_refresh") as refresh:
+                        result = manager._rescue_chain_impl(
+                            "test", manager._rescue_round)
+                dead = dict(manager._chain_dead_until)
+                history = list(manager.status["refresh_history"])
+            finally:
+                manager.stop()
+
+        self.assertEqual("pinned", result)
+        self.assertEqual("vpngate-0", manager.preferred_tag)
+        apply_config.assert_not_called()
+        refresh.assert_called_once_with("test: no delay-alive candidate")
+        skipped = [e for e in history
+                   if e["event"] == "chain-rescue-skipped"]
+        self.assertEqual("test: all candidates delay-dead",
+                         skipped[-1]["detail"])
+        self.assertNotIn("vpngate-1", dead)
+        self.assertNotIn("vpngate-2", dead)
+
+    def test_rescue_with_unknown_delay_status_uses_existing_flow(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = self._manager(tmpdir, start_singbox=False)
+            try:
+                self._seed_nodes(manager, ("203.0.113.11", 100, 20),
+                                 ("203.0.113.12", 200, 30),
+                                 ("203.0.113.13", 300, 40))
+                manager.preferred_tag = "vpngate-0"
+                manager.status["preferred_tag"] = "vpngate-0"
+                manager._auto_pinned = True
+                manager._chain_pin_at = time.monotonic() - 3600.0
+                probe = _FakeDelayProbe({"vpngate-0": 25}, status=None)
+                manager.probe = probe
+                applied: list[str] = []
+                with mock.patch.object(
+                        manager, "_apply_config",
+                        side_effect=lambda **kw: applied.append(
+                            kw["preferred"]) or True):
+                    result = manager._rescue_chain_impl(
+                        "test", manager._rescue_round)
+            finally:
+                manager.stop()
+
+        self.assertEqual("rescued", result)
+        self.assertEqual(["vpngate-1"], applied)
+        self.assertEqual([["vpngate-1", "vpngate-2"]], probe.status_calls)
+
+    def test_rescue_tries_a_candidate_missing_from_delay_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = self._manager(tmpdir, start_singbox=False)
+            try:
+                self._seed_nodes(manager, ("203.0.113.11", 100, 20),
+                                 ("203.0.113.12", 200, 30),
+                                 ("203.0.113.13", 300, 40))
+                manager.preferred_tag = "vpngate-0"
+                manager.status["preferred_tag"] = "vpngate-0"
+                manager._auto_pinned = True
+                manager._chain_pin_at = time.monotonic() - 3600.0
+                probe = _FakeDelayProbe(
+                    {"vpngate-0": 25}, status={"vpngate-2": True})
+                manager.probe = probe
+                applied: list[str] = []
+                with mock.patch.object(
+                        manager, "_apply_config",
+                        side_effect=lambda **kw: applied.append(
+                            kw["preferred"]) or True):
+                    result = manager._rescue_chain_impl(
+                        "test", manager._rescue_round)
+            finally:
+                manager.stop()
+
+        self.assertEqual("rescued", result)
+        self.assertEqual(["vpngate-1"], applied)
+        self.assertNotIn("vpngate-1", probe.status)
+
     def test_unknown_chain_probe_does_not_increment_death_streaks(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             manager = self._manager(tmpdir)
@@ -6325,6 +6745,248 @@ class PinVerificationContractTests(unittest.TestCase):
         self.assertEqual(["pinned"] * 3, results)
         self.assertEqual(0, chain_streak)
         self.assertEqual(0, pin_streak)
+
+    def test_fast_health_uses_delay_without_the_exit_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = self._manager(tmpdir, start_singbox=False)
+            try:
+                self._seed_nodes(manager, ("203.0.113.11", 100, 20))
+                manager.preferred_tag = "vpngate-0"
+                manager.status["preferred_tag"] = "vpngate-0"
+                manager._chain_pin_at = time.monotonic() - 3600.0
+                manager._last_deep_chain_probe = time.monotonic()
+                manager.probe = _FakeDelayProbe({"vpngate-0": 25})
+                with mock.patch.object(
+                        manager, "_chain_probe_ok",
+                        side_effect=AssertionError("deep exit probe is not due")):
+                    result = manager.check_fast_health()
+                streak = manager._chain_fail_streak
+                calls = list(manager.probe.calls)
+            finally:
+                manager.stop()
+
+        self.assertEqual("pinned", result)
+        self.assertEqual(0, streak)
+        self.assertEqual([["vpngate-0"]], calls)
+
+    def test_constructor_clamps_health_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            low = self._manager(tmpdir, start_singbox=False,
+                                chain_settle_grace=1,
+                                fast_delay_timeout_ms=100)
+            high = self._manager(tmpdir, start_singbox=False,
+                                 chain_settle_grace=999,
+                                 fast_delay_timeout_ms=99999)
+            try:
+                self.assertEqual(5.0, low._chain_settle_grace)
+                self.assertEqual(500, low._fast_delay_timeout_ms)
+                self.assertEqual(120.0, high._chain_settle_grace)
+                self.assertEqual(5000, high._fast_delay_timeout_ms)
+            finally:
+                low.stop()
+                high.stop()
+
+    def test_fast_health_passes_the_configured_delay_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = self._manager(tmpdir, start_singbox=False,
+                                    fast_delay_timeout_ms=750)
+            try:
+                self._seed_nodes(manager, ("203.0.113.11", 100, 20))
+                manager.preferred_tag = "vpngate-0"
+                manager.status["preferred_tag"] = "vpngate-0"
+                manager._chain_pin_at = time.monotonic() - 3600.0
+                manager._last_deep_chain_probe = time.monotonic()
+                manager.probe = _FakeDelayProbe({"vpngate-0": 25})
+                result = manager.check_fast_health()
+                timeouts = list(manager.probe.timeouts)
+            finally:
+                manager.stop()
+
+        self.assertEqual("pinned", result)
+        self.assertEqual([750], timeouts)
+
+    def test_configured_settle_grace_defers_judging_a_new_pin(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = self._manager(tmpdir, start_singbox=False,
+                                    chain_settle_grace=5)
+            try:
+                self._seed_nodes(manager, ("203.0.113.11", 100, 20))
+                manager.preferred_tag = "vpngate-0"
+                manager.status["preferred_tag"] = "vpngate-0"
+                manager._chain_pin_at = time.monotonic()
+                with mock.patch("railway_manager.probe_tcp_latency",
+                                return_value=100),\
+                     mock.patch.object(manager, "_chain_probe_ok",
+                                       return_value=False):
+                    warm = manager.check_pinned_health()
+                    warm_streak = manager._chain_fail_streak
+                    manager._chain_pin_at = time.monotonic() - 6.0
+                    settled = manager.check_pinned_health()
+                    settled_streak = manager._chain_fail_streak
+            finally:
+                manager.stop()
+
+        self.assertEqual("pinned", warm)
+        self.assertEqual(0, warm_streak)
+        self.assertEqual("pinned", settled)
+        self.assertEqual(1, settled_streak)
+
+    def test_health_loop_is_fixed_rate_and_skips_overrun_ticks(self) -> None:
+        class _ClockStop:
+            def __init__(self):
+                self.now = 0.0
+                self.waits = []
+            def is_set(self):
+                return False
+            def monotonic(self):
+                return self.now
+            def wait(self, timeout):
+                self.waits.append(timeout)
+                self.now += timeout
+                return len(self.waits) >= 3
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = self._manager(tmpdir, start_singbox=False)
+            clock = _ClockStop()
+            checks = []
+
+            def _check():
+                checks.append(clock.now)
+                clock.now = 5.5 if len(checks) == 1 else 19.0
+
+            manager.probe = object()
+            manager._fast_health_interval = 5
+            manager._stop_event = clock
+            with mock.patch.object(manager, "check_fast_health",
+                                   side_effect=_check),\
+                 mock.patch("railway_manager.time.monotonic",
+                            side_effect=clock.monotonic):
+                _HEALTH_MONITOR_LOOP(manager)
+
+        self.assertEqual([5.0, 4.5, 5.0], clock.waits)
+        self.assertEqual([5.0, 10.0], checks)
+
+    def test_health_loop_uses_slow_interval_without_a_probe(self) -> None:
+        class _StopAtFirstWait:
+            def __init__(self):
+                self.waits = []
+            def is_set(self):
+                return False
+            def wait(self, timeout):
+                self.waits.append(timeout)
+                return True
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = self._manager(tmpdir, start_singbox=False)
+            stop = _StopAtFirstWait()
+            manager.probe = None
+            manager._health_check_interval = 20
+            manager._stop_event = stop
+            with mock.patch("railway_manager.time.monotonic", return_value=0.0):
+                _HEALTH_MONITOR_LOOP(manager)
+
+        self.assertEqual([20], stop.waits)
+
+    def test_fast_health_confirms_a_dead_delay_with_the_exit_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = self._manager(tmpdir, start_singbox=False)
+            try:
+                self._seed_nodes(manager, ("203.0.113.11", 100, 20))
+                manager.preferred_tag = "vpngate-0"
+                manager.status["preferred_tag"] = "vpngate-0"
+                manager._chain_pin_at = time.monotonic() - 3600.0
+                manager._last_deep_chain_probe = time.monotonic()
+                manager.probe = _FakeDelayProbe({})
+                with mock.patch("railway_manager.probe_tcp_latency",
+                                return_value=100), \
+                     mock.patch.object(manager, "_chain_probe_ok",
+                                       return_value=False) as deep:
+                    result = manager.check_fast_health()
+                streak = manager._chain_fail_streak
+                deep_calls = deep.call_count
+            finally:
+                manager.stop()
+
+        self.assertEqual("pinned", result)
+        self.assertEqual(1, streak)
+        self.assertEqual(1, deep_calls)
+
+    def test_fast_health_falls_back_when_delay_has_no_answer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = self._manager(tmpdir, start_singbox=False)
+            try:
+                self._seed_nodes(manager, ("203.0.113.11", 100, 20))
+                manager.preferred_tag = "vpngate-0"
+                manager.status["preferred_tag"] = "vpngate-0"
+                manager._chain_pin_at = time.monotonic() - 3600.0
+                manager._last_deep_chain_probe = (
+                    time.monotonic() - manager._deep_health_interval - 1.0)
+                manager.probe = _FakeDelayProbe(None)
+                with mock.patch("railway_manager.probe_tcp_latency",
+                                return_value=100), \
+                     mock.patch.object(manager, "_chain_probe_ok",
+                                       return_value=True) as deep:
+                    result = manager.check_fast_health()
+                deep_calls = deep.call_count
+            finally:
+                manager.stop()
+
+        self.assertEqual("pinned", result)
+        self.assertEqual(1, deep_calls)
+
+    def test_fast_health_does_not_reset_a_pin_that_switched_mid_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = self._manager(tmpdir, start_singbox=False)
+            try:
+                self._seed_nodes(manager, ("203.0.113.11", 100, 20),
+                                 ("203.0.113.12", 200, 30))
+                manager.preferred_tag = "vpngate-0"
+                manager.status["preferred_tag"] = "vpngate-0"
+                manager._chain_pin_at = time.monotonic() - 3600.0
+                manager._last_deep_chain_probe = time.monotonic()
+                manager._pinned_fail_streak = 2
+                probe = _FakeDelayProbe({"vpngate-0": 25})
+                base_delays = probe.delays
+
+                def _delays(tags, timeout_ms=None):
+                    result = base_delays(tags, timeout_ms=timeout_ms)
+                    manager.preferred_tag = "vpngate-1"
+                    return result
+
+                probe.delays = _delays
+                manager.probe = probe
+                result = manager.check_fast_health()
+                streak = manager._pinned_fail_streak
+            finally:
+                manager.stop()
+
+        self.assertEqual("pinned", result)
+        self.assertEqual(2, streak)
+
+    def test_fast_health_still_runs_the_deep_exit_probe_on_schedule(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = self._manager(tmpdir, start_singbox=False)
+            try:
+                self._seed_nodes(manager, ("203.0.113.11", 100, 20))
+                manager.preferred_tag = "vpngate-0"
+                manager.status["preferred_tag"] = "vpngate-0"
+                manager._chain_pin_at = time.monotonic() - 3600.0
+                manager._last_deep_chain_probe = (
+                    time.monotonic() - manager._deep_health_interval - 1.0)
+                manager.probe = _FakeDelayProbe({"vpngate-0": 25})
+                with mock.patch("railway_manager.probe_tcp_latency",
+                                return_value=100), \
+                     mock.patch.object(manager, "_chain_probe_ok",
+                                       return_value=True) as deep:
+                    result = manager.check_fast_health()
+                deep_calls = deep.call_count
+                deep_stamp = manager._last_deep_chain_probe
+            finally:
+                manager.stop()
+
+        self.assertEqual("pinned", result)
+        self.assertEqual(1, deep_calls)
+        self.assertGreater(deep_stamp, time.monotonic() - 60.0)
 
     def test_switch_rejects_a_dead_node_and_rolls_back(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

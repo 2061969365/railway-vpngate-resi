@@ -17,7 +17,13 @@ import (
 // liveness check.
 const DefaultDelayURL = "https://www.gstatic.com/generate_204"
 
-const maxClashBody = 64 << 10
+const (
+	maxClashBody = 64 << 10
+	// delayContextMarginMS must stay below the Python caller's fixed 2s
+	// transport margin (timeout_ms/1000 + 2.0). Keeping 500ms of that margin
+	// in reserve leaves room for the response to reach the caller.
+	delayContextMarginMS = 1500
+)
 
 // DelayResult is one Clash API delay probe result. MS and Error are pointers
 // so the JSON contract can spell an explicit null.
@@ -112,7 +118,7 @@ func (c *ClashClient) delay(ctx context.Context, tag, probeURL string, timeoutMS
 	if tag == "" {
 		return failureResult(tag, "empty tag")
 	}
-	ctx, cancel := context.WithTimeout(ctx, time.Duration(timeoutMS+2000)*time.Millisecond)
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(timeoutMS+delayContextMarginMS)*time.Millisecond)
 	defer cancel()
 
 	path := "/proxies/" + url.PathEscape(tag) + "/delay?url=" + url.QueryEscape(probeURL) + "&timeout=" + strconv.Itoa(timeoutMS)

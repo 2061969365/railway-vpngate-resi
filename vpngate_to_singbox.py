@@ -196,6 +196,7 @@ def ovpn_to_endpoint(
     tag: str,
     username: str = DEFAULT_USERNAME,
     password: str = DEFAULT_PASSWORD,
+    on_demand: bool = True,
 ) -> dict:
     """Convert one OpenVPN client config (TCP) to a sing-box openvpn-client endpoint."""
     if not config_text or not config_text.strip():
@@ -276,7 +277,13 @@ def ovpn_to_endpoint(
         # and a fresh client could only get in on half of them). Needs
         # sing-box >= 1.15 (the field does not exist in 1.14); the image
         # pins the version and the CI checks the config with it.
-        "on_demand": True,
+        #
+        # Pinned/backup tags deliberately keep their session
+        # (on_demand=False) so an idle gap does not release the served
+        # chain; every other endpoint still releases when unused. This is
+        # duplicate-cn-safe because the same tag only ever reuses its own
+        # session - the manager never opens a second dial for that node.
+        "on_demand": on_demand,
         # The keepalive comes from the .ovpn itself (see _keepalive_fields,
         # which falls back to 10s/60s). It is deliberately NOT overridden
         # here: the server-pushed values win, and they are the ones the
@@ -1411,6 +1418,7 @@ def build_singbox_config(
     resi_rotate_tags: list[str] | None = None,
     chain_candidates: list[str] | None = None,
     clash_api: dict | None = None,
+    persistent_tags: list[str] | None = None,
 ) -> dict:
     """Wrap endpoints in a minimal checkable sing-box config.
 
@@ -1462,7 +1470,24 @@ def build_singbox_config(
     connection, so successive connections leave through different nodes.
     resi_rotate_tags narrows that set (and fixes its order) to the nodes the
     manager decided to rotate over; None means all endpoints in given order.
+
+    ``persistent_tags`` names endpoints that must hold their OpenVPN session
+    while idle (the pinned/backup part of the chain): those endpoints are
+    emitted with ``on_demand=False``. Every other endpoint keeps its existing
+    value (default ``True`` when absent), so an unknown tag changes nothing and
+    the session is still released as before. None/empty leaves the endpoints
+    untouched. Persistence is keyed by the same endpoint tag and therefore
+    duplicate-cn-safe: it only ever reuses that tag's own session, never a
+    second dial.
     """
+    persistent = set(persistent_tags or ())
+    if persistent:
+        endpoints = [
+            {**endpoint, "on_demand": False
+             if endpoint["tag"] in persistent
+             else endpoint.get("on_demand", True)}
+            for endpoint in endpoints
+        ]
     tags = [ep["tag"] for ep in endpoints]
     if preferred is not None and preferred not in tags:
         preferred = None

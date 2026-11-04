@@ -686,3 +686,23 @@ func TestNewRejectsInvalidAdminURL(t *testing.T) {
 		}
 	}
 }
+
+func TestAdminTransportKeepsIdleConnections(t *testing.T) {
+	admin, _, _ := startAdmin(t)
+	proxy, _ := newTestProxy(t, testConfig(admin.URL, "127.0.0.1:1", "127.0.0.1:2", "uuid"))
+	transport, ok := proxy.reverse.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("admin transport is %T, want *http.Transport", proxy.reverse.Transport)
+	}
+	if transport.MaxIdleConnsPerHost != adminMaxIdleConnsPerHost {
+		t.Fatalf("MaxIdleConnsPerHost = %d, want %d", transport.MaxIdleConnsPerHost, adminMaxIdleConnsPerHost)
+	}
+}
+
+func TestCopyBufferPoolProvidesFullBuffers(t *testing.T) {
+	buffer := copyBufferPool.Get().([]byte)
+	if len(buffer) != copyBufferSize {
+		t.Fatalf("pooled buffer len = %d, want %d", len(buffer), copyBufferSize)
+	}
+	copyBufferPool.Put(buffer)
+}
