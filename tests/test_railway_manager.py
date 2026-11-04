@@ -1,6 +1,7 @@
 """Tests for railway_manager ($PORT multiplexer + sing-box supervisor)."""
 import base64
 import contextlib
+import http.server
 import inspect
 import io
 import json
@@ -32,6 +33,31 @@ def _fake_singbox():
     with mock.patch("railway_manager.subprocess.Popen"), \
          mock.patch.object(RailwayManager, "_check_config", return_value=True):
         yield
+
+
+@contextlib.contextmanager
+def _edge_metrics_server(body: bytes):
+    """Tiny loopback HTTP server serving the edge /v1/traffic payload."""
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args) -> None:
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}/v1/traffic"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
 
 
 def _settle_probes(manager) -> None:
@@ -1128,6 +1154,37 @@ class EnvValidationTests(unittest.TestCase):
 
         self.assertEqual("/custom", config["data_dir"])
 
+    def test_admin_port_binds_instead_of_public_port(self) -> None:
+        config = build_config_from_env(self._env(PORT="5000", ADMIN_PORT="3001"))
+
+        self.assertEqual(3001, config["port"])
+        self.assertEqual("127.0.0.1", config["bind_host"])
+        self.assertEqual("", config["edge_metrics_url"])
+
+    def test_default_bind_host_is_all_interfaces(self) -> None:
+        config = build_config_from_env(self._env())
+
+        self.assertEqual("0.0.0.0", config["bind_host"])
+
+    def test_admin_port_suppresses_non_3000_port_warning(self) -> None:
+        with mock.patch("builtins.print") as printed:
+            build_config_from_env(self._env(PORT="5000", ADMIN_PORT="3001"))
+
+        self.assertFalse(any("not 3000" in str(call.args)
+                             for call in printed.call_args_list))
+
+    def test_admin_port_collision_refused(self) -> None:
+        for bad in ("8080", "8081", "8082", "4096", "40000"):
+            with self.assertRaises(SystemExit, msg="ADMIN_PORT=" + bad):
+                build_config_from_env(self._env(ADMIN_PORT=bad))
+
+    def test_edge_metrics_url_passthrough(self) -> None:
+        config = build_config_from_env(self._env(
+            EDGE_METRICS_URL="http://127.0.0.1:39002/v1/traffic"))
+
+        self.assertEqual("http://127.0.0.1:39002/v1/traffic",
+                         config["edge_metrics_url"])
+
 
 class DialWorkersPlumbingTests(unittest.TestCase):
     """refresh_once must forward the configured dial concurrency."""
@@ -1383,22 +1440,20 @@ class PinnedHealthTests(unittest.TestCase):
                     by_server["203.0.113.13"]["real_latency_ms"] = 50
 
                     failing = lambda host, port, timeout=5: 0
-                    # Dead tunnel: the first failed dial fast-rescues
-                    # immediately (no 3-strike wait). The rescue path
-                    # commits under the round-scoped guard, so a manual
-                    # pin with no mid-round switch is rescued (operator
-                    # can see auto-rescue in history and switch back);
-                    # only a switch AFTER the round started wins.
+                    # Handshake death needs PINNED_FAIL_THRESHOLD strikes; the
+                    # candidate then has to verify through the served chain.
                     with mock.patch.object(manager, "dial_fn",
-                                           return_value=None):
-                        self.assertEqual("rescued", manager.check_pinned_health(probe_fn=failing))
+                                           return_value=None),                          mock.patch.object(manager, "_chain_probe_ok",
+                                           return_value=None),                          mock.patch.object(manager, "_served_exit_probe",
+                                           return_value=("9.9.9.9", 20, True)):
+                        states = [manager.check_pinned_health(probe_fn=failing)
+                                  for _ in range(3)]
 
                 self.assertEqual("vpngate-1", manager.preferred_tag)
                 self.assertTrue(manager._auto_pinned)
+                self.assertEqual(["pinned", "pinned", "rescued"], states)
                 events = [e["event"] for e in manager.status["refresh_history"]]
-                # No candidate had a fresh proof, so the rescue is
-                # recorded as auto-rescue-stale: still a rescue.
-                self.assertTrue(any(e.startswith("auto-rescue")
+                self.assertTrue(any(e.startswith("chain-rescue")
                                     for e in events))
             finally:
                 manager.stop()
@@ -1430,9 +1485,13 @@ class PinnedHealthTests(unittest.TestCase):
 
                     failing = lambda host, port, timeout=5: 0
                     with mock.patch.object(manager, "dial_fn",
-                                           return_value=None):
-                        self.assertEqual("rescued", manager.check_pinned_health(probe_fn=failing))
+                                           return_value=None),                          mock.patch.object(manager, "_chain_probe_ok",
+                                           return_value=None),                          mock.patch.object(manager, "_served_exit_probe",
+                                           return_value=("9.9.9.9", 20, True)):
+                        states = [manager.check_pinned_health(probe_fn=failing)
+                                  for _ in range(3)]
 
+                self.assertEqual(["pinned", "pinned", "rescued"], states)
                 self.assertEqual("vpngate-1", manager.preferred_tag)
                 # One reserved node: the chain fails over through a Clash API
                 # hot switch, so no standby is taken from the rotation.
@@ -1442,9 +1501,7 @@ class PinnedHealthTests(unittest.TestCase):
                 chain = next(o for o in written["outbounds"] if o["tag"] == "chain")
                 self.assertEqual(["vpngate-1", "auto"], chain["outbounds"])
                 events = [e["event"] for e in manager.status["refresh_history"]]
-                # "auto-rescue-stale" when no candidate had a fresh verify:
-                # the rescue still happens, it is just based on stale data.
-                self.assertTrue([e for e in events if e.startswith("auto-rescue")])
+                self.assertTrue([e for e in events if e.startswith("chain-rescue")])
             finally:
                 manager.stop()
 
@@ -1662,6 +1719,116 @@ class ColdStartTests(unittest.TestCase):
                 manager._initial_refresh()
             self.assertFalse(manager._serving_ok())
             self.assertEqual([], manager.status["endpoints"])
+
+
+    def test_boot_from_last_good_restores_rotate_routes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = self._paths(tmpdir)
+            seed = RailwayManager(
+                port=0, mixed_port=get_free_port(),
+                start_singbox=False, auto_refresh=False, fetch_on_start=False,
+                **paths)
+            nodes = snapshot_to_nodes(
+                _snapshot_csv("203.0.113.21", "203.0.113.22"), probe=False)
+            for node in nodes:
+                node["real_latency_ms"] = 50
+            seed._nodes = nodes
+            seed._persist_nodes()
+            endpoints = nodes_to_endpoints(nodes)
+            with open(seed.last_good_path, "w", encoding="utf-8") as handle:
+                json.dump(build_singbox_config(endpoints, "127.0.0.1",
+                                              seed.mixed_port), handle)
+
+            manager = RailwayManager(
+                port=0, mixed_port=get_free_port(), resi_rotate=True,
+                vless_uuid="u-u-i-d", start_singbox=False,
+                auto_refresh=False, fetch_on_start=False, **paths)
+            try:
+                self.assertTrue(manager._boot_from_last_good())
+                expected = manager._rotate_routes(manager._ordered_serving())
+                routes = list(manager._resi_routes)
+                pool = manager._resi_pool()
+                status = manager.status_snapshot()
+            finally:
+                manager.stop()
+
+        self.assertEqual(2, len(expected))
+        self.assertEqual(expected, routes)
+        self.assertEqual(expected, pool)
+        self.assertTrue(any(e["tag"] == "vpngate-0"
+                            for e in status["endpoints"]))
+        self.assertEqual(len(expected), status["resi"]["inbounds"])
+class BindHostTests(unittest.TestCase):
+    def test_start_binds_loopback_when_configured(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = RailwayManager(
+                port=0, mixed_port=get_free_port(), start_singbox=False,
+                auto_refresh=False, fetch_on_start=False,
+                bind_host="127.0.0.1",
+                config_path=f"{tmpdir}/singbox.json",
+                nodes_path=f"{tmpdir}/nodes.json",
+                state_path=f"{tmpdir}/state.json")
+            try:
+                manager.start()
+                bound_host = manager._listener.getsockname()[0]
+            finally:
+                manager.stop()
+
+        self.assertEqual("127.0.0.1", bound_host)
+
+
+class EdgeMetricsStatusTests(unittest.TestCase):
+    def _manager(self, tmpdir: str, url: str) -> RailwayManager:
+        return RailwayManager(
+            port=0, mixed_port=get_free_port(), start_singbox=False,
+            auto_refresh=False, fetch_on_start=False, edge_metrics_url=url,
+            config_path=f"{tmpdir}/singbox.json",
+            nodes_path=f"{tmpdir}/nodes.json",
+            state_path=f"{tmpdir}/state.json")
+
+    def test_status_snapshot_adds_edge_bytes_without_mutating_status(self) -> None:
+        body = json.dumps({"ok": True, "bytes_up": 100, "bytes_down": 200,
+                           "connections": 3}).encode()
+        with _edge_metrics_server(body) as url,              tempfile.TemporaryDirectory() as tmpdir:
+            manager = self._manager(tmpdir, url)
+            try:
+                self.assertEqual(url, manager.edge_metrics_url)
+                manager.status["traffic"] = {"connections": 2,
+                                             "bytes_up": 10, "bytes_down": 20}
+                snapshot = manager.status_snapshot()
+                self.assertEqual(110, snapshot["traffic"]["bytes_up"])
+                self.assertEqual(220, snapshot["traffic"]["bytes_down"])
+                self.assertEqual(2, snapshot["traffic"]["connections"])
+                self.assertEqual(10, manager.status["traffic"]["bytes_up"])
+                self.assertEqual(20, manager.status["traffic"]["bytes_down"])
+            finally:
+                manager.stop()
+
+    def test_unreachable_edge_metrics_fails_open(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = self._manager(tmpdir,
+                                    "http://127.0.0.1:1/v1/traffic")
+            try:
+                manager.status["traffic"] = {"connections": 1,
+                                             "bytes_up": 7, "bytes_down": 9}
+                snapshot = manager.status_snapshot()
+                self.assertEqual(7, snapshot["traffic"]["bytes_up"])
+                self.assertEqual(9, snapshot["traffic"]["bytes_down"])
+                self.assertEqual(7, manager.status["traffic"]["bytes_up"])
+            finally:
+                manager.stop()
+
+    def test_malformed_edge_metrics_fails_open(self) -> None:
+        with _edge_metrics_server(b"not-json") as url,              tempfile.TemporaryDirectory() as tmpdir:
+            manager = self._manager(tmpdir, url)
+            try:
+                manager.status["traffic"] = {"connections": 1,
+                                             "bytes_up": 7, "bytes_down": 9}
+                snapshot = manager.status_snapshot()
+                self.assertEqual(7, snapshot["traffic"]["bytes_up"])
+                self.assertEqual(9, snapshot["traffic"]["bytes_down"])
+            finally:
+                manager.stop()
 
 
 class TunnelTests(unittest.TestCase):
@@ -2356,6 +2523,25 @@ class StableTagTests(unittest.TestCase):
         self.assertEqual("vpngate-1", by_server["203.0.113.12"])
         self.assertTrue(by_server["203.0.113.13"].startswith("vpngate-"))
         self.assertEqual(3, len(set(by_server.values())))
+
+    def test_new_fast_node_inserted_first_cannot_steal_an_old_tag(self) -> None:
+        from railway_manager import assign_stable_tags
+
+        def node(server, tag=""):
+            return {"server": server, "server_port": 443,
+                    "endpoint": {"tag": tag, "server": server,
+                                 "server_port": 443}}
+
+        old = [node("203.0.113.11", "vpngate-0"),
+               node("203.0.113.12", "vpngate-1")]
+        # A brand-new, very fast node sorts to the front of the snapshot.
+        new = [node("203.0.113.99"), node("203.0.113.11"), node("203.0.113.12")]
+        assign_stable_tags(new, old)
+        by_server = {n["server"]: n["endpoint"]["tag"] for n in new}
+        self.assertEqual("vpngate-0", by_server["203.0.113.11"])
+        self.assertEqual("vpngate-1", by_server["203.0.113.12"])
+        self.assertNotEqual("vpngate-0", by_server["203.0.113.99"])
+        self.assertNotEqual("vpngate-1", by_server["203.0.113.99"])
 
     def test_same_server_keeps_tag_across_reordered_refresh(self) -> None:
         first = self._csv({"203.0.113.11": 5000, "203.0.113.12": 1000})
@@ -3132,7 +3318,7 @@ class AuditFixAConsoleTests(unittest.TestCase):
 
     def test_verify_abort_restores_button(self) -> None:
         start = UI_HTML.index("async function verifyExit")
-        block = UI_HTML[start:start + 2200]
+        block = UI_HTML[start:start + 6000]
         self.assertRegex(block,
                          r'if \(isAbort\(e\)\) \{[^}]*setBusy\("btn-verify", false\)')
 
@@ -3564,14 +3750,19 @@ class RefreshGateTests(unittest.TestCase):
                  mock.patch("railway_manager.probe_tcp_latency",
                             return_value=100), \
                  mock.patch.object(manager, "verify_fn",
-                                   side_effect=lambda ep: ("9.9.9.9", 11)):
+                                   side_effect=lambda ep: ("9.9.9.9", 11)),                  mock.patch.object(manager, "_chain_probe_ok",
+                                   return_value=None),                  mock.patch.object(manager, "_served_exit_probe",
+                                   return_value=("9.9.9.9", 20, True)):
                 ok = manager.refresh_once(
                     fetcher=lambda url, timeout: _snapshot_csv(
                         "203.0.113.11", "203.0.113.12"))
                 pin_at_return = manager.preferred_tag
-                # The pin only moves when its chain stops carrying traffic.
-                rescued = manager.check_pinned_health(
+                # Handshake death needs 3 strikes; the pin only moves when its
+                # chain stops carrying traffic.
+                results = [manager.check_pinned_health(
                     probe_fn=lambda host, port, timeout=5: 0)
+                    for _ in range(3)]
+                rescued = results[-1]
                 pin_after_health = manager.preferred_tag
             if manager._full_probe_thread is not None:
                 manager._full_probe_thread.join(timeout=60)
@@ -4558,15 +4749,17 @@ class VerifyAttributionTests(unittest.TestCase):
                                             "error": None}
             failing = lambda host, port, timeout=5: 0
             with _fake_singbox(), \
-                 mock.patch.object(manager, "dial_fn", return_value=None):
+                 mock.patch.object(manager, "dial_fn", return_value=None), \
+                 mock.patch("railway_manager.probe_tcp_latency", return_value=100):
                 # Dead tunnel dial on an auto pin: first failure
                 # fast-rescues.
-                result = manager.check_pinned_health(probe_fn=failing)
+                results = [manager.check_pinned_health(probe_fn=failing)
+                           for _ in range(3)]
             snap = manager.status["verify"]
         finally:
             manager.stop()
 
-        self.assertEqual("rescued", result)
+        self.assertEqual("rescued", results[-1])
         self.assertEqual("idle", snap["state"])
         self.assertIsNone(snap["exit_ip"])
 
@@ -4612,15 +4805,18 @@ class ProbeObserveUiTests(unittest.TestCase):
         delegation = UI_HTML[start:end]
         self.assertEqual(2, delegation.count("该节点测速中，请稍候"))
 
-    def test_space_key_defers_to_click(self) -> None:
+    def test_space_activates_native_row_button(self) -> None:
         start = UI_HTML.index('document.getElementById("bench-body").onkeydown')
-        block = UI_HTML[start:start + 1400]
-        self.assertIn('if (ev.key === " ") { ev.preventDefault(); return; }',
-                      block)
-        space_at = block.index('if (ev.key === " ") { ev.preventDefault(); return; }')
-        enter_tail = block[space_at:]
-        self.assertIn("probeOne(p)", enter_tail)
-        self.assertIn("switchTag(sw)", enter_tail)
+        block = UI_HTML[start:start + 1600]
+        # Space must not be swallowed: the native button is clicked, so the
+        # browser (and screen readers) see the same activation as a mouse.
+        self.assertIn('if (ev.key === " ") {', block)
+        self.assertIn("ev.preventDefault();", block)
+        self.assertIn("link.click();", block)
+        self.assertNotIn('if (ev.key === " ") { ev.preventDefault(); return; }', block)
+        enter_at = block.index('if (ev.key !== "Enter") return;')
+        self.assertIn("probeOne(p)", block[enter_at:])
+        self.assertIn("switchTag(sw)", block[enter_at:])
 
 
 class VerifyAttributionUiTests(unittest.TestCase):
@@ -5282,7 +5478,8 @@ class DeadPinTests(unittest.TestCase):
                 with _fake_singbox(), \
                      mock.patch("railway_manager.probe_tcp_latency",
                                 return_value=0):
-                    result = manager.check_pinned_health(probe_fn=failing)
+                    results = [manager.check_pinned_health(probe_fn=failing)
+                               for _ in range(3)]
                     events = [(e["event"], e.get("detail", ""))
                               for e in manager.status["refresh_history"]]
                 # read the files while the temp dir still exists
@@ -5291,19 +5488,16 @@ class DeadPinTests(unittest.TestCase):
             finally:
                 manager.stop()
 
-        self.assertEqual("rescued", result)
-        self.assertEqual("vpngate-1", manager.preferred_tag)
+        # No candidate answered a fresh handshake: the old code moved the pin
+        # onto the best *stale* candidate. That is gone; the gateway unpins
+        # after the 3-strike all-handshakes-dead path instead.
+        self.assertEqual(["pinned", "pinned", "unpinned"], results)
+        self.assertIsNone(manager.preferred_tag)
         self.assertEqual([], dial_calls, "a real dial would open a second session")
-        # No candidate answered a fresh handshake: the stale fallback is
-        # recorded, and the pin is moved all the same.
-        self.assertIn("auto-rescue-stale", [ev for ev, _ in events])
-        # The new pin is published and persisted, not just held in memory.
-        self.assertEqual("vpngate-1", manager.status["preferred_tag"])
-        self.assertEqual("vpngate-1", state.get("preferred_tag"))
-        chain = next((o for o in config["outbounds"]
-                      if o.get("tag") == "chain"), None)
-        self.assertIsNotNone(chain, "a pinned chain must publish a selector")
-        self.assertEqual("vpngate-1", chain["outbounds"][0])
+        self.assertIn("auto-unpin", [ev for ev, _ in events])
+        self.assertNotIn("auto-rescue-stale", [ev for ev, _ in events])
+        self.assertIsNone(state.get("preferred_tag"))
+        self.assertEqual("auto", config["route"]["final"])
 
     def test_the_rescue_only_moves_to_a_node_that_carries_traffic(self) -> None:
         """A candidate that is connected but silent must not get the chain.
@@ -5343,11 +5537,12 @@ class DeadPinTests(unittest.TestCase):
                                 side_effect=_measure), \
                      mock.patch("railway_manager.probe_tcp_latency",
                                 return_value=0):
-                    result = manager.check_pinned_health(probe_fn=failing)
+                    results = [manager.check_pinned_health(probe_fn=failing)
+                               for _ in range(3)]
             finally:
                 manager.stop()
 
-        self.assertEqual("rescued", result)
+        self.assertEqual(["pinned", "pinned", "rescued"], results)
         # vpngate-1 answers, vpngate-0 (the dead pin) and vpngate-2 do not.
         self.assertEqual("vpngate-1", manager.preferred_tag)
         self.assertIn(41001, measured)
@@ -5421,16 +5616,16 @@ class DeadPinTests(unittest.TestCase):
                 with _fake_singbox(), \
                      mock.patch("railway_manager.probe_tcp_latency",
                                 return_value=50):
-                    result = manager.check_pinned_health(probe_fn=failing)
+                    results = [manager.check_pinned_health(probe_fn=failing)
+                               for _ in range(3)]
                     events = [e["event"]
                               for e in manager.status["refresh_history"]]
             finally:
                 manager.stop()
 
-        self.assertEqual("rescued", result)
+        self.assertEqual(["pinned", "pinned", "rescued"], results)
         self.assertEqual("vpngate-1", manager.preferred_tag)
-        self.assertIn("auto-rescue", events)
-        self.assertNotIn("auto-rescue-stale", events)
+        self.assertTrue(any(e.startswith("chain-rescue") for e in events))
 
     def test_health_failure_never_dials_and_fast_rescues(self) -> None:
         """First failed handshake rescues to the alive node immediately (no
@@ -5449,12 +5644,14 @@ class DeadPinTests(unittest.TestCase):
                 manager._auto_pinned = True
                 manager._chain_pin_at = time.monotonic() - 3600.0
                 failing = lambda host, port, timeout=5: 0
-                with _fake_singbox():
-                    result = manager.check_pinned_health(probe_fn=failing)
+                with _fake_singbox(),                      mock.patch("railway_manager.probe_tcp_latency",
+                                return_value=50):
+                    results = [manager.check_pinned_health(probe_fn=failing)
+                               for _ in range(3)]
             finally:
                 manager.stop()
 
-        self.assertEqual("rescued", result)
+        self.assertEqual(["pinned", "pinned", "rescued"], results)
         self.assertEqual("vpngate-1", manager.preferred_tag)
         # Health judgement is handshake + mux probe only: no real dial.
         self.assertEqual([], dial_calls)
@@ -5536,8 +5733,6 @@ class DeadPinTests(unittest.TestCase):
                                  ("203.0.113.12", 200, 40))
                 manager.preferred_tag = "vpngate-0"
                 manager.status["preferred_tag"] = "vpngate-0"
-                manager.backup_tag = "vpngate-1"
-                manager.status["backup_tag"] = "vpngate-1"
                 manager._auto_pinned = True
                 failing = lambda host, port, timeout=5: 0
 
@@ -5553,13 +5748,15 @@ class DeadPinTests(unittest.TestCase):
                     return real_commit(round_id, best, second)
 
                 with _fake_singbox(), \
+                     mock.patch("railway_manager.probe_tcp_latency", return_value=100), \
                      mock.patch.object(manager, "_commit_rescue",
                                        side_effect=_commit_then_manual):
-                    result = manager.check_pinned_health(probe_fn=failing)
+                    results = [manager.check_pinned_health(probe_fn=failing)
+                               for _ in range(3)]
             finally:
                 manager.stop()
 
-        self.assertEqual("pinned", result)
+        self.assertEqual("pinned", results[-1])
         self.assertEqual("vpngate-1", manager.preferred_tag)
         self.assertFalse(manager._auto_pinned)
 
@@ -5847,12 +6044,14 @@ class RescueRoundTests(unittest.TestCase):
                 manager.status["preferred_tag"] = "vpngate-0"
                 manager._auto_pinned = False
                 failing = lambda host, port, timeout=5: 0
-                with _fake_singbox():
+                with _fake_singbox(),                      mock.patch("railway_manager.probe_tcp_latency",
+                                return_value=100):
                     # Capture the round id the check will use, then
                     # switch before the commit: stale round must yield.
                     round_at_start = self._round_id(manager)
-                    result = manager.check_pinned_health(probe_fn=failing)
-                    self.assertEqual("rescued", result)
+                    results = [manager.check_pinned_health(probe_fn=failing)
+                               for _ in range(3)]
+                    self.assertEqual("rescued", results[-1])
                     _settle_probes(manager)
                     manager.switch(tag="vpngate-0")
                     committed = manager._commit_rescue(
@@ -5955,5 +6154,403 @@ class LoggingTests(unittest.TestCase):
             finally:
                 manager.stop()
 
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class PinVerificationContractTests(unittest.TestCase):
+    """New pin/verify contracts: served exit proof, bounded waiting, rollback,
+    dead-memory and unknown-is-not-death."""
+
+    TOKEN = "test-admin-token-0123456789abcdef"
+
+    def _manager(self, tmpdir: str, **kwargs):
+        defaults = dict(port=0, mixed_port=get_free_port(), start_singbox=True,
+                        auto_refresh=False, fetch_on_start=False,
+                        admin_token=self.TOKEN,
+                        config_path=f"{tmpdir}/singbox.json",
+                        nodes_path=f"{tmpdir}/nodes.json",
+                        state_path=f"{tmpdir}/state.json")
+        defaults.update(kwargs)
+        return RailwayManager(**defaults)
+
+    def _seed_nodes(self, manager, *specs):
+        manager._nodes = [{"server": ip, "server_port": 443,
+                           "country": "Japan", "country_short": "JP",
+                           "latency_ms": hand, "real_latency_ms": real,
+                           "speed": 1000,
+                           "endpoint": {"tag": f"vpngate-{i}", "server": ip,
+                                        "server_port": 443}}
+                          for i, (ip, hand, real) in enumerate(specs)]
+
+    def test_switch_from_unpinned_commits_after_served_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = self._manager(tmpdir)
+            try:
+                self._seed_nodes(manager, ("203.0.113.11", 100, 20),
+                                 ("203.0.113.12", 200, 40))
+                seen = []
+
+                def _probe():
+                    seen.append(manager.preferred_tag)
+                    return ("203.0.113.99", 25, True)
+
+                with _fake_singbox(), \
+                     mock.patch.object(manager, "_mixed_listening", return_value=True), \
+                     mock.patch.object(manager, "_singbox_live", return_value=True), \
+                     mock.patch.object(manager, "_served_exit_probe", side_effect=_probe), \
+                     mock.patch.object(manager, "_apply_config", return_value=True):
+                    ok, effective = manager.switch(tag="vpngate-1")
+            finally:
+                manager.stop()
+
+        self.assertTrue(ok)
+        self.assertEqual("chain", effective)
+        self.assertEqual("vpngate-1", manager.preferred_tag)
+        self.assertEqual([None], seen,
+                         "the probe must run while the pin is still unpinned")
+        ev = manager._node_evidence["203.0.113.12:443"]
+        self.assertTrue(ev["alive"])
+        self.assertEqual("203.0.113.99", ev["exit_ip"])
+
+    def test_verify_waits_for_the_mixed_inbound_to_come_back(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = self._manager(tmpdir)
+            try:
+                self._seed_nodes(manager, ("203.0.113.11", 100, 20))
+                manager.preferred_tag = "vpngate-0"
+                listening = [False, False, True, True, True]
+                with mock.patch.object(manager, "_mixed_listening",
+                                       side_effect=lambda timeout=0.5: listening.pop(0)
+                                       if listening else True), \
+                     mock.patch.object(manager, "_singbox_live", return_value=True), \
+                     mock.patch.object(manager, "_served_exit_probe",
+                                       return_value=("203.0.113.7", 40, True)):
+                    ok, exit_ip, ms, attempted = manager._verify_served(budget=5.0)
+            finally:
+                manager.stop()
+
+        self.assertTrue(ok)
+        self.assertEqual("203.0.113.7", exit_ip)
+        self.assertTrue(attempted)
+
+    def test_all_candidates_failing_keeps_the_pin_and_remembers_them(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = self._manager(tmpdir)
+            try:
+                self._seed_nodes(manager, ("203.0.113.11", 100, 20),
+                                 ("203.0.113.12", 200, 30),
+                                 ("203.0.113.13", 300, 40))
+                manager.preferred_tag = "vpngate-0"
+                manager.status["preferred_tag"] = "vpngate-0"
+                manager._auto_pinned = True
+                manager._chain_pin_at = time.monotonic() - 3600.0
+                with _fake_singbox(), \
+                     mock.patch.object(manager, "_mixed_listening", return_value=True), \
+                     mock.patch.object(manager, "_singbox_live", return_value=True), \
+                     mock.patch.object(manager, "_served_exit_probe",
+                                       return_value=(None, None, True)), \
+                     mock.patch.object(manager, "_chain_probe_ok", return_value=False), \
+                     mock.patch.object(manager, "_apply_config", return_value=True):
+                    results = [manager.check_pinned_health() for _ in range(2)]
+                dead = dict(manager._chain_dead_until)
+                events = [e["event"] for e in manager.status["refresh_history"]]
+                pinned = manager.preferred_tag
+            finally:
+                manager.stop()
+
+        self.assertEqual(["pinned", "pinned"], results)
+        self.assertEqual("vpngate-0", pinned, "never a stale fallback pin")
+        self.assertIn("vpngate-1", dead)
+        self.assertIn("chain-rescue-skipped", events)
+        self.assertNotIn("auto-rescue-stale", events)
+
+    def test_unknown_chain_probe_does_not_increment_death_streaks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = self._manager(tmpdir)
+            try:
+                self._seed_nodes(manager, ("203.0.113.11", 100, 20))
+                manager.preferred_tag = "vpngate-0"
+                manager.status["preferred_tag"] = "vpngate-0"
+                manager._chain_pin_at = time.monotonic() - 3600.0
+                with _fake_singbox(), \
+                     mock.patch.object(manager, "_chain_probe_ok", return_value=None):
+                    results = [manager.check_pinned_health(
+                        probe_fn=lambda h, p, timeout=5: 120) for _ in range(3)]
+                chain_streak = manager._chain_fail_streak
+                pin_streak = manager._pinned_fail_streak
+            finally:
+                manager.stop()
+
+        self.assertEqual(["pinned"] * 3, results)
+        self.assertEqual(0, chain_streak)
+        self.assertEqual(0, pin_streak)
+
+    def test_switch_rejects_a_dead_node_and_rolls_back(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = self._manager(tmpdir)
+            try:
+                self._seed_nodes(manager, ("203.0.113.11", 100, 20),
+                                 ("203.0.113.12", 200, 40))
+                manager.preferred_tag = "vpngate-0"
+                manager.status["preferred_tag"] = "vpngate-0"
+                applied = []
+                with _fake_singbox(), \
+                     mock.patch.object(manager, "_mixed_listening", return_value=True), \
+                     mock.patch.object(manager, "_singbox_live", return_value=True), \
+                     mock.patch.object(manager, "_served_exit_probe",
+                                       return_value=(None, None, True)), \
+                     mock.patch.object(manager, "_apply_config",
+                                       side_effect=lambda **kw: applied.append(kw.get("preferred")) or True):
+                    ok, detail = manager.switch(tag="vpngate-1")
+            finally:
+                manager.stop()
+
+        self.assertFalse(ok)
+        self.assertIn("node tunnel dead", detail)
+        self.assertEqual("vpngate-0", manager.preferred_tag)
+        self.assertEqual("vpngate-0", applied[-1],
+                         "a rejected switch must restore the previous pin")
+
+    def test_gateway_chain_probe_uses_the_served_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = self._manager(tmpdir)
+            try:
+                self._seed_nodes(manager, ("203.0.113.11", 100, 20))
+                manager.preferred_tag = "vpngate-0"
+                manager.status["preferred_tag"] = "vpngate-0"
+                with _fake_singbox(), \
+                     mock.patch.object(manager, "_serving_ok", return_value=True), \
+                     mock.patch.object(manager, "_mixed_listening", return_value=True), \
+                     mock.patch.object(manager, "_served_exit_probe",
+                                       return_value=("203.0.113.55", 33, True)):
+                    ok = manager._chain_probe_ok()
+                manager.status["endpoints"] = [
+                    manager._endpoint_row(node["endpoint"], node)
+                    for node in manager._nodes]
+                snap = manager.status_snapshot()
+                ev = manager._node_evidence["203.0.113.11:443"]
+            finally:
+                manager.stop()
+
+        self.assertTrue(ok)
+        self.assertTrue(ev["alive"])
+        self.assertEqual("203.0.113.55", ev["exit_ip"])
+        row = next(e for e in snap["endpoints"] if e["tag"] == "vpngate-0")
+        self.assertEqual("203.0.113.55", row["exit_ip"])
+        self.assertTrue(row["alive"])
+        self.assertIn("pin_health", snap)
+
+    def test_verify_never_uses_a_throwaway_client_on_a_pin(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = self._manager(tmpdir)
+            try:
+                self._seed_nodes(manager, ("203.0.113.11", 100, 20))
+                node = manager._nodes[0]
+                manager.preferred_tag = "vpngate-0"
+                manager.status["preferred_tag"] = "vpngate-0"
+                with _fake_singbox(), \
+                     mock.patch.object(manager, "verify_fn") as verify_fn, \
+                     mock.patch.object(manager, "_served_exit_probe",
+                                       return_value=("203.0.113.66", 12, True)):
+                    manager._run_verify(node, manager._verify_generation)
+                snap = manager.status["verify"]
+                ev = manager._node_evidence["203.0.113.11:443"]
+            finally:
+                manager.stop()
+
+        verify_fn.assert_not_called()
+        self.assertEqual("203.0.113.66", snap["exit_ip"])
+        self.assertEqual("203.0.113.66", ev["exit_ip"])
+
+    def test_auto_repin_only_moves_auto_pins_to_a_much_better_node(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = self._manager(tmpdir, auto_repin=True)
+            try:
+                self._seed_nodes(manager, ("203.0.113.11", 100, 100),
+                                 ("203.0.113.12", 200, 40))
+                manager.preferred_tag = "vpngate-0"
+                manager.status["preferred_tag"] = "vpngate-0"
+                manager._auto_pinned = True
+                with _fake_singbox(), \
+                     mock.patch.object(manager, "_mixed_listening", return_value=True), \
+                     mock.patch.object(manager, "_singbox_live", return_value=True), \
+                     mock.patch.object(manager, "_served_exit_probe",
+                                       return_value=("203.0.113.77", 20, True)), \
+                     mock.patch.object(manager, "_apply_config", return_value=True):
+                    manager._auto_pin_best(manager._nodes, None)
+                pinned = manager.preferred_tag
+            finally:
+                manager.stop()
+
+        self.assertEqual("vpngate-1", pinned)
+
+    def test_manual_pin_is_never_repinned_by_auto_repin(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = self._manager(tmpdir, auto_repin=True)
+            try:
+                self._seed_nodes(manager, ("203.0.113.11", 100, 100),
+                                 ("203.0.113.12", 200, 40))
+                manager.preferred_tag = "vpngate-0"
+                manager.status["preferred_tag"] = "vpngate-0"
+                manager._auto_pinned = False
+                with _fake_singbox(), \
+                     mock.patch.object(manager, "_apply_config", return_value=True) as apply_cfg:
+                    manager._auto_pin_best(manager._nodes, None)
+                pinned = manager.preferred_tag
+            finally:
+                manager.stop()
+
+        self.assertEqual("vpngate-0", pinned)
+        apply_cfg.assert_not_called()
+
+    def test_single_probe_refuses_a_serving_tag_without_a_rotate_route(self) -> None:
+        dials: list[str] = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = self._manager(
+                tmpdir, start_singbox=False, resi_rotate=True,
+                vless_uuid="u-u-i-d",
+                dial_fn=lambda node: dials.append(node["server"]) or 42)
+            try:
+                self._seed_nodes(manager, ("203.0.113.11", 100, 20))
+                node = manager._nodes[0]
+                manager.preferred_tag = "vpngate-0"
+                manager.status["preferred_tag"] = "vpngate-0"
+                manager._resi_routes = []          # e.g. right after boot
+                manager._run_single_probe(node)
+                probe = dict(manager.status["probe"])
+            finally:
+                manager.stop()
+
+        self.assertEqual([], dials, "a serving tag must never be dialed")
+        self.assertIsNone(probe["ms"])
+        self.assertIn("duplicate-cn", probe["error"])
+
+    def test_auto_pin_rejects_the_commit_when_the_node_set_changed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = self._manager(tmpdir)
+            try:
+                self._seed_nodes(manager, ("203.0.113.11", 100, 20),
+                                 ("203.0.113.12", 200, 40))
+                applied: list = []
+
+                def _apply(**kwargs):
+                    applied.append(kwargs.get("preferred"))
+                    return True
+
+                def _verify(*args, **kwargs):
+                    # A refresh replaces self._nodes while the exit probe runs.
+                    manager._nodes_rev += 1
+                    return True, "203.0.113.99", 25, True
+
+                with _fake_singbox(),                      mock.patch.object(manager, "_mixed_listening", return_value=True),                      mock.patch.object(manager, "_singbox_live", return_value=True),                      mock.patch.object(manager, "_apply_config", side_effect=_apply),                      mock.patch.object(manager, "_verify_served", side_effect=_verify):
+                    manager._auto_pin_best(manager._nodes, None)
+                events = [(e["event"], e.get("detail", ""))
+                          for e in manager.status["refresh_history"]]
+            finally:
+                manager.stop()
+
+        self.assertIsNone(manager.preferred_tag)
+        self.assertTrue(any(ev == "auto-pin-skipped" and "node set changed" in detail
+                            for ev, detail in events))
+        self.assertEqual([None], applied[-1:],
+                         "the rollback must put the selector back on the live pin")
+
+class PinUxContractTests(unittest.TestCase):
+    """Pin/undo/liveness console contract after the core-state rework."""
+
+    def _between(self, start: str, end: str) -> str:
+        begin = UI_HTML.index(start)
+        return UI_HTML[begin:UI_HTML.index(end, begin)]
+
+    def _switch_block(self) -> str:
+        return self._between("async function switchTag", "async function probeOne")
+
+    def test_success_clears_pending_then_renders_then_verifies(self) -> None:
+        block = self._switch_block()
+        clear_at = block.index("pendingTag = null")
+        self.assertIn("clearTimeout(pendingTimer)", block)
+        self.assertLess(clear_at, block.index("renderAll(lastStatus)"))
+        self.assertLess(block.index("renderAll(lastStatus)"),
+                        block.index("await verifyExit()"))
+        self.assertLess(block.index("renderFiltered()"),
+                        block.index("await verifyExit()"))
+
+    def test_undo_window_starts_after_verification(self) -> None:
+        block = self._switch_block()
+        self.assertGreater(block.rindex("showUndo(fromTag, newTag)"),
+                           block.index("await verifyExit()"))
+
+    def test_undo_calls_switch_tag_back(self) -> None:
+        block = self._between("function onUndo", "async function switchTag")
+        self.assertIn('const back = undoFrom == null ? "auto" : undoFrom;', block)
+        self.assertIn("switchTag(back)", block)
+        self.assertLess(block.index("clearUndo()"), block.index("switchTag(back)"))
+
+    def test_show_undo_supports_auto_from_tag(self) -> None:
+        block = self._between("function showUndo", "function onUndo")
+        self.assertIn("if (fromTag === toTag) return;", block)
+        self.assertNotIn("if (!fromTag", block)
+        self.assertIn("ipOf(fromTag)", block)
+        self.assertIn("ipOf(toTag)", block)
+        self.assertIn('return "自动";', UI_HTML)
+
+    def test_pin_health_is_rendered(self) -> None:
+        self.assertIn("s.pin_health", UI_HTML)
+        self.assertIn('id="sb-health"', UI_HTML)
+        self.assertIn('id="health-line"', UI_HTML)
+        for state in ("ok", "degraded", "dead", "unknown", "unpinned"):
+            self.assertIn(state, UI_HTML)
+        self.assertIn("chain_switch", UI_HTML)
+        self.assertIn("chain.ready", UI_HTML)
+        self.assertIn("fail_streak", UI_HTML)
+        status = self._between("function renderStatusbar", "function renderTraffic")
+        self.assertIn("renderHealth(s, pref)", status)
+
+    def test_switch_gated_by_fresh_evidence_not_latency_only(self) -> None:
+        block = self._between("function switchBlockReason", "function emptyActionKey")
+        self.assertIn("e.verify_fresh && e.alive === true", block)
+        self.assertIn("e.real_latency_ms != null", block)
+        self.assertIn("e.verify_error", block)
+        self.assertIn("已失联", block)
+        self.assertIn("先测速", block)
+
+    def test_pinned_row_shows_evidence_and_replacement_marks(self) -> None:
+        evidence = self._between("function verifyEvidenceText", "function rescueMarks")
+        for hook in ("e.alive", "e.verify_fresh", "e.exit_ip", "e.verified_at",
+                     "e.verify_error"):
+            self.assertIn(hook, evidence)
+        rows = self._between("    const rows = eps.map(e => {",
+                             '    }).join("");')
+        self.assertIn("verifyEvidenceText(e)", rows)
+        self.assertIn("已救回", rows)
+        self.assertIn("已被替换", rows)
+        self.assertIn("已失联", rows)
+
+    def test_probe_and_chain_availability_rendered(self) -> None:
+        self.assertIn("probeServiceText", UI_HTML)
+        self.assertIn("servedExitText", UI_HTML)
+        self.assertIn("chain.ready", UI_HTML)
+        self.assertIn("单测服务", UI_HTML)
+        self.assertIn("服务出口", UI_HTML)
+
+    def test_verify_retries_transient_and_surfaces_no_ip(self) -> None:
+        block = self._between("async function verifyExit", "silentLogin();")
+        self.assertIn("postRetried", block)
+        self.assertIn("409|5[0-9][0-9]", block)
+        self.assertIn("if (!s.verify.exit_ip)", block)
+        self.assertIn("s.verify.error", block)
+        self.assertIn("via_tag", block)
+        self.assertIn("验证失败", block)
+        self.assertIn("i < 60", block)
+
+    def test_space_activates_row_buttons_and_empty_links_are_focusable(self) -> None:
+        block = self._between('document.getElementById("bench-body").onkeydown',
+                              "setInterval(() => {")
+        self.assertIn("link.click()", block)
+        self.assertIn('role="button"', UI_HTML)
+        self.assertIn('tabindex="0"', UI_HTML)
+        self.assertIn("emptyActionKey", UI_HTML)
+        self.assertIn("data-empty-action", UI_HTML)

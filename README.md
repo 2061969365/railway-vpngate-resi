@@ -18,11 +18,97 @@ CC Switch / 伪装页 / 哪吒探针从 `railway-proxy-combined` 全量搬运
 三条路互不串扰。`VLESS_UUID` 为空时第③路不生成；有 `VLESS_UUID` 就默认开启
 「节点轮换」（面板第三张卡显示节点数与当前游标）。
 
+公网侧默认由 Go `vpngate-edge` 接 `$PORT` 并分流到上述 loopback 入站；没有 edge 时由管理器
+自己在 `$PORT` 分流（旧行为不变）。
+
+## 架构：Python 控制面 + Go 数据面/探测边车
+
+- `railway_manager.py` 是控制面：生成/重写 sing-box 配置、管理 `chain`/`auto` pin、节点
+  轮换、Clash API 热切换与 `/api/status`，并继续提供 `/ui`、`/api`、`/healthz` 与伪装页
+  （由 edge 反代）。edge 模式下它只绑 `127.0.0.1:ADMIN_PORT`，不再直接监听公网。
+- `vpngate-edge`（`cmd/vpngate-edge`，纯标准库 Go，`CGO_ENABLED=0` 静态编译）是公网数据面：
+  拥有 `$PORT`，把 `/ws-node`、`/ws-chain` 原样 TCP 转发到 `127.0.0.1:8080/8082`（并统计
+  字节/连接），`/ws-resi` 原样转给 Python 管理端（由 Python 计数），其余请求反代给管理端。
+- `vpngate-probe`（`cmd/vpngate-probe`，纯标准库 Go，`CGO_ENABLED=0` 静态编译）是**只监听
+  回环**的测量边车，只读不写：`GET /v1/health`、`POST /v1/exit`、`POST /v1/delay`。它不选
+  节点、不改配置、不启动 sing-box；完整契约见 [`docs/probe-sidecar.md`](docs/probe-sidecar.md)。
+- `probe_client.py` 是它的 fail-open 客户端：任何传输错误、超时、401/503 或畸形响应都返回
+  `None` 并短暂熔断，调用方随即回退到 `vpngate_to_singbox.measure_mixed_exit_ip()`
+  （HTTP CONNECT + TLS，纯 Python，无子进程）。
+- Docker 是两段式：`golang:1.27-alpine` 构建 `vpngate-edge` 与 `vpngate-probe`，两个静态
+  二进制拷进 `python:3.11-slim` 运行镜像（见 `Dockerfile`）。
+
+### Go edge（公网数据面）
+
+**启动与回退**：`start.sh` 默认 `EDGE_PROXY=1`；二进制存在且未禁用时，edge 监听
+`0.0.0.0:$PORT`，管理器改绑 `127.0.0.1:ADMIN_PORT`（默认 `3001`，自动跳过 `$PORT`、
+8080/8081/8082/8084/4096/40000 与 metrics 端口）。二进制缺失或 `EDGE_PROXY=0` 时
+`start.sh` 会 unset `ADMIN_PORT`/`EDGE_METRICS_URL`，管理器照旧绑 `$PORT` 并自己做路径
+mux。edge 日志 `/tmp/edge.log`。
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `EDGE_PROXY` | `1` | `0` 关闭 edge（回到 manager 直接监听 `$PORT`） |
+| `ADMIN_PORT` | `3001` | edge 模式下 manager 的回环管理端口；`start.sh` 冲突时自动递增 |
+| `EDGE_LISTEN` | `0.0.0.0:3000` | 公网监听；`start.sh` 实际设为 `0.0.0.0:$PORT` |
+| `EDGE_ADMIN` | `http://127.0.0.1:3001` | 管理端 base URL（反代与 `/ws-resi` 的目标） |
+| `EDGE_NODE` | `127.0.0.1:8080` | `/ws-node` 的原始 TCP 后端 |
+| `EDGE_CHAIN` | `127.0.0.1:8082` | `/ws-chain` 的原始 TCP 后端 |
+| `EDGE_METRICS_LISTEN` | `127.0.0.1:39002` | 指标监听，**必须回环**（启动校验） |
+| `EDGE_METRICS_PORT` | `39002` | `start.sh` 只读；拼出 `http://127.0.0.1:<port>/v1/traffic` |
+| `EDGE_METRICS_URL` | 由上一行生成 | manager 读取的指标地址；edge 启用时导出，关闭时 unset |
+| `EDGE_IDLE_TIMEOUT_MS` | `120000` | 原始隧道每块读/写的空闲超时 |
+| `EDGE_DIAL_TIMEOUT_MS` | `5000` | 连接后端的超时 |
+| `VLESS_DIRECT_PATH` | `/ws-node` | 直连 VLESS WS 路径 |
+| `VLESS_CHAIN_PATH` | `/ws-chain` | chain VLESS WS 路径 |
+| `RESI_PATH` | `/ws-resi` | 第三路路径 |
+
+**路由**：只有“无 body 的 GET”且路径**精确相等**才走原始 TCP；`/ws-node`、`/ws-chain` 还
+要求 `VLESS_UUID` 非空。原始模式用 `http.Hijacker` 接管连接，重放原请求后由两个 goroutine
+做双向 copy，并用 `CloseWrite` 半关闭；连接后端失败返回 502。其它请求（包括带 body 的同
+路径请求）一律反代到 `EDGE_ADMIN`。
+
+**流量口径**：edge 只统计 `/ws-node`、`/ws-chain` 的 `bytes_up`/`bytes_down`/`connections`/
+`active`；`/ws-resi` 与测量流量仍由 Python 统计。`/api/status` 生成快照时以 0.3 秒超时拉
+`EDGE_METRICS_URL`，把 edge 的 `bytes_up`/`bytes_down` 加进返回的 `traffic`；拉取失败静默
+忽略（fail-open），管理页其它数据不受影响。
+
+**为什么用 Go**：旧 mux 在 Python 里对每个客户端起一个线程（`_accept_loop` →
+`_handle_client`）并在线程里搬字节，VLESS 热路径受 GIL/线程栈限制；edge 用 `net/http`
+hijack + 每连接两个 goroutine，减少了 Python 线程模型的 header、半关闭与超时边界问题，
+同时控制面（配置、pin、轮换、健康）仍完全留在 Python。
+
+**edge 故障排查**：
+
+| 现象 | 可能原因 | 处理 |
+|---|---|---|
+| 日志 `vpngate-edge disabled or not installed` | `EDGE_PROXY=0`，或镜像里没有可执行的 `/usr/local/bin/vpngate-edge` | 走回退模式；重建镜像或去掉 `EDGE_PROXY=0` 后重启 |
+| edge 启动即退出 | `$PORT` 被占、`EDGE_ADMIN` 非法、metrics 非回环 | 看 `/tmp/edge.log`；`start.sh` 会直接退出让平台重启 |
+| 运行中 edge 死了 | 进程崩溃/端口异常 | 15 秒健康循环发现后让容器退出，平台重启即恢复 |
+| 管理端口冲突 | 手动把 `ADMIN_PORT` 设成 `$PORT`、8080/8081/8082/8084/4096/40000 或 metrics 端口 | 不要手填，交给 `start.sh` 自动挑；直接给 manager 设冲突值会拒绝启动 |
+| metrics 连不上 / 流量总数偏小 | edge 未运行，或 `EDGE_METRICS_URL` 未设/指错 | `curl 127.0.0.1:39002/v1/traffic` 自检；拉取失败是 fail-open |
+| 回退模式 | `EDGE_PROXY=0` 或无 edge 二进制 | 预期行为：manager 绑 `0.0.0.0:$PORT` 并执行原来的路径 mux |
+
+### 探测边车环境变量（全部有默认值，`PROBE_SERVICE=0` 可关闭）
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `PROBE_SERVICE` | `1` | `0` 关闭（`start.sh` 只认 `0`；Python 客户端还接受 `false`/`no`/`off`） |
+| `PROBE_LISTEN` | `127.0.0.1:39001` | 边车监听地址，**必须是回环**（启动时校验，非回环直接退出）；客户端也用它拼 base URL |
+| `PROBE_TOKEN` | 空 | 设置后 `/v1/*` 都要 `Authorization: Bearer <token>` |
+| `CLASH_URL` | `http://127.0.0.1:9090` | sing-box Clash API（边车只读） |
+| `CLASH_SECRET` | 空 | Clash API secret |
+| `PROBE_DEFAULT_TIMEOUT_MS` | `8000` | `/v1/exit`、`/v1/delay` 的默认超时预算（请求可覆盖，上限 120000ms） |
+| `PROBE_CONCURRENCY` | `8` | `/v1/delay` 并发上限 |
+
+边车日志写到 `/tmp/probe.log`；二进制缺失、`PROBE_SERVICE=0` 或启动失败都只告警，不阻塞
+管理器（fail-open）。代码没有单独的 `PROBE_URL`：监听与客户端地址都读 `PROBE_LISTEN`。
+
 ## Railway 部署
 
 1. 新建 Service，指向本仓库，Region 建议新加坡（离 VPNGate 亚洲节点近）。
 2. Variables（必填）：
-   - `PORT`（默认 3000 即正确值，不填即可；填 8080/8081/8082/4096/混入端口会拒绝启动，非 3000 会告警，因隧道与 TCP 代理规则都指向 3000）
+   - `PORT`（默认 3000 即正确值，不填即可；edge 模式下这是 edge 的公网端口，manager 改绑回环 `ADMIN_PORT`。填 8080/8081/8082/4096/混入端口会拒绝启动，非 3000 会告警，因隧道与 TCP 代理规则都指向 3000）
      - `PROXY_USER`（默认 `u`）/ `PROXY_PASS`（可选；不填则每次启动自动生成随机 `PROXY_PASS`，
        `PROXY_USER` 保持 `u`。走 VLESS+tunnel 时用不到；只有直连 SOCKS5 调试时才需要。
        显式填写的话 `PROXY_PASS` 须 ≥ 16 位，否则拒绝启动）
@@ -61,9 +147,9 @@ ingress 规则在 Cloudflare Dashboard 的 tunnel 配置里加。
 
 - `node.example.com` + Path `/*` → `http://localhost:3000`
 
-管理器在 `$PORT`（3000）这一个端口上按路径分流三条 VLESS+WS：
-`/ws-node` → 本机 `8080`、`/ws-chain` → 本机 `8082`、`/ws-resi` → 轮换出口
-（轮换模式下由管理器的轮换监听器接）。因此**新增第三路不需要动 ingress**，
+`$PORT`（3000）由 Go edge 统一按路径分流三条 VLESS+WS：
+`/ws-node` → 本机 `8080`、`/ws-chain` → 本机 `8082`、`/ws-resi` → 管理端的轮换监听器
+（无 edge 时由管理器做同样的分流）。因此**新增第三路不需要动 ingress**，
 `/ws-node`、`/ws-chain` 也不会因为忘了加规则而失效。
 
 **按端口分流的老配法（也仍然支持，规则必须按顺序）**
@@ -74,7 +160,8 @@ ingress 规则在 Cloudflare Dashboard 的 tunnel 配置里加。
 - 同一 hostname + Path `/*` → `http://localhost:3000`（兜底，必须排在上面几条**之后**）
 
 两种配法可以混用：按端口分流的规则命中后直连 sing-box/轮换监听器，
-没命中的路径落到 3000 再由管理器分流。manager 剥离 query 后路由：`/ui` 进控制台登录门，
+没命中的路径落到 3000 再由 edge（回退模式下是管理器）反代给管理端。管理端剥离 query 后
+路由：`/ui` 进控制台登录门，
 `/api/*` 为数据接口（需 Bearer token），`/` 直接 serve 伪装页文件
 （`start.sh` 注入 UUID 后经 `DISGUISE_PATH` 接线，`start.sh` 幂等，
 容器重启不会残留旧值），其余路径 404 或 401。
@@ -251,6 +338,9 @@ docker run -d --name combined -p 3000:3000 -p 8080:8080 -p 8082:8082 -p 8084:808
 curl http://127.0.0.1:3000/healthz   # ok
 ```
 
+默认走 edge（3000 → 回环 admin）。要验证旧的无 edge 回退路径，在 `docker run` 里加
+`-e EDGE_PROXY=0`，此时管理器直接绑 `$PORT`。
+
 要一起试住宅出口，再加：
 
 ```bash
@@ -262,6 +352,51 @@ curl http://127.0.0.1:3000/healthz   # ok
 单节点测速：节点列表每行“测速”按钮，或 `POST /api/probe {"tag":"vpngate-N"}`；
 测通的节点自动可切换（全部存活节点本就在 sing-box 配置里，无需重建）。切换即切即换，成功后总览出现 15 秒「撤销换回」按钮（键盘可达，过期焦点自动回到当前节点）；成功的操作只在行内确认，失败才右下角弹窗。表头按钮可键盘排序，状态条圆点三态（绿=已验证新鲜/黄=未验证或数据旧/红=刷新失败），token 失效自动回登录页，全量真测可中途取消并显示中文进度＋预计剩余时间。日志支持搜索＋自动滚动开关；订阅行标注直连/经 VPN 用途，切换失败提示取后端 detail；统计卡自适应列、流量带单位、时长人性化显示，移动端保留导航并冻结首末列。
 
+## 链路健康：真实出口验证与 pin_health
+
+**验证方式**：对正在服务的 pin/chain 的出口判定，一律走**正在服务的 mixed inbound**
+（`127.0.0.1:40000`，HTTP CONNECT + TLS + 出口 IP 回显），优先用边车，边车不可用则用
+Python 回退。sing-box 运行时**绝不再起临时客户端去拨第二个会话**——VPNGate 每节点只允许
+一个会话（`duplicate-cn`），第二个会踢掉正在服务的那条。没有验证器、或 mixed 正在重启时
+结果是 **unknown，不是死亡**，不会触发救援。
+
+`status.pin_health`（`GET /api/status`）：
+
+| 字段 | 含义 |
+|---|---|
+| `state` | `ok` / `degraded` / `dead` / `unknown` / `unpinned` |
+| `fail_streak` | 握手连败与隧道连败中的较大值 |
+| `checked_at` | 最后一次健康判定时间 |
+| `exit_ip` / `error` | 最近一次真实出口 IP / 错误 |
+| `chain_switch` | `{mode, ready, switches}`，热切换通道状态 |
+
+`status.endpoints[]` 的验证字段：`alive`、`exit_ip`、`verified_at`、`verify_ms`、
+`verify_error`、`verify_fresh`（`VERIFY_STALE_AFTER_SEC=600` 秒内算新鲜）。
+
+**阈值与救援**：
+
+- 握手连续 **3** 次失败（`PINNED_FAIL_THRESHOLD=3`）才把 pin 判死；隧道端到端探针连续
+  **2** 次失败（`CHAIN_FAIL_THRESHOLD=2`）才救援；新 pin 有 45 秒
+  （`CHAIN_SETTLE_GRACE`）预热宽限，宽限内失败不判死。
+- 救援只切到**当下真实出口验证通过**的候选（最多试 6 个、60 秒预算）；失败候选进
+  900 秒死记忆，连续救援会沿池子往下走。没有候选通过时**保留原 pin**、标 `degraded`，
+  并触发后台刷新——绝不拿没验证的节点顶上。
+- 握手已死但链路仍能真实出口：视为 `ok`（热切换已经把 selector 移走），不重写配置。
+- 手动 pin 在刷新/自动测速后保持不变；`AUTO_REPIN` 只重 pin 自动轨道。
+- 轮换模式（未配 `RESI_GATEWAY`）在所有候选握手都死时**保留死 pin**并标 `dead`
+  （丢掉 pin 会让 urltest 和轮换抢同一会话，变成“一个死两个一起死”）；住宅网关模式
+  （配了 `RESI_GATEWAY`）则在连续 3 次握手失败后解 pin 回 `auto`（`unpinned`）。
+
+### 故障排查
+
+| 现象 | 可能原因 | 处理 |
+|---|---|---|
+| 日志 `vpngate-probe disabled or not installed` / 边车缺失 | `PROBE_SERVICE=0`、镜像里没二进制或启动即崩 | 管理器会回退 Python 验证；看 `/tmp/probe.log`，确认 `PROBE_LISTEN` 是回环且端口空闲 |
+| `pin_health=degraded` | 握手/隧道连败未到阈值、serving 短暂不可达、或无候选通过验证 | 健康循环每 20 秒重试；看 `/api/status` 的 `pin_health.error` 与 `/tmp/probe.log` |
+| `pin_health=dead` | 轮换模式下所有候选握手都死，按设计保留 pin | 不是崩溃；等刷新补测或手动切换，必要时 `POST /api/full_probe` |
+| 所有节点 `alive`/`exit_ip` 为 `null`、`verify_fresh=false` | 冷启动尚未测完，或没有验证器 | 等全量真测；确认边车/回退可用，或 `POST /api/full_probe` |
+| 面板提示「服务出口探测不可用」 | 没有验证器（边车与 Python 回退都不可用）或 mixed 正在重启 | 恢复边车/等待 sing-box 起来；`unknown` 不会触发救援，勿据此判死 |
+
 ## CI
 
 `.github/workflows/publish-image.yml`：在 `main` 上构建仓库 `Dockerfile` 并把镜像推到
@@ -269,7 +404,9 @@ GHCR（`ghcr.io/<owner>/<repo>`），支持 `workflow_dispatch` 手动触发。�
 所有验证都在本地完成：
 
 ```bash
-python -m unittest discover -s tests -v          # 单元测试
+go test ./...                                     # 边车单测
+go vet ./...                                      # 边车静态检查（Dockerfile 用 CGO_ENABLED=0 静态构建）
+python -m pytest -q                               # 管理器/转换器测试
 python vpngate_to_singbox.py \
   --input tests/fixtures/vpngate_tcp_sample.ovpn --output /tmp/singbox.json
 sing-box check -c /tmp/singbox.json              # 配置形状（含三路入站）校验

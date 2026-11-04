@@ -1,0 +1,26 @@
+name: Test combined
+
+# Go sidecar tests only: the Python suite is already covered by
+# unit-tests.yml (interpreter/repeat matrix). Keep this workflow cheap.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  go-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27"
+      - name: Run Go tests
+        run: go test ./...
+      - name: Run go vet
+        run: go vet ./...

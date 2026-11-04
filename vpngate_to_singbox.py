@@ -551,6 +551,118 @@ def _fetch_exit_ip(proxy_host: str, proxy_port: int, timeout: float = 20) -> tup
     return None
 
 
+def _exit_ip_tls_context() -> ssl.SSLContext:
+    """Client TLS context for exit-IP probes (patched in unit tests)."""
+    return ssl.create_default_context()
+
+
+def _mixed_connect_get_text(proxy_host: str, proxy_port: int,
+                            proxy_auth: str,
+                            target_host: str,
+                            target_port: int = 443,
+                            path: str = "/",
+                            timeout: float = 6.0) -> tuple | None:
+    """One HTTPS GET through a mixed/HTTP proxy CONNECT tunnel.
+
+    Sends a single CONNECT with the supplied Proxy-Authorization header,
+    then does a real TLS handshake (SNI=target_host) and GET inside the
+    tunnel. Returns (code, body, ms) like _socks5_get_text, or None.
+    """
+    family = socket.AF_INET6 if ":" in proxy_host else socket.AF_INET
+    authority = f"{target_host}:{target_port}"
+    sock = None
+    try:
+        sock = socket.socket(family, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        sock.connect((proxy_host, proxy_port))
+        sock.sendall(
+            f"CONNECT {authority} HTTP/1.1\r\n"
+            f"Host: {authority}\r\n"
+            f"Proxy-Authorization: {proxy_auth}\r\n"
+            f"\r\n".encode("ascii")
+        )
+        head = b""
+        while b"\r\n\r\n" not in head:
+            chunk = sock.recv(4096)
+            if not chunk:
+                return None
+            head += chunk
+            if len(head) > 8192:
+                return None
+        try:
+            code = int(head.split(b" ", 2)[1])
+        except (IndexError, ValueError):
+            return None
+        if code != 200:
+            return None
+        try:
+            sock = _exit_ip_tls_context().wrap_socket(
+                sock, server_hostname=target_host)
+        except OSError:
+            return None
+        start = time.monotonic()
+        sock.sendall(f"GET {path} HTTP/1.1\r\nHost: {target_host}\r\n"
+                     f"Connection: close\r\n\r\n".encode())
+        raw = b""
+        while True:
+            try:
+                chunk = sock.recv(4096)
+            except OSError:
+                return None
+            if not chunk:
+                break
+            raw += chunk
+            if len(raw) > 65536:
+                return None
+        ms = max(1, int((time.monotonic() - start) * 1000))
+        response_head, _, body = raw.partition(b"\r\n\r\n")
+        try:
+            code = int(response_head.split(b" ", 2)[1])
+        except (IndexError, ValueError):
+            return None
+        return (code, body.strip(), ms)
+    except (OSError, ValueError):
+        return None
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
+def measure_mixed_exit_ip(proxy_host: str, proxy_port: int, username: str,
+                          password: str,
+                          timeout: float = 8.0) -> tuple[str | None, int | None]:
+    """Measure the real exit IP through a local sing-box mixed inbound.
+
+    Uses HTTP CONNECT (with Basic proxy auth) and TLS to each exit-IP echo
+    service, trying EXIT_IP_TARGETS in order inside one total timeout budget.
+    Returns (ip, elapsed_ms) on success and (None, None) otherwise. No
+    subprocess is spawned, so this is cheap enough for every health tick.
+    """
+    try:
+        budget = float(timeout)
+    except (TypeError, ValueError):
+        budget = 8.0
+    proxy_auth = "Basic " + base64.b64encode(
+        f"{username}:{password}".encode("utf-8")).decode("ascii")
+    deadline = time.monotonic() + max(0.05, budget)
+    for host, port, path in EXIT_IP_TARGETS:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        fetched = _mixed_connect_get_text(
+            proxy_host, proxy_port, proxy_auth, host, port, path,
+            timeout=min(remaining, 6.0))
+        if fetched is None or fetched[0] != 200:
+            continue
+        ip = _parse_exit_ip(fetched[1])
+        if ip:
+            return (ip, fetched[2])
+    return (None, None)
+
+
 def _free_port() -> int:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:

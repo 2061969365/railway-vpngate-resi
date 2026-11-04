@@ -4,6 +4,13 @@
 # railway-proxy-combined; Xray replaced by sing-box VLESS+WS inbounds).
 set -e
 
+# Loopback probe sidecar (optional; see section 2b below).
+PROBE_PID=""
+# Go edge proxy (optional; see section 2c below).
+EDGE_PID=""
+EDGE_PROXY="${EDGE_PROXY:-1}"
+EDGE_METRICS_PORT="${EDGE_METRICS_PORT:-39002}"
+
 # === 1. UUID (one value for both VLESS inbounds; env may override) ===
 export UUID="${UUID:-a29738e5-bee1-c0fc-b484-ae7c49cbc828}"
 export VLESS_UUID="${VLESS_UUID:-$UUID}"
@@ -43,17 +50,104 @@ _term() {
   echo "[shutdown] SIGTERM, stopping children..."
   kill -TERM "$MANAGER_PID" 2>/dev/null || true
   kill -TERM "$PROXY_PID" "$HTTP_PID" "$NEZHA_PID" 2>/dev/null || true
+  if [ -n "${PROBE_PID:-}" ]; then
+    kill -TERM "$PROBE_PID" 2>/dev/null || true
+  fi
+  if [ -n "${EDGE_PID:-}" ]; then
+    kill -TERM "$EDGE_PID" 2>/dev/null || true
+    wait "$EDGE_PID" 2>/dev/null || true
+  fi
   wait "$MANAGER_PID" 2>/dev/null || true
   exit 0
 }
 trap _term TERM INT
 
-# === 3. vpngate manager: owns $PORT, supervises sing-box + cloudflared ===
+_cleanup() {
+  if [ -n "${PROBE_PID:-}" ]; then
+    kill -TERM "$PROBE_PID" 2>/dev/null || true
+    wait "$PROBE_PID" 2>/dev/null || true
+  fi
+  if [ -n "${EDGE_PID:-}" ]; then
+    kill -TERM "$EDGE_PID" 2>/dev/null || true
+    wait "$EDGE_PID" 2>/dev/null || true
+  fi
+}
+trap _cleanup EXIT
+
+# === 2b. vpngate-probe sidecar (optional, loopback only) ===
+# Never fatal: the manager keeps working with its Python fallback when the
+# binary is absent, disabled, or fails to start.
+if [ "${PROBE_SERVICE:-1}" != "0" ] && [ -f /usr/local/bin/vpngate-probe ]; then
+  export PROBE_LISTEN="${PROBE_LISTEN:-127.0.0.1:39001}"
+  echo "[init] starting vpngate-probe on $PROBE_LISTEN..."
+  /usr/local/bin/vpngate-probe > /tmp/probe.log 2>&1 &
+  PROBE_PID=$!
+  echo "[debug] vpngate-probe PID=$PROBE_PID"
+  sleep 0.2 || true
+  if ! kill -0 "$PROBE_PID" 2>/dev/null; then
+    echo "[WARN] vpngate-probe exited immediately, continuing without it; log:"
+    cat /tmp/probe.log 2>&1 || true
+    PROBE_PID=""
+  fi
+else
+  echo "[init] vpngate-probe disabled or not installed"
+fi
+
+# === 2c. Go edge proxy decision (optional) ===
+# When the edge binary is present it owns the public $PORT; the manager binds
+# a loopback admin port instead. Without it, boot behavior is unchanged.
+EDGE_BIN="/usr/local/bin/vpngate-edge"
+USE_EDGE=0
+if [ "$EDGE_PROXY" != "0" ] && [ -x "$EDGE_BIN" ]; then
+  USE_EDGE=1
+fi
+if [ "$USE_EDGE" = "1" ]; then
+  probe_endpoint="${PROBE_LISTEN:-127.0.0.1:39001}"
+  probe_port="${probe_endpoint##*:}"
+  reserved_list="8080 8081 8082 8084 4096 40000 ${MIXED_PORT:-40000} ${RESI_PORT:-8084} ${VLESS_DIRECT_PORT:-8080} ${VLESS_CHAIN_PORT:-8082} ${CLASH_API_PORT:-9090} ${probe_port} ${PORT:-}"
+  metrics_ok=0
+  while [ "$metrics_ok" = "0" ]; do
+    metrics_collision=0
+    for reserved_port in $reserved_list; do
+      if [ "$EDGE_METRICS_PORT" = "$reserved_port" ]; then metrics_collision=1; fi
+    done
+    if [ "$metrics_collision" = "0" ]; then
+      metrics_ok=1
+    else
+      EDGE_METRICS_PORT=$((EDGE_METRICS_PORT + 1))
+    fi
+  done
+  admin_port="${ADMIN_PORT:-3001}"
+  admin_ok=0
+  while [ "$admin_ok" = "0" ]; do
+    collision=0
+    for reserved_port in $reserved_list "$EDGE_METRICS_PORT"; do
+      if [ "$admin_port" = "$reserved_port" ]; then collision=1; fi
+    done
+    if [ "$collision" = "0" ]; then
+      admin_ok=1
+    else
+      admin_port=$((admin_port + 1))
+    fi
+  done
+  export ADMIN_PORT="$admin_port"
+  export EDGE_METRICS_URL="http://127.0.0.1:${EDGE_METRICS_PORT}/v1/traffic"
+  echo "[init] vpngate-edge enabled: public :$PORT -> admin 127.0.0.1:$ADMIN_PORT"
+else
+  echo "[init] vpngate-edge disabled or not installed"
+  unset ADMIN_PORT EDGE_METRICS_URL
+fi
+
+# === 3. vpngate manager: admin mux in edge mode, or owns $PORT as fallback ===
 # Manager serves the disguise page itself at GET / (file already has the
 # UUID/remark injected above), so the tunnel catch-all /* -> $PORT keeps
 # the disguise at the domain root with no extra route.
 export DISGUISE_PATH="/app/www/index.html"
-echo "[init] starting railway_manager (owns \$PORT=$PORT)..."
+if [ "$USE_EDGE" = "1" ]; then
+  echo "[init] starting railway_manager (admin 127.0.0.1:$ADMIN_PORT, edge owns \$PORT=$PORT)..."
+else
+  echo "[init] starting railway_manager (owns \$PORT=$PORT)..."
+fi
 python railway_manager.py &
 MANAGER_PID=$!
 sleep 1
@@ -62,6 +156,28 @@ if ! kill -0 $MANAGER_PID 2>/dev/null; then
   exit 1
 fi
 echo "[debug] manager PID=$MANAGER_PID"
+
+# === 3b. Go edge proxy: public $PORT -> VLESS/admin backends ===
+if [ "$USE_EDGE" = "1" ]; then
+  export EDGE_LISTEN="0.0.0.0:${PORT}"
+  export EDGE_ADMIN="http://127.0.0.1:${ADMIN_PORT}"
+  export EDGE_NODE="127.0.0.1:${VLESS_DIRECT_PORT:-8080}"
+  export EDGE_CHAIN="127.0.0.1:${VLESS_CHAIN_PORT:-8082}"
+  export EDGE_METRICS_LISTEN="127.0.0.1:${EDGE_METRICS_PORT}"
+  export VLESS_DIRECT_PATH="${VLESS_DIRECT_PATH:-/ws-node}"
+  export VLESS_CHAIN_PATH="${VLESS_CHAIN_PATH:-/ws-chain}"
+  export RESI_PATH="${RESI_PATH:-/ws-resi}"
+  echo "[init] starting vpngate-edge on 0.0.0.0:$PORT..."
+  "$EDGE_BIN" > /tmp/edge.log 2>&1 &
+  EDGE_PID=$!
+  echo "[debug] vpngate-edge PID=$EDGE_PID"
+  sleep 0.3 || true
+  if ! kill -0 "$EDGE_PID" 2>/dev/null; then
+    echo "[ERR] vpngate-edge exited immediately, log:"
+    cat /tmp/edge.log 2>&1 || true
+    exit 1
+  fi
+fi
 
 # === 4. Disguise page (8081) ===
 echo "[init] starting disguise page (8081)..."
@@ -123,6 +239,11 @@ while true; do
   sleep 15
   if ! kill -0 $MANAGER_PID 2>/dev/null; then
     echo "[ERR] manager died, exiting to trigger restart"
+    exit 1
+  fi
+  if [ -n "${EDGE_PID:-}" ] && ! kill -0 "$EDGE_PID" 2>/dev/null; then
+    echo "[ERR] vpngate-edge died, exiting to trigger restart"
+    cat /tmp/edge.log 2>&1 | tail -20 || true
     exit 1
   fi
   if ! kill -0 $PROXY_PID 2>/dev/null; then

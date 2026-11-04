@@ -18,6 +18,8 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from functools import lru_cache
+from pathlib import Path
 from vpngate_to_singbox import (
     _safe_print,
     DEFAULT_RESI_PATH,
@@ -36,6 +38,17 @@ from vpngate_to_singbox import (
     render_resi_username,
     snapshot_to_nodes,
 )
+# These two land in sibling files owned by other agents. Import them
+# fail-open: the manager must keep working with the pure-Python fallbacks
+# while they are absent.
+try:
+    from probe_client import ProbeClient
+except Exception:  # pragma: no cover - absent during incremental rollout
+    ProbeClient = None
+try:
+    from vpngate_to_singbox import measure_mixed_exit_ip
+except ImportError:  # pragma: no cover - added by the sidecar owner
+    measure_mixed_exit_ip = None
 
 
 DEFAULT_SNAPSHOT_URL = "https://www.vpngate.net/api/iphone/"
@@ -61,7 +74,6 @@ PINNED_FAIL_THRESHOLD = 3
 CHAIN_FAIL_THRESHOLD = 2
 CHAIN_RESCUE_COOLDOWN = 30.0
 CHAIN_RESCUE_COOLDOWN_MAX = 120.0
-CHAIN_PROBE_TIMEOUT = 12.0
 # A freshly pinned endpoint has to establish its OpenVPN session before the
 # chain can carry traffic. Judging it inside that window repinned the chain in
 # a loop (every probe "failed", the pool walked node by node, and the chain
@@ -77,7 +89,6 @@ CHAIN_DEAD_MEMORY = 900.0
 CHAIN_ALIVE_WINDOW = 900.0
 SUPERVISE_INTERVAL = 10
 EXIT_VERIFY_CAP = 3
-REFRESH_PROBE_GRACE = 30.0
 MAX_SERVING_ENDPOINTS = 100
 VERIFY_STALE_AFTER_SEC = 600
 # Third path (rotate mode) runtime health. A node that kicks us out without
@@ -178,1298 +189,29 @@ def _build_resi_from_env(env: dict) -> dict | None:
             "probe_interval": _int_env(env, "RESI_PROBE_INTERVAL", 300, 60, 86400)}
 CRASH_BACKOFFS = (5, 10, 20, 40, 300)
 
-UI_HTML = """\
-<!doctype html>
-<html lang="zh"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="color-scheme" content="dark light">
-<title>vpngate console</title>
-<script>try{document.documentElement.dataset.theme=localStorage.getItem("theme")||(matchMedia("(prefers-color-scheme: light)").matches?"light":"dark")}catch(e){document.documentElement.dataset.theme="dark"}</script>
-<style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{background:#000;color:#fff;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;min-height:100vh}
-body::before{content:"";position:fixed;inset:0;z-index:-1;background:radial-gradient(ellipse 55% 40% at 75% 8%,rgba(99,102,241,.28),transparent 70%),radial-gradient(ellipse 45% 35% at 12% 25%,rgba(34,211,238,.16),transparent 70%),radial-gradient(ellipse 50% 45% at 50% 100%,rgba(16,185,129,.14),transparent 70%),#000}
-#topnav{position:sticky;top:0;z-index:50;display:flex;align-items:center;gap:26px;padding:14px 32px;font-size:14px;background:rgba(10,12,24,.88);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);border-bottom:1px solid rgba(255,255,255,.09)}
-#topnav .logo{font-weight:800;font-size:16px;background:linear-gradient(90deg,#a5b4fc,#67e8f9);-webkit-background-clip:text;background-clip:text;color:transparent}
-#topnav .live{font-size:11px;color:#6ee7b7;border:1px solid rgba(110,231,183,.4);border-radius:999px;padding:2px 10px}
-#topnav .links{display:flex;gap:22px;color:#ccc}
-#topnav .right{margin-left:auto;display:flex;gap:14px;align-items:center}
-#topnav .cta{border:1px solid rgba(255,255,255,.2);border-radius:999px;padding:7px 18px;cursor:pointer;background:rgba(255,255,255,.06)}
-#topnav .cta:hover{background:rgba(255,255,255,.14)}
-.wrap{max-width:1180px;margin:0 auto;padding:34px 28px 60px}
-.glass-card{background:rgba(255,255,255,.055);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,.11);border-radius:22px;padding:28px 30px;margin-bottom:22px;box-shadow:0 18px 50px rgba(0,0,0,.45)}
-.glass-card h2{font-size:19px;font-weight:700;margin-bottom:6px}
-.glass-card .desc{color:#a8adbd;font-size:13px;line-height:1.7;margin-bottom:16px}
-#exit-card{background:linear-gradient(135deg,rgba(99,102,241,.2),rgba(34,211,238,.1)),rgba(255,255,255,.055)}
-#hero-kicker{font-size:52px;font-weight:800;letter-spacing:-.03em;line-height:1.08;background:linear-gradient(92deg,#fff,#a5b4fc 60%,#67e8f9);-webkit-background-clip:text;background-clip:text;color:transparent}
-#hero-sub{color:#c2c7d6;font-size:14px;margin-top:10px}
-#verify-result{margin-top:12px;font-size:14px;color:#6ee7b7;min-height:22px}
-.verify-ok{color:#6ee7b7}.verify-err{color:#fca5a5}
-.linklike{color:#8ab4ff;cursor:pointer;text-decoration:none}
-.linklike:hover{text-decoration:underline}
-.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px;margin-bottom:22px}
-.stat{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:16px;padding:16px 18px;backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px)}
-.stat .k{font-size:12px;color:#8b91a5}
-.stat .v{font-size:24px;font-weight:700;margin-top:4px}
-.btn{border-radius:999px;padding:10px 24px;font-size:14px;cursor:pointer;border:1px solid rgba(255,255,255,.2);color:#fff;background:rgba(255,255,255,.07);transition:transform .12s ease,background .15s ease}
-.btn:hover{background:rgba(255,255,255,.15)}
-.btn:active{transform:scale(.97)}
-.btn:disabled{opacity:.55;cursor:wait;transform:none}
-.btn.primary{background:linear-gradient(92deg,#4338CA,#0369A3);border:none;font-weight:600;box-shadow:0 6px 24px rgba(99,102,241,.45)}
-.btn.busy{animation:pulse 1.1s ease-in-out infinite}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.55}}
-#pills{display:flex;gap:10px;margin:14px 0;flex-wrap:wrap}
-#scope{margin:14px 0;min-width:180px}
-.opbtn{min-height:28px;padding:5px 16px;border-radius:999px;border:1px solid rgba(138,180,255,.5);background:rgba(138,180,255,.08);color:#8ab4ff;font-size:12.5px;cursor:pointer;margin-right:8px;white-space:nowrap}
-.opbtn:hover{background:rgba(138,180,255,.18)}
-.opbtn:disabled{opacity:.45;cursor:not-allowed}
-.opbtn[aria-disabled="true"]{opacity:.45;cursor:not-allowed}
-#node-search::placeholder{color:#9aa0b2}
-.ip{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px}
-#thinbar{display:none;height:2px;border-radius:999px;background:rgba(255,255,255,.08);overflow:hidden;margin:10px 0 2px}
-#thinbar.show{display:block}
-#thinbar i{display:block;height:100%;width:30%;border-radius:999px;background:linear-gradient(90deg,#6366f1,#22d3ee);animation:slide 1s ease-in-out infinite}
-@keyframes slide{0%{margin-left:-30%}100%{margin-left:100%}}
-.spin{display:inline-block;width:12px;height:12px;border:2px solid rgba(255,255,255,.25);border-top-color:#fff;border-radius:50%;animation:rot .7s linear infinite;vertical-align:-2px;margin-right:6px}
-@keyframes rot{to{transform:rotate(360deg)}}
-table.bench.loading tbody{opacity:.55}
-#switch-undo{margin-top:8px;font-size:13px;color:#a8adbd}
-#switch-undo b{font-family:ui-monospace,Menlo,Consolas,monospace;color:#e5e7eb}
-#undo-link{color:#8ab4ff;cursor:pointer;text-decoration:none}
-#undo-link:hover{text-decoration:underline}
-.actions{display:flex;gap:12px;margin-top:16px;flex-wrap:wrap}
-#btn-verify{background:linear-gradient(92deg,#4338CA,#0369A3);color:#fff;border-radius:999px;padding:10px 26px;font-size:14px;font-weight:600;cursor:pointer;border:none;box-shadow:0 6px 24px rgba(99,102,241,.45)}
-#btn-refresh{border:1px solid rgba(255,255,255,.2);border-radius:999px;padding:10px 26px;font-size:14px;color:#fff;background:rgba(255,255,255,.07);cursor:pointer}
-#btn-fullprobe{border:1px solid rgba(138,180,255,.55);border-radius:999px;padding:10px 26px;font-size:14px;color:#8ab4ff;background:rgba(138,180,255,.08);cursor:pointer}
-#btn-verify:disabled,#btn-refresh:disabled,#btn-fullprobe:disabled{opacity:.55;cursor:wait}
-#node-search{background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.14);color:#fff;border-radius:10px;padding:8px 14px;font-size:13px;width:230px}
-table.bench{width:100%;border-collapse:collapse;font-size:14px}
-table.bench th,table.bench td{text-align:left;padding:11px 14px;border-bottom:1px solid rgba(255,255,255,.08)}
-table.bench th{color:#8b91a5;font-weight:500;font-size:12px}
-table.bench tr:hover td{background:rgba(255,255,255,.035)}
-table.bench td.hl{color:#fff;font-weight:600}
-.badge{display:inline-block;font-size:11px;border-radius:999px;padding:2px 10px;margin-left:8px;background:linear-gradient(92deg,#4338CA,#0369A3);color:#fff}
-.badge.probing{background:rgba(251,191,36,.18);color:#fbbf24;border:1px solid rgba(251,191,36,.4)}
-#probe-progress{display:none;margin:14px 0 4px}
-#probe-progress.show{display:block}
-#probe-progress .bar{height:8px;border-radius:999px;background:rgba(255,255,255,.1);overflow:hidden}
-#probe-progress .fill{height:100%;width:0;border-radius:999px;background:linear-gradient(90deg,#6366f1,#22d3ee);transition:width .4s ease}
-#probe-progress .txt{font-size:12px;color:#8b91a5;margin-top:6px}
-#history-line{color:#8b91a5;font-size:13px;margin-top:14px}
-#history-list{list-style:none;margin-top:10px;max-height:220px;overflow:auto}
-#history-list li{font-size:12.5px;color:#a8adbd;padding:7px 4px;border-bottom:1px dashed rgba(255,255,255,.08)}
-#history-list li b{color:#e5e7eb;font-weight:600}
-#toast{position:fixed;right:22px;bottom:22px;z-index:100;display:flex;flex-direction:column;gap:10px}
-.toast-msg{background:rgba(16,20,36,.92);border:1px solid rgba(110,231,183,.45);color:#d1fae5;border-radius:14px;padding:12px 18px;font-size:13px;max-width:360px;box-shadow:0 10px 30px rgba(0,0,0,.5);animation:slidein .25s ease}
-.toast-msg.err{border-color:rgba(248,113,113,.55);color:#fecaca}
-@keyframes slidein{from{transform:translateY(12px);opacity:0}to{transform:none;opacity:1}}
-.footer{color:#9AA0B2;font-size:12.5px;text-align:center;padding:10px 0 30px}
-#login-gate{position:fixed;inset:0;z-index:200;display:flex;align-items:center;justify-content:center;padding:20px;background:radial-gradient(ellipse 55% 40% at 75% 8%,rgba(99,102,241,.28),transparent 70%),radial-gradient(ellipse 45% 35% at 12% 25%,rgba(34,211,238,.16),transparent 70%),rgba(0,0,0,.72);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px)}
-#login-gate.hidden{display:none}
-.login-card{width:380px;max-width:92vw;text-align:center;padding:40px 36px}
-.login-card .logo{font-weight:800;font-size:22px;background:linear-gradient(90deg,#a5b4fc,#67e8f9);-webkit-background-clip:text;background-clip:text;color:transparent}
-.login-card .sub{color:#8b91a5;font-size:13px;margin:10px 0 22px}
-#login-token{width:100%;background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.16);color:#fff;border-radius:12px;padding:12px 16px;font-size:14px;margin-bottom:14px;text-align:center}
-#btn-login{width:100%;background:linear-gradient(92deg,#4338CA,#0369A3);color:#fff;border-radius:12px;padding:12px;font-size:15px;font-weight:600;cursor:pointer;border:none;box-shadow:0 6px 24px rgba(99,102,241,.45)}
-#btn-login:disabled{opacity:.55;cursor:wait}
-#login-err{color:#fca5a5;font-size:13px;min-height:20px;margin-top:12px}
-.shake{animation:shake .4s ease}
-@keyframes shake{0%,100%{transform:translateX(0)}25%{transform:translateX(-8px)}75%{transform:translateX(8px)}}
-#console.hidden{display:none}
-#btn-lock{border:1px solid rgba(255,255,255,.2);border-radius:999px;padding:7px 18px;cursor:pointer;background:rgba(255,255,255,.06);font-size:13px;color:#ddd}
-#btn-lock:hover{background:rgba(255,255,255,.14)}
-@media(max-width:768px){#hero-kicker{font-size:34px}.wrap{padding:20px 14px 44px}.stats{grid-template-columns:repeat(2,1fr)}#topnav{gap:14px}#topnav .links{display:flex;gap:8px;overflow-x:auto;flex:none;max-width:46vw}#topnav .links a{padding:6px 10px;font-size:12px;white-space:nowrap}}
-#bench-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
-table.bench{min-width:560px}
-@media(max-width:640px){.wrap{padding:16px 12px 40px}.glass-card{padding:20px 16px;border-radius:18px}#hero-kicker{font-size:30px}.stats{gap:10px}.stat{padding:12px 14px}.stat .v{font-size:20px}#node-search{width:100%;max-width:none}.actions .btn{flex:1 1 100%;text-align:center}#topnav{padding:12px 16px;gap:14px}#topnav .live{display:none}.glass-card,.stat{backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}#toast{right:max(12px,env(safe-area-inset-right));bottom:max(12px,env(safe-area-inset-bottom));left:max(12px,env(safe-area-inset-left))}.toast-msg{max-width:none}}
-@media(max-width:640px){table.bench th:first-child,table.bench td:first-child{position:sticky;left:0;background:#0b0e1c;z-index:2}table.bench th:last-child,table.bench td:last-child{position:sticky;right:0;background:#0b0e1c;z-index:2}}
-html[data-theme="light"] table.bench th:first-child,html[data-theme="light"] table.bench td:first-child,html[data-theme="light"] table.bench th:last-child,html[data-theme="light"] table.bench td:last-child{background:#fff}
-/* v2 新增元素（与深色皮肤同语言） */
-.num,.stat .v{font-variant-numeric:tabular-nums}
-#topnav .links a{color:#ccc;text-decoration:none;font-size:13px;padding:6px 12px;border-radius:10px}
-#topnav .links a:hover{color:#fff;background:rgba(255,255,255,.07)}
-#topnav .links a.on{color:#fff;background:rgba(255,255,255,.1)}
-#btn-theme{border:1px solid rgba(255,255,255,.2);border-radius:999px;padding:7px 18px;cursor:pointer;background:rgba(255,255,255,.06);font-size:13px;color:#ddd}
-#btn-theme:hover{background:rgba(255,255,255,.14)}
-#statusbar{position:sticky;top:57px;z-index:49;display:flex;gap:20px;align-items:center;flex-wrap:wrap;background:rgba(10,12,24,.88);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);padding:9px 32px;border-bottom:1px solid rgba(255,255,255,.09);font-size:12.5px;color:#a8adbd}
-#statusbar b{color:#fff;font-weight:600;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}
-#statusbar .dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:#6ee7b7;margin-right:6px;box-shadow:0 0 8px #6ee7b7}
-#statusbar .dot.stale{background:#fbbf24;box-shadow:0 0 8px #fbbf24}
-#statusbar .dot.err{background:#fca5a5;box-shadow:0 0 8px #fca5a5}
-#statusbar .sp{flex:1}
-section{scroll-margin-top:130px}
-.route-strip{display:flex;gap:12px;margin-top:16px;flex-wrap:wrap}
-.route-strip .rt{flex:1;min-width:230px;background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.09);border-radius:14px;padding:10px 16px;font-size:12.5px;color:#c2c7d6}
-.route-strip .rt b{display:block;font-size:11.5px;color:#8b91a5;font-weight:600;margin-bottom:2px}
-.route-strip .rt code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;color:#7dd3fc}
-#spark{width:100%;height:64px;display:block}
-.rate-legend{display:flex;gap:18px;font-size:12px;color:#8b91a5;margin-top:8px}
-.rate-legend i{display:inline-block;width:18px;height:2px;vertical-align:middle;margin-right:6px}
-#sortsel,#scope,#loglevel,#log-search{background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.14);color:#fff;border-radius:10px;padding:8px 10px;font-size:13px}
-#sortsel option,#scope option,#loglevel option{background:#121826}
-.node-count{margin-left:auto;font-size:12px;color:#8b91a5}
-.errchip{display:inline-block;font-size:11px;border-radius:999px;padding:2px 10px;margin-left:8px;background:rgba(251,191,36,.15);color:#fbbf24;border:1px solid rgba(251,191,36,.4);font-weight:400}
-.vh{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
-.subtag{display:inline-block;font-size:11px;border-radius:8px;padding:2px 10px;margin-right:10px;background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.14);color:#ddd;white-space:nowrap;flex:none}
-.hostnote{font-size:12px;color:#8b91a5;margin-top:10px}
-.logtools{display:flex;gap:10px;align-items:center;margin-bottom:12px;flex-wrap:wrap}
-.logtools .chk{font-size:12.5px;color:#a8adbd;display:flex;gap:6px;align-items:center;cursor:pointer;white-space:nowrap}
-.setgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:4px}
-.setgrid label{font-size:12.5px;color:#a8adbd;display:flex;flex-direction:column;gap:6px}
-.setgrid label.chk{flex-direction:row;align-items:center;gap:8px;cursor:pointer;min-height:28px}
-.setgrid input[type="number"]{background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.14);color:#fff;border-radius:10px;padding:8px 12px;font-size:13px;width:100%}
-.setgrid input[type="checkbox"]{width:16px;height:16px;accent-color:#0ea5e9}
-#settings-result{margin-top:10px;font-size:13px;color:#6ee7b7;min-height:20px}
-#log-search{width:180px}
-table.bench th.sortable{cursor:pointer;user-select:none}
-table.bench th.sortable:hover{color:#fff}
-.thsort{background:none;border:none;color:inherit;font:inherit;font-size:inherit;cursor:pointer;padding:6px 8px;margin:-6px -8px;min-height:28px;border-radius:8px;white-space:nowrap}
-.thsort:hover{color:#fff}
-table.bench tr.pinned td{background:rgba(99,102,241,.12)}
-table.bench tr.pending td{opacity:.55}
-.cc{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;color:#7dd3fc;border:1px solid rgba(125,211,252,.35);border-radius:6px;padding:1px 7px;margin-right:8px}
-.badge.unmeasured{background:rgba(125,211,252,.13);color:#7dd3fc}
-.lat{display:flex;align-items:center;gap:9px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px}
-.lat .bar{width:66px;height:6px;border-radius:999px;background:rgba(255,255,255,.1);overflow:hidden}
-.lat .bar i{display:block;height:100%;border-radius:999px}
-.l-good{color:#6ee7b7}.l-mid{color:#fbbf24}.l-bad{color:#fca5a5}.l-na{color:#9AA0B2}
-tr.skel td{padding:13px 14px}
-.skel .sk{height:13px;border-radius:6px;background:linear-gradient(90deg,rgba(255,255,255,.05),rgba(255,255,255,.14),rgba(255,255,255,.05));background-size:200% 100%;animation:sh 1.1s linear infinite}
-@keyframes sh{to{background-position:-200% 0}}
-.empty{padding:30px;text-align:center;color:#8b91a5;font-size:13px}
-#logbox{background:rgba(0,0,0,.45);border:1px solid rgba(255,255,255,.09);border-radius:14px;padding:14px 18px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;line-height:1.8;max-height:300px;overflow:auto}
-#logbox .t{color:#69707f}#logbox .ok{color:#6ee7b7}#logbox .warn{color:#fbbf24}#logbox .err{color:#fca5a5}
-.subrow{display:flex;gap:12px;align-items:center;background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.09);border-radius:14px;padding:11px 16px;margin-bottom:10px}
-.subrow code{flex:1;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11.5px;color:#8b91a5;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.subrow .btn{padding:7px 18px;font-size:12.5px}
-:focus-visible{outline:2px solid #67e8f9;outline-offset:2px}
-/* 浅色模式：Google 式白——纯白底、无渐变、无毛玻璃，蓝只用 #1a73e8 一处 */
-html[data-theme="light"] body{background:#fff;color:#202124}
-html[data-theme="light"] body::before{display:none}
-html[data-theme="light"] #topnav,html[data-theme="light"] #statusbar{background:#fff;border-bottom-color:#dadce0}
-html[data-theme="light"] #topnav .links a,html[data-theme="light"] #statusbar{color:#5f6368}
-html[data-theme="light"] #topnav .links a:hover{color:#202124;background:#f1f3f4}
-html[data-theme="light"] #topnav .links a.on{color:#1a73e8;background:#e8f0fe}
-html[data-theme="light"] #btn-lock,html[data-theme="light"] #btn-theme{border-color:#dadce0;background:#fff;color:#1a73e8}
-html[data-theme="light"] #btn-lock:hover,html[data-theme="light"] #btn-theme:hover{background:#f6fafe}
-html[data-theme="light"] #topnav .live{color:#188038;border-color:#188038}
-html[data-theme="light"] #topnav .logo{background:none;color:#1a73e8}
-html[data-theme="light"] .glass-card,html[data-theme="light"] .stat{background:#fff;border-color:#dadce0;box-shadow:0 1px 2px rgba(60,64,67,.15)}
-html[data-theme="light"] .glass-card .desc,html[data-theme="light"] .stat .k,html[data-theme="light"] table.bench th,html[data-theme="light"] #history-line,html[data-theme="light"] #history-list li,html[data-theme="light"] #probe-progress .txt,html[data-theme="light"] .rate-legend,html[data-theme="light"] .empty,html[data-theme="light"] .footer,html[data-theme="light"] .node-count{color:#5f6368}
-html[data-theme="light"] #history-list li{border-bottom-color:#e8eaed}
-html[data-theme="light"] #history-list li b{color:#202124}
-html[data-theme="light"] #hero-kicker{background:none;color:#202124}
-html[data-theme="light"] #hero-sub{color:#5f6368}
-html[data-theme="light"] #verify-result{color:#188038}
-html[data-theme="light"] .verify-ok{color:#188038}
-html[data-theme="light"] .verify-err{color:#d93025}
-html[data-theme="light"] .linklike{color:#1a73e8}
-html[data-theme="light"] #switch-undo{color:#5f6368}
-html[data-theme="light"] #switch-undo b{color:#202124}
-html[data-theme="light"] #undo-link{color:#1a73e8}
-html[data-theme="light"] #exit-card{background:#fff}
-html[data-theme="light"] .route-strip .rt{background:#f8f9fa;border-color:#e8eaed;color:#3c4043}
-html[data-theme="light"] .route-strip .rt b{color:#5f6368}
-html[data-theme="light"] .route-strip .rt code{color:#1a73e8}
-html[data-theme="light"] .btn{border-color:#dadce0;color:#1a73e8;background:#fff}
-html[data-theme="light"] .btn:hover{background:#f6fafe}
-html[data-theme="light"] .btn:active{transform:none}
-html[data-theme="light"] #btn-verify{background:#1a73e8;box-shadow:none}
-html[data-theme="light"] #btn-verify:hover{background:#1b66c9}
-html[data-theme="light"] #btn-fullprobe{border-color:#1a73e8;color:#1a73e8;background:#fff}
-html[data-theme="light"] #node-search,html[data-theme="light"] #sortsel,html[data-theme="light"] #scope,html[data-theme="light"] #loglevel,html[data-theme="light"] #log-search{background:#fff;border-color:#dadce0;color:#202124}
-html[data-theme="light"] #sortsel option,html[data-theme="light"] #scope option,html[data-theme="light"] #loglevel option{background:#fff}
-html[data-theme="light"] #thinbar{background:#e8eaed}
-html[data-theme="light"] #thinbar i{background:#1a73e8}
-html[data-theme="light"] #probe-progress .bar{background:#e8eaed}
-html[data-theme="light"] #probe-progress .fill{background:#1a73e8}
-html[data-theme="light"] table.bench th,html[data-theme="light"] table.bench td{border-bottom-color:#e8eaed}
-html[data-theme="light"] table.bench tr:hover td{background:#f6fafe}
-html[data-theme="light"] table.bench tr.pinned td{background:#e8f0fe}
-html[data-theme="light"] table.bench td.hl{color:#202124}
-html[data-theme="light"] .opbtn{border-color:#dadce0;background:#fff;color:#1a73e8}
-html[data-theme="light"] .opbtn:hover{background:#f6fafe}
-html[data-theme="light"] .opbtn:disabled{color:#70757A;border-color:#e8eaed;background:#fff}
-html[data-theme="light"] .opbtn[aria-disabled="true"]{color:#70757A;border-color:#e8eaed;background:#fff}
-html[data-theme="light"] #node-search::placeholder{color:#5f6368}
-html[data-theme="light"] .ip{color:#202124}
-html[data-theme="light"] table.bench th.sortable:hover{color:#202124}
-html[data-theme="light"] .cc{color:#1a73e8;border-color:#c2dbff}
-html[data-theme="light"] .badge{background:#e6f4ea;color:#137333}
-html[data-theme="light"] .badge.probing{background:#fef7e0;color:#7A4A00;border-color:#fde293}
-html[data-theme="light"] .badge.unmeasured{background:#e8f0fe;color:#174EA6}
-html[data-theme="light"] .lat .bar{background:#e8eaed}
-html[data-theme="light"] .l-good{color:#188038}html[data-theme="light"] .l-mid{color:#B06000}html[data-theme="light"] .l-bad{color:#d93025}html[data-theme="light"] .l-na{color:#70757A}
-html[data-theme="light"] #foot-cpu.l-good,html[data-theme="light"] #foot-mem.l-good{color:#188038}
-html[data-theme="light"] #foot-cpu.l-mid,html[data-theme="light"] #foot-mem.l-mid{color:#e37400}
-html[data-theme="light"] #foot-cpu.l-bad,html[data-theme="light"] #foot-mem.l-bad{color:#d93025}
-html[data-theme="light"] .skel .sk{background:linear-gradient(90deg,#e8eaed,#f1f3f4,#e8eaed);background-size:200% 100%}
-html[data-theme="light"] .subrow{background:#f8f9fa;border-color:#e8eaed}
-html[data-theme="light"] .subrow code{color:#5f6368}
-html[data-theme="light"] #statusbar b{color:#202124}
-html[data-theme="light"] #statusbar .dot{background:#188038;box-shadow:none}
-html[data-theme="light"] #statusbar .dot.stale{background:#B06000;box-shadow:none}
-html[data-theme="light"] #statusbar .dot.err{background:#d93025;box-shadow:none}
-html[data-theme="light"] .spin{border-color:rgba(26,115,232,.25);border-top-color:#1a73e8}
-html[data-theme="light"] #logbox{background:#f8f9fa;border-color:#e8eaed}
-html[data-theme="light"] #logbox .t{color:#70757A}
-html[data-theme="light"] #logbox .ok{color:#188038}html[data-theme="light"] #logbox .warn{color:#b06000}html[data-theme="light"] #logbox .err{color:#d93025}
-html[data-theme="light"] #login-gate{background:rgba(255,255,255,.9)}
-html[data-theme="light"] .login-card{background:#fff;border-color:#dadce0;box-shadow:0 1px 3px rgba(60,64,67,.2)}
-html[data-theme="light"] .login-card .logo{background:none;color:#1a73e8}
-html[data-theme="light"] .login-card .sub{color:#5f6368}
-html[data-theme="light"] #login-token{background:#fff;border-color:#dadce0;color:#202124}
-html[data-theme="light"] #btn-login{background:#1a73e8;box-shadow:none}
-html[data-theme="light"] #login-err{color:#d93025}
-html[data-theme="light"] .errchip{background:#fef7e0;color:#7A4A00;border-color:#fde293}
-html[data-theme="light"] .subtag{background:#f1f3f4;border-color:#dadce0;color:#5f6368}
-html[data-theme="light"] .hostnote,html[data-theme="light"] .logtools .chk{color:#5f6368}
-html[data-theme="light"] .setgrid label{color:#5f6368}
-html[data-theme="light"] .setgrid input[type="number"]{background:#fff;border-color:#dadce0;color:#202124}
-html[data-theme="light"] #settings-result{color:#188038}
-html[data-theme="light"] .toast-msg{background:#fff;color:#3c4043;border-color:#dadce0}
-html[data-theme="light"] .toast-msg.err{background:#fff;color:#d93025;border-color:#d93025}
-html[data-theme="light"] :focus-visible{outline-color:#1a73e8}
-@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+# The console lives in www/console.html so this module stays reviewable; the
+# loader is cached and anchored to the module directory, and reading with
+# newline="" keeps the served bytes identical to the old literal.
+_CONSOLE_HTML_PATH = Path(__file__).resolve().parent / "www" / "console.html"
+_CONSOLE_HTML_FALLBACK = (
+    "<!doctype html><html lang=\"zh\"><head><meta charset=\"utf-8\">"
+    "<title>vpngate console</title></head><body>"
+    "<h1>console unavailable</h1>"
+    "<p>www/console.html could not be read.</p></body></html>"
+)
 
-</style></head>
-<body>
-<div id="topnav"><span class="logo">vpngate</span><span class="live" title="自动刷新每15秒">● <span lang="en">LIVE</span></span><span class="links"><a href="#sec-overview">总览</a><a href="#sec-nodes">节点</a><a href="#sec-logs">日志</a><a href="#sec-sub" id="nav-sub">订阅</a><a href="#sec-hist">事件</a><a href="#sec-settings">设置</a></span><span class="right"><button id="btn-theme" onclick="toggleTheme()">浅色</button><button id="btn-lock" onclick="lockConsole()">锁定</button></span></div>
-<div id="statusbar" aria-label="实时状态"><span><span class="dot" id="sb-dot"></span><span class="vh" id="sb-dot-txt">正常</span>出口 <b id="sb-exit">—</b></span><span>节点 <b id="sb-node">—</b></span><span class="sp"></span><span>↓ <b id="rate-dn">—</b> Mb/s</span><span>↑ <b id="rate-up">—</b> Mb/s</span></div>
-<div id="login-gate"><div class="login-card glass-card"><div class="logo">vpngate</div><div class="sub">输入 Railway 环境变量 ADMIN_TOKEN（部署页 Variables 中查看）</div><div style="display:flex;gap:8px;margin-bottom:14px"><input id="login-token" type="password" autocomplete="off" aria-label="ADMIN_TOKEN" aria-describedby="login-err" placeholder="ADMIN_TOKEN" style="margin-bottom:0;flex:1" onkeydown="if(event.key==='Enter')loginEnter()"><button id="btn-show-token" class="btn" style="padding:12px 14px;font-size:13px;white-space:nowrap" aria-pressed="false" onclick="toggleToken()">显示</button></div><button id="btn-login" onclick="loginEnter()">进入控制台</button><button id="btn-theme-gate" class="btn" style="width:100%;margin-top:10px;padding:10px;font-size:13px" onclick="toggleTheme()">浅色</button><p id="login-err" role="alert"></p></div></div>
-<div class="wrap" id="console" style="display:none">
-<section id="sec-overview" aria-label="总览">
-<div id="exit-card" class="glass-card">
-<div id="hero-kicker">—<br>—</div>
-<p id="hero-sub">加载中…</p>
-<p id="verify-result" aria-live="polite"></p>
-<p id="switch-undo" hidden>已从 <b id="undo-from"></b> 切换到 <b id="undo-to"></b> · <button id="undo-link" class="opbtn" onclick="onUndo()">撤销换回</button></p>
-<div class="route-strip" id="route-strip" hidden>
-<div class="rt"><b>/ws-node → Railway 本机</b><code id="route-direct">—</code></div>
-<div class="rt"><b>/ws-chain → VPN 节点</b><code id="route-chain">—</code></div>
-<div class="rt" id="route-resi-wrap" hidden><b>/ws-resi → <span id="route-resi-kind">出口</span></b><code id="route-resi">—</code></div>
-</div>
-<div class="actions"><button id="btn-verify" onclick="verifyExit()">验证出口 IP</button></div>
-</div>
-<div class="glass-card" id="resi-card" hidden>
-<h2>第三出口（轮换）</h2>
-<p class="desc">默认从所有实测有效节点里按连接环形轮换：第 1 条走节点 1、第 2 条走节点 2，用完一圈回到第 1 个。配置了住宅网关时改为连固定 backconnect 网关。</p>
-<p id="resi-line">—</p>
-<p id="resi-ips" class="ip" aria-live="polite">—</p>
-<div class="actions"><button id="btn-resi-probe" class="btn" onclick="resiProbe()">探测出口 IP</button></div>
-</div>
-<div class="stats">
-<div class="stat"><div class="k">可用节点</div><div class="v" id="stat-nodes">—</div></div>
-<div class="stat"><div class="k">最优实测</div><div class="v" id="stat-best">—</div></div>
-<div class="stat"><div class="k">运行时间</div><div class="v" id="stat-uptime">—</div></div>
-<div class="stat"><div class="k">累计流量 ↓/↑</div><div class="v num" style="font-size:17px;padding-top:7px"><span id="stat-down">—</span> / <span id="stat-up">—</span></div></div>
-<div class="stat"><div class="k">刷新成功/失败 <span id="stat-err" class="errchip" hidden></span></div><div class="v" id="stat-refresh">—</div></div>
-</div>
-<div class="glass-card" id="rate-card" hidden>
-<h2>实时速率</h2>
-<p class="desc">由 traffic 计数器差分绘制，console 可见时每轮更新。</p>
-<canvas id="spark" width="1000" height="64" role="img" aria-label="速率曲线"></canvas><p id="spark-alt" class="vh" role="status"></p>
-<div class="rate-legend"><span><i style="background:#6ee7b7"></i>下行</span><span><i style="background:#7dd3fc"></i>上行</span></div>
-</div>
-</section>
-<section id="sec-nodes" aria-label="节点">
-<div class="glass-card">
-<h2>可用节点</h2>
-<p class="desc">全部节点握手发现，真拨先测 TopK（REAL_TOPK）让服务先起来，启动/刷新后会自动在后台补齐全量真测；Speed 排名不等于可拨通，首选由 urltest 实测决定，多 endpoint 兜底。点击表头可排序，未测通节点不可切换。</p>
-<div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap"><input id="node-search" aria-label="搜索节点（IP 或国家）" placeholder="搜索 IP / 国家…" oninput="debouncedRefresh()"><select id="sortsel" aria-label="排序"><option value="real">按实测延迟</option><option value="hand">按握手延迟</option><option value="country">按国家</option><option value="alive">按存活时间</option><option value="server">按出口 IP</option></select><button id="btn-refresh" class="btn" onclick="refreshNow()">刷新节点</button><button id="btn-fullprobe" class="btn" onclick="fullProbeNow()">全量真测</button><button id="btn-fullprobe-cancel" class="btn" style="display:none" onclick="cancelFullProbe()">取消真测</button><span class="node-count" id="node-count"></span></div>
-<select id="scope" aria-label="范围"><option value="">全部国家</option></select>
-<div id="thinbar" aria-hidden="true"><i></i></div><div id="probe-progress"><div class="bar"><div class="fill" id="probe-fill" role="progressbar" aria-label="全量真测进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></div></div><div class="txt" id="probe-txt"></div></div>
-<div id="empty-note" class="empty" hidden></div>
-<p id="load-note" class="vh" role="status" hidden>加载中…</p><div id="bench-wrap"><table class="bench" aria-label="可用节点"><thead><tr><th class="sortable" scope="col"><button class="thsort" data-k="server" data-label="出口 IP">出口 IP</button></th><th class="sortable" scope="col"><button class="thsort" data-k="country" data-label="国家">国家</button></th><th class="sortable" scope="col"><button class="thsort" data-k="hand" data-label="握手">握手</button></th><th class="sortable" scope="col"><button class="thsort" data-k="real" data-label="实测">实测</button></th><th class="sortable" scope="col"><button class="thsort" data-k="alive" data-label="存活">存活</button></th><th scope="col">操作</th></tr></thead><tbody id="bench-body"></tbody></table></div>
-</div>
-</section>
-<section id="sec-logs" aria-label="日志">
-<div class="glass-card">
-<h2>日志</h2>
-<p class="desc">sing-box 最近输出，排查拨号失败时看这里。</p>
-<div class="logtools"><input id="log-search" placeholder="搜索日志…" aria-label="搜索日志" oninput="renderLogs()"><select id="loglevel" aria-label="级别" title="error≈fail·refus·denied·exception；warn≈timeout·retry；ok≈verify·switch·refresh"><option value="">全部级别</option><option value="info">info</option><option value="warn">warn</option><option value="error">error</option></select><label class="chk"><input type="checkbox" id="log-auto" checked onchange="renderLogs()"> 自动滚动</label><button class="btn" style="padding:7px 18px;font-size:12.5px" id="btn-logrefresh" onclick="refreshLogs(this)">刷新</button></div>
-<div id="logbox" role="log" aria-label="服务日志"><div style="color:#8b91a5">加载中…</div></div>
-</div>
-</section>
-<section id="sec-sub" aria-label="订阅" hidden>
-<div class="glass-card">
-<h2>订阅</h2>
-<p class="desc">双路 VLESS，一键复制。域名取当前访问 host。</p>
-<div class="subrow"><span class="subtag">直连 /ws-node（VPN 故障时可用）</span><code id="sub-direct">—</code><button class="btn" onclick="copySub('direct',this)">复制</button></div>
-<div class="subrow"><span class="subtag">经 VPN /ws-chain（跟随当前出口）</span><code id="sub-chain">—</code><button class="btn" onclick="copySub('chain',this)">复制</button></div>
-<div class="subrow" id="sub-resi-row" hidden><span class="subtag">第三出口 /ws-resi（轮换）</span><code id="sub-resi">—</code><button class="btn" onclick="copySub('resi',this)">复制</button></div>
-<p class="hostnote" id="sub-host"></p>
-<div class="actions" style="margin-top:4px"><button class="btn" id="btn-copy-all" style="padding:7px 18px;font-size:12.5px" onclick="copyAll(this)">复制全部</button></div>
-</div>
-</section>
-<section id="sec-hist" aria-label="事件">
-<div class="glass-card">
-<h2>事件</h2>
-<p class="desc">刷新 / 切换 / 测速 / 验证记录，最近 20 条。</p>
-<p id="history-line"></p>
-<ul id="history-list"></ul>
-</div>
-</section>
-<section id="sec-settings" aria-label="设置">
-<div class="glass-card">
-<h2>设置</h2>
-<p class="desc">运行参数，保存后下轮生效（刷新间隔、全量并发等），重启不丢失。</p>
-<div class="setgrid">
-<label>刷新间隔秒<input id="set-refresh" type="number" aria-label="刷新间隔秒"></label>
-<label>真拨超时秒<input id="set-timeout" type="number" aria-label="真拨超时秒"></label>
-<label>TopK 真拨数<input id="set-topk" type="number" aria-label="TopK 真拨数"></label><label>节点数(0=全量)<input id="set-limit" type="number" aria-label="节点数"></label>
-<label>刷新真拨并发<input id="set-dialw" type="number" aria-label="刷新真拨并发"></label>
-<label>全量真测并发<input id="set-fpw" type="number" aria-label="全量真测并发"></label>
-<label>握手并发<input id="set-probew" type="number" aria-label="握手并发"></label>
-<label class="chk"><input type="checkbox" id="set-repin"> 每小时自动重 pin 最优</label>
-<label class="chk"><input type="checkbox" id="set-rescue"> 手动 pin 挂了自动救最优</label>
-<label>住宅粘性秒(0=旋转)<input id="set-resittl" type="number" aria-label="住宅粘性秒"></label>
-</div>
-<div class="actions"><button id="btn-settings-save" class="btn" onclick="saveSettings()">保存设置</button></div>
-<p id="settings-result" aria-live="polite"></p>
-</div>
-</section>
-<div class="footer"><span id="foot-cpu" class="num">CPU —</span> · <span id="foot-mem" class="num">MEM —</span></div>
-</div>
-<div id="toast" role="status" aria-live="polite"></div><div id="alerts" role="alert" aria-live="assertive"></div>
-<script>
-var activeCountry = "";
-var lastStatus = null;
-var probeSeq = 0, fullSeq = 0, verifySeq = 0, fullT0 = 0, lastOkAt = 0;
-var searchTimer = null, probeCtl = null, verifyCtl = null, fullCtl = null, autoVerifiedFor = null;
-var sortKey = "real", sortDir = 1, pendingTag = null, pendingTimer = null, scopeSig = null;
-var lastBytes = null, rateHist = {dn: [], up: []}, lastLogLines = [];
-function authHeaders() {
-  return {"Authorization": "Bearer " + (localStorage.getItem("admin_token") || "")};
-}
-function showConsole() {
-  document.getElementById("login-gate").classList.add("hidden");
-  document.getElementById("console").style.display = "";
-  refresh();
-  refreshLogs(null);
-  loadSettings();
-}
-function backToLogin(msg) {
-  probeSeq++; fullSeq++; verifySeq++;
-  if (probeCtl) { probeCtl.abort(); probeCtl = null; }
-  if (verifyCtl) { verifyCtl.abort(); verifyCtl = null; }
-  if (fullCtl) { fullCtl.abort(); fullCtl = null; }
-  localStorage.removeItem("admin_token");
-  document.getElementById("console").style.display = "none";
-  const gate = document.getElementById("login-gate");
-  gate.classList.remove("hidden");
-  const input = document.getElementById("login-token");
-  input.value = "";
-  document.getElementById("login-err").textContent = msg || "";
-  input.focus();
-}
-function lockConsole() {
-  if (pendingTimer) clearTimeout(pendingTimer);
-  pendingTag = null;
-  if (undoTimer) clearTimeout(undoTimer);
-  undoFrom = null;
-  const undo = document.getElementById("switch-undo");
-  if (undo) undo.hidden = true;
-  backToLogin("");
-}
-async function loginEnter() {
-  const input = document.getElementById("login-token");
-  const btn = document.getElementById("btn-login");
-  if (btn.disabled) return;
-  const err = document.getElementById("login-err");
-  const trial = input.value.trim();
-  if (!trial) { err.textContent = "请先填写 token"; input.focus(); return; }
-  btn.disabled = true;
-  btn.textContent = "验证中…";
-  err.textContent = "";
-  localStorage.setItem("admin_token", trial);
-  try {
-    await api("/api/status");
-    showConsole();
-  } catch (e) {
-    localStorage.removeItem("admin_token");
-    err.textContent = "token 不对，请重试";
-    input.select();
-    input.focus();
-    const card = document.querySelector(".login-card");
-    card.classList.remove("shake");
-    void card.offsetWidth;
-    card.classList.add("shake");
-  }
-  btn.disabled = false;
-  btn.textContent = "进入控制台";
-}
-async function silentLogin() {
-  if (!localStorage.getItem("admin_token")) return;
-  try {
-    await api("/api/status");
-    showConsole();
-  } catch (e) {
-    localStorage.removeItem("admin_token");
-  }
-}
-function toast(msg, isErr) {
-  const box = document.getElementById(isErr ? "alerts" : "toast") || document.getElementById("toast");
-  if ([...box.children].some(c => c.textContent === msg)) return;
-  while (box.children.length >= 3) box.firstChild.remove();
-  const el = document.createElement("div");
-  el.className = "toast-msg" + (isErr ? " err" : "");
-  el.textContent = msg;
-  box.appendChild(el);
-  setTimeout(() => el.remove(), isErr ? 6000 : 4500);
-}
-function setBusy(id, busy, busyText) {
-  const el = document.getElementById(id);
-  if (!el) return;
-  if (busy) {
-    if (el.dataset.orig === undefined) el.dataset.orig = el.textContent;
-    el.disabled = true;
-    el.classList.add("busy");
-    el.textContent = busyText || "进行中…";
-  } else {
-    el.disabled = false;
-    el.classList.remove("busy");
-    if (el.dataset.orig !== undefined) el.textContent = el.dataset.orig;
-  }
-}
-async function api(path, method, body, signal) {
-  const r = await fetch(path, {method: method || "GET", headers: authHeaders(),
-    body: body ? JSON.stringify(body) : undefined, signal: signal || undefined});
-  if (r.status === 401) throw new Error("unauthorized: save ADMIN_TOKEN first");
-  if (!r.ok) {
-    const raw = (await r.text()).slice(0, 160);
-    let detail = raw;
-    try { const j = JSON.parse(raw); detail = j.detail || j.error || raw; } catch (_e) {}
-    throw new Error("HTTP " + r.status + ": " + detail);
-  }
-  return r.json();
-}
-function runningTagOf(msg) { const m = /"tag"\\s*:\\s*"([^"]+)"/.exec(msg || ""); return m ? m[1] : ""; }
-// Charset note: tags are safeTag-stripped ([a-zA-Z0-9-_]) and only minted as
-// vpngate-N, so they never contain quotes/escapes that could break [^"]+.
-function isAbort(e) { return !!e && e.name === "AbortError"; }
-function fmtMs(v) { return v == null ? "—" : v + "ms"; }
-function safeTag(t) { return String(t || "").replace(/[^a-zA-Z0-9-_]/g, ""); }
-function esc(s) { return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;"); }
-function latCls(v) { if (v == null) return "l-na"; if (v < 250) return "l-good"; if (v < 600) return "l-mid"; return "l-bad"; }
-function latBar(v) {
-  if (v == null) return '<span class="l-na">—</span>';
-  const w = Math.max(6, Math.min(100, Math.round(v / 8)));
-  return '<span class="lat"><span class="bar"><i style="width:' + w + '%;background:currentColor" class="' + latCls(v) + '"></i></span><span class="' + latCls(v) + '">' + v + 'ms</span></span>';
-}
-function fmtGB(v) { return v == null ? "—" : (v / 1e9).toFixed(1) + " GB"; }
-function fmtDur(sec) {
-  sec = Math.max(0, Math.floor(sec || 0));
-  if (sec < 3600) return Math.floor(sec / 60) + "m";
-  if (sec < 172800) return Math.floor(sec / 3600) + "h" + Math.floor(sec % 3600 / 60) + "m";
-  return Math.floor(sec / 86400) + "d" + Math.floor(sec % 86400 / 3600) + "h";
-}
-function nodeQuery() { const el = document.getElementById("node-search"); return el ? el.value.trim().toLowerCase() : ""; }
-function preferredEp(s) { const all = (s && s.endpoints) || []; return all.find(e => e.tag === s.preferred_tag) || all[0]; }
-function sortVal(e) {
-  if (sortKey === "country") return (e.country || "") + (e.tag || "");
-  if (sortKey === "tag") return e.tag || "";
-  if (sortKey === "server") return e.server || "";
-  if (sortKey === "hand") return e.latency_ms == null ? 1e9 : e.latency_ms;
-  if (sortKey === "alive") return -(e.alive_seconds || 0);
-  return e.real_latency_ms == null ? 1e9 : e.real_latency_ms;
-}
-function filteredEndpoints(s) {
-  const q = nodeQuery();
-  const arr = s.endpoints.filter(e => (!activeCountry || e.country_short === activeCountry) &&
-    (!q || (e.tag || "").toLowerCase().includes(q) || (e.country_short || "").toLowerCase().includes(q) ||
-      (e.country || "").toLowerCase().includes(q) || (e.server || "").toLowerCase().includes(q)));
-  arr.sort((a, b) => { const x = sortVal(a), y = sortVal(b); return (x > y ? 1 : x < y ? -1 : 0) * sortDir; });
-  return arr;
-}
-function debouncedRefresh() {
-  if (searchTimer) clearTimeout(searchTimer);
-  searchTimer = setTimeout(() => { searchTimer = null; renderFiltered(); }, 300);
-}
-function clearFilter() {
-  activeCountry = "";
-  const el = document.getElementById("node-search");
-  if (el) el.value = "";
-  const sc = document.getElementById("scope");
-  if (sc) sc.value = "";
-  renderFiltered();
-}
-async function refresh() {
-  try {
-    const s = await api("/api/status");
-    lastStatus = s;
-    renderAll(s);
-    lastOkAt = Date.now();
-  } catch (e) {
-    if (isAbort(e)) return;
-    if (/401|unauthorized/.test(e.message || "")) { backToLogin("登录已失效，请重新输入 token"); return; }
-    document.getElementById("hero-sub").textContent = "状态拉取失败：" + e.message;
-    toast("状态拉取失败: " + e.message, true);
-  }
-}
-function renderFiltered() {
-  if (!lastStatus) { refresh(); return; }
-  renderAll(lastStatus);
-}
-function renderAll(s) {
-  try {
-    const focusEl = document.activeElement;
-    let focusBack = null;
-    const focusSearch = () => { if (document.getElementById("node-search")) document.getElementById("node-search").focus(); };
-    if (focusEl && focusEl.getAttribute) {
-      if (focusEl.id === "scope") focusBack = () => document.getElementById("scope").focus();
-      else if (focusEl.getAttribute("data-probe")) { const t = focusEl.getAttribute("data-probe"); focusBack = () => { const b = document.querySelector("[data-probe='" + t + "']"); if (b && !b.disabled) b.focus(); else focusSearch(); }; }
-      else if (focusEl.getAttribute("data-switch")) { const t = focusEl.getAttribute("data-switch"); focusBack = () => { const b = document.querySelector("[data-switch='" + t + "']"); if (b && !b.disabled) b.focus(); else focusSearch(); }; }
-    }
-    if (pendingTag && s.preferred_tag === pendingTag && !(s.probe && s.probe.state === "running")) pendingTag = null;
-    const eps = filteredEndpoints(s);
-    const pref = preferredEp(s);
-    document.getElementById("hero-kicker").innerHTML =
-      (pref ? esc(pref.country_short) + "<br>" + (pref.real_latency_ms != null ? pref.real_latency_ms + "ms" : fmtMs(pref.latency_ms) + "·未真测") : "—<br>无节点");
-    document.getElementById("hero-sub").textContent =
-      pref ? ("出口 " + pref.server + ":" + pref.server_port + " · 存活 " + (pref.alive_seconds || 0) + "s") : "暂无可用节点";
-    renderVerify(s.verify, pref);
-    maybeAutoVerify(s);
-    renderStatusbar(s, pref);
-    renderTraffic(s);
-    renderRoutes(s);
-    renderSub(s);
-    document.getElementById("stat-nodes").textContent = s.endpoints.length;
-    const measured = s.endpoints.filter(e => e.real_latency_ms != null).map(e => e.real_latency_ms);
-    document.getElementById("stat-best").textContent = measured.length ? Math.min.apply(null, measured) + "ms" : "—";
-    document.getElementById("stat-uptime").textContent = fmtDur(s.uptime_seconds || 0);
-    document.getElementById("stat-refresh").textContent = s.refresh_ok + "/" + s.refresh_fail;
-    const errChip = document.getElementById("stat-err");
-    if (errChip) {
-      if (s.last_error) { errChip.hidden = false; errChip.textContent = String(s.last_error).slice(0, 18); errChip.title = String(s.last_error); }
-      else errChip.hidden = true;
-    }
-    const byCountry = {};
-    s.endpoints.forEach(e => { byCountry[e.country_short] = (byCountry[e.country_short] || 0) + 1; });
-    const scopeSel = document.getElementById("scope");
-    if (scopeSel) {
-      const codes = {};
-      (s.countries || []).forEach(c => { codes[c.code] = c.name; });
-      s.endpoints.forEach(e => { if (e.country_short && !codes[e.country_short]) codes[e.country_short] = e.country || e.country_short; });
-      const sig = JSON.stringify([codes, byCountry]);
-      if (sig !== scopeSig) {
-        scopeSig = sig;
-        scopeSel.innerHTML = '<option value="">全部国家 ' + s.endpoints.length + "</option>" +
-          Object.keys(codes).sort().map(code => '<option value="' + esc(code) + '"' + (activeCountry === code ? " selected" : "") + ">" + esc(code) + " " + (byCountry[code] || 0) + "</option>").join("");
-      } else if (scopeSel.value !== activeCountry) {
-        scopeSel.value = activeCountry;
-      }
-    }
-    const probingTag = (s.probe && s.probe.state === "running") ? s.probe.tag : null;
-    const rows = eps.map(e => {
-      const t = safeTag(e.tag);
-      const isPinned = e.tag === s.preferred_tag, isPending = e.tag === pendingTag;
-      const pinned = isPinned ? '<span class="badge">生效中</span>' : "";
-      const pending = isPending ? '<span class="badge probing">切换中</span>' : "";
-      const probing = (!isPending && e.tag === probingTag) ? '<span class="badge probing">测速中</span>' : "";
-      const unmeasured = e.real_latency_ms == null;
-      const unm = (!isPinned && !isPending && unmeasured) ? '<span class="badge unmeasured">未测通</span>' : "";
-      const disSw = unmeasured ? " aria-disabled='true' title='先测速再切换：该节点还未测通'" : "";
-      const disPb = (e.tag === probingTag) ? " aria-disabled='true' title='测速中，请稍候'" : "";
-      return "<tr class='" + (isPinned ? "pinned" : "") + (isPending ? " pending" : "") + "'><td class='hl'><span class='ip'>" + esc(e.server || e.tag) + "</span>" + pinned + pending + probing + unm + "</td><td><span class='cc'>" + esc(e.country_short) + "</span>" + esc(e.country) + "</td><td class='hl'>" + fmtMs(e.latency_ms) +
-      "</td><td class='hl'>" + latBar(e.real_latency_ms) + "</td><td>" + (e.alive_seconds || 0) + "s</td>" +
-      "<td class='op'><button class='opbtn' data-probe='" + t + "' aria-label='单测 " + esc(e.server || e.tag) + "'" + disPb + ">测速</button><button class='opbtn' data-switch='" + t + "' aria-label='切换到 " + esc(e.server || e.tag) + "'" + disSw + ">切换</button></td></tr>";
-    }).join("");
-    document.getElementById("bench-body").innerHTML = rows ||
-      '<tr><td colspan="6"><div class="empty">无匹配节点，换个关键词或 <a class="linklike" onclick="clearFilter()">清除筛选</a></div></td></tr>';
-    document.getElementById("node-count").textContent = eps.length + " / " + s.endpoints.length;
-    const loadNote = document.getElementById("load-note");
-    if (loadNote) loadNote.hidden = true;
-    const emptyNote = document.getElementById("empty-note");
-    if (emptyNote) {
-      const filtering = activeCountry || nodeQuery();
-      if (s.endpoints.length === 0) {
-        emptyNote.hidden = false;
-        emptyNote.innerHTML = "暂无可用节点" + (s.last_error ? "（快照拉取失败：" + esc(String(s.last_error).slice(0, 120)) + "）" : "") + ' · <a class="linklike" onclick="refreshNow()">重试刷新</a>';
-      } else if (!filtering && s.endpoints.every(e => e.real_latency_ms == null)) {
-        emptyNote.hidden = false;
-        emptyNote.innerHTML = s.endpoints.length + ' 个节点均未真测，请先全量真测再切换 · <a class="linklike" onclick="fullProbeNow()">开始全量真测</a>';
-      } else {
-        emptyNote.hidden = true;
-      }
-    }
-    if (focusBack) focusBack();
-    syncSortHeaders();
-    renderProbeProgress(s.full_probe);
-    document.getElementById("history-line").textContent =
-      "刷新成功/失败：" + s.refresh_ok + "/" + s.refresh_fail + " · 运行：" + fmtDur(s.uptime_seconds || 0) + " · 错误：" + (s.last_error || "—");
-    const hist = (s.refresh_history || []).slice().reverse().slice(0, 20);
-    document.getElementById("history-list").innerHTML = hist.length ?
-      hist.map(h => "<li><b>" + esc(h.event) + "</b> " + esc(h.detail || "") + " · " + esc(h.ts || "") + "</li>").join("") :
-      '<li style="color:#8b91a5">暂无事件</li>';
-    const cpu = s.cpu || {}, mem = s.mem || s.memory || {};
-    const cpuPct = cpu.pct, memPct = mem.pct;
-    const footCpu = document.getElementById("foot-cpu"), footMem = document.getElementById("foot-mem");
-    if (footCpu) {
-      footCpu.textContent = "CPU " + (cpu.model || "—") + " · " + (cpuPct == null ? "—" : cpuPct + "%");
-      footCpu.className = "num " + (cpuPct == null || cpuPct < 50 ? "l-good" : (cpuPct < 80 ? "l-mid" : "l-bad"));
-    }
-    if (footMem) {
-      footMem.textContent = "MEM " + (memPct == null ? "—" : memPct + "%");
-      footMem.className = "num " + (memPct == null || memPct < 70 ? "l-good" : (memPct < 88 ? "l-mid" : "l-bad"));
-    }
-  } catch (e) {
-    if (isAbort(e)) return;
-    document.getElementById("hero-sub").textContent = "状态拉取失败：" + e.message;
-    toast("状态拉取失败: " + e.message, true);
-  }
-}
-function renderStatusbar(s, pref) {
-  const exitIp = (s.verify && s.verify.exit_ip) ||
-    ((s.verify && s.verify.state === "running") ? "验证中…" : "未验证");
-  document.getElementById("sb-exit").textContent = exitIp;
-  const pinEp = (s.endpoints || []).find(x => x.tag === s.preferred_tag) || {};
-  const pinIp = pinEp.server || s.preferred_tag;
-  const nodeEl = document.getElementById("sb-node");
-  nodeEl.textContent = s.preferred_tag ? (pinIp + " · 已 pin") : (pref ? ((pref.server || pref.tag) + " · 自动") : "—");
-  const backupIp = s.backup_tag ? ipOf(s.backup_tag) : null;
-  nodeEl.title = s.preferred_tag
-    ? ((s.auto_pinned ? "自动优选：全量实测最低" : "已 pin：手动锁定该出口") +
-       (backupIp ? " · 备选 " + backupIp : ""))
-    : "自动：由 urltest 优选";
-  const dot = document.getElementById("sb-dot");
-  if (dot) {
-    const age = lastOkAt ? Math.round((Date.now() - lastOkAt) / 1000) : 1e9;
-    const verified = !!(s.verify && s.verify.exit_ip);
-    dot.className = "dot " + (age > 45 ? "err" : ((!verified || age > 30) ? "stale" : ""));
-    dot.title = "上次更新" + (age > 1e8 ? "—" : age + "s前") + " · 自动刷新每15s";
-    const dtxt = document.getElementById("sb-dot-txt");
-    if (dtxt) dtxt.textContent = age > 45 ? "刷新失败" : ((!verified || age > 30) ? "未验证或数据较旧" : "正常");
-  }
-}
-function renderTraffic(s) {
-  const t = s.traffic || {};
-  document.getElementById("stat-down").textContent = fmtGB(t.bytes_down);
-  document.getElementById("stat-up").textContent = fmtGB(t.bytes_up);
-  const now = Date.now();
-  if (lastBytes && now > lastBytes.at) {
-    const dt = (now - lastBytes.at) / 1000;
-    const dn = Math.max(0, (t.bytes_down - lastBytes.dn) * 8 / dt / 1e6);
-    const up = Math.max(0, (t.bytes_up - lastBytes.up) * 8 / dt / 1e6);
-    document.getElementById("rate-dn").textContent = dn.toFixed(2);
-    document.getElementById("rate-up").textContent = up.toFixed(2);
-    const alt = document.getElementById("spark-alt");
-    if (alt) alt.textContent = "下行最新 " + dn.toFixed(2) + " Mb/s，上行 " + up.toFixed(2) + " Mb/s";
-    rateHist.dn.push(dn); rateHist.up.push(up);
-    if (rateHist.dn.length > 60) { rateHist.dn.shift(); rateHist.up.shift(); }
-    document.getElementById("rate-card").hidden = false;
-    drawSpark();
-  }
-  lastBytes = {at: now, dn: t.bytes_down || 0, up: t.bytes_up || 0};
-}
-function drawSpark() {
-  const c = document.getElementById("spark");
-  if (!c || !rateHist.dn.length) return;
-  const x = c.getContext("2d"), W = c.width, H = c.height;
-  x.clearRect(0, 0, W, H);
-  const dark = document.documentElement.dataset.theme !== "light";
-  const line = (arr, col, max) => {
-    x.strokeStyle = col; x.lineWidth = 2; x.beginPath();
-    arr.forEach((v, i) => { const px = i / Math.max(1, arr.length - 1) * W, py = H - 4 - Math.min(1, v / max) * (H - 10); i ? x.lineTo(px, py) : x.moveTo(px, py); });
-    x.stroke();
-  };
-  line(rateHist.dn, dark ? "#6ee7b7" : "#047857", Math.max(2, ...rateHist.dn));
-  line(rateHist.up, dark ? "#7dd3fc" : "#0284c7", Math.max(1, ...rateHist.up));
-}
-function renderRoutes(s) {
-  const strip = document.getElementById("route-strip");
-  if (!strip) return;
-  strip.hidden = false;
-  document.getElementById("route-direct").textContent = location.hostname + " 本机";
-  const exitIp = (s.verify && s.verify.exit_ip) || ((s.verify && s.verify.state === "running") ? "验证中…" : "未验证");
-  document.getElementById("route-chain").textContent = exitIp;
-  const resi = s.resi || {};
-  const wrap = document.getElementById("route-resi-wrap");
-  if (wrap) wrap.hidden = !resi.enabled;
-  if (resi.enabled) {
-    const rotate = resi.mode === "rotate";
-    const kind = document.getElementById("route-resi-kind");
-    if (kind) kind.textContent = rotate ? "节点轮换" : "住宅出口";
-    const cell = document.getElementById("route-resi");
-    if (cell) cell.textContent = rotate
-      ? ((resi.pool || 0) + " / " + (resi.inbounds || resi.nodes || 0) + " 可用")
-      : (resi.exit_ip || "未探测");
-  }
-  renderResi(s);
-}
-function renderResi(s) {
-  const card = document.getElementById("resi-card");
-  if (!card) return;
-  const r = s.resi || {};
-  if (!r.enabled) { card.hidden = true; return; }
-  card.hidden = false;
-  const rotate = r.mode === "rotate";
-  const mode = rotate
-    ? ("节点池 " + (r.pool || 0) + "/" + (r.inbounds || 0) + " 可用 · 每连接轮换" +
-       (r.down ? (" · " + r.down + " 个临时剔除") : "") +
-       (r.reserved ? (" · " + r.reserved + " 个留给 chain") : ""))
-    : (r.mode === "sticky" ? ("粘性 · ttl " + r.sticky_ttl + "s") : "旋转");
-  const where = rotate ? ("入口 :" + r.port + r.path) : ("网关 " + r.host + ":" + r.port);
-  const state = r.state === "up" ? "正常" : (r.state === "down" ? "不可用" : "未探测");
-  const el = document.getElementById("resi-line");
-  if (el) el.textContent = where + " · " + mode + " · " + state +
-    (r.exit_ip ? (" · 出口 " + r.exit_ip + (r.ms ? (" / " + r.ms + "ms") : "")) : "") +
-    (r.error ? (" · " + r.error) : "");
-  const p = r.last_probe || {};
-  const ips = p.ips || [];
-  const box = document.getElementById("resi-ips");
-  if (!box) return;
-  if (p.state === "running") { box.textContent = "探测中…"; return; }
-  if (!ips.length) { box.textContent = p.error ? ("探测失败：" + p.error) : "尚无探测结果"; return; }
-  let verdict = "";
-  if (p.rotating === true) verdict = " · 轮换正常";
-  else if (p.rotating === false) verdict = " · 未轮换（旋转模式请确认客户端已关闭 multiplex/mux）";
-  box.textContent = ips.join(" → ") + " · 不同 IP " + p.distinct + " 个" + verdict;
-}
-async function resiProbe() {
-  const btn = document.getElementById("btn-resi-probe");
-  if (btn && btn.disabled) return;
-  if (btn) { btn.disabled = true; btn.classList.add("busy"); }
-  try {
-    await api("/api/resi_probe", "POST", {count: 3});
-    if (lastStatus) renderAll(lastStatus);
-    refresh();
-  } catch (e) {
-    if (!isAbort(e)) toast("探测失败: " + e.message, true);
-  } finally {
-    if (btn) { btn.disabled = false; btn.classList.remove("busy"); }
-  }
-}
-function renderSub(s) {
-  const sec = document.getElementById("sec-sub");
-  if (!sec) return;
-  const nav = document.getElementById("nav-sub");
-  if (!s.vless) { sec.hidden = true; if (nav) nav.style.display = "none"; return; }
-  sec.hidden = false;
-  if (nav) nav.style.display = "";
-  const host = location.hostname, uuid = s.vless.uuid;
-  const mk = (path, label) => "vless://" + uuid + "@" + host + ":443?security=tls&sni=" + host + "&type=ws&path=" + path + "#" + label;
-  sec.dataset.direct = mk(s.vless.direct_path, "direct");
-  sec.dataset.chain = mk(s.vless.chain_path, "vpngate");
-  document.getElementById("sub-direct").textContent = sec.dataset.direct;
-  document.getElementById("sub-chain").textContent = sec.dataset.chain;
-  const resi = s.resi || {};
-  const resiRow = document.getElementById("sub-resi-row");
-  if (resiRow) {
-    resiRow.hidden = !(resi.enabled && resi.path);
-    if (!resiRow.hidden) {
-      sec.dataset.resi = mk(resi.path, "resi");
-      document.getElementById("sub-resi").textContent = sec.dataset.resi;
-    }
-  }
-  const hostNote = document.getElementById("sub-host");
-  if (hostNote) hostNote.textContent = "当前 host=" + host + " · 换域名访问会改变链接";
-}
-async function copySub(which, btn) {
-  const sec = document.getElementById("sec-sub");
-  const text = which === "direct" ? sec.dataset.direct : (which === "chain" ? sec.dataset.chain : sec.dataset.resi);
-  if (!text) return;
-  let ok = false;
-  try {
-    await navigator.clipboard.writeText(text);
-    ok = true;
-  } catch (e) {
-    const ta = document.createElement("textarea");
-    ta.value = text; document.body.appendChild(ta); ta.select();
-    try { ok = document.execCommand("copy"); } catch (_e) {}
-    ta.remove();
-  }
-  if (!ok) { toast("复制失败，请手动复制", true); return; }
-  if (btn) {
-    const old = btn.textContent;
-    btn.textContent = "已复制 ✓";
-    setTimeout(() => { btn.textContent = old; }, 1500);
-  }
-}
-async function copyAll(btn) {
-  const sec = document.getElementById("sec-sub");
-  const text = [sec.dataset.direct, sec.dataset.chain, sec.dataset.resi].filter(Boolean).join(String.fromCharCode(10));
-  if (!text) return;
-  let ok = false;
-  try {
-    await navigator.clipboard.writeText(text);
-    ok = true;
-  } catch (e) {
-    const ta = document.createElement("textarea");
-    ta.value = text; document.body.appendChild(ta); ta.select();
-    try { ok = document.execCommand("copy"); } catch (_e) {}
-    ta.remove();
-  }
-  if (!ok) { toast("复制失败，请手动复制", true); return; }
-  if (btn) {
-    const old = btn.textContent;
-    btn.textContent = "已复制 ✓";
-    setTimeout(() => { btn.textContent = old; }, 1500);
-  }
-}
-async function refreshLogs(btn) {
-  if (btn) { btn.disabled = true; }
-  try {
-    const r = await api("/api/logs?lines=100");
-    lastLogLines = r.lines || [];
-    renderLogs();
-  } catch (e) { if (!isAbort(e)) toast("日志拉取失败: " + e.message, true); }
-  if (btn) { btn.disabled = false; }
-}
-function setVal(id, v) {
-  const el = document.getElementById(id);
-  if (!el) return;
-  if (el.type === "checkbox") el.checked = !!v;
-  else el.value = v;
-}
-function getVal(id) {
-  const el = document.getElementById(id);
-  if (!el) return null;
-  if (el.type === "checkbox") return el.checked;
-  const n = parseInt(el.value, 10);
-  return isNaN(n) ? el.value : n;
-}
-async function loadSettings() {
-  try {
-    const r = await api("/api/settings");
-    const v = r.values || {};
-    setVal("set-refresh", v.refresh_seconds);
-    setVal("set-timeout", v.dial_timeout);
-    setVal("set-topk", v.real_topk);
-    setVal("set-limit", v.limit);
-    setVal("set-dialw", v.dial_workers);
-    setVal("set-fpw", v.full_probe_workers);
-    setVal("set-probew", v.probe_workers);
-    setVal("set-repin", v.auto_repin);
-    setVal("set-rescue", v.auto_rescue);
-    setVal("set-resittl", v.resi_session_ttl);
-  } catch (e) { if (!isAbort(e)) toast("设置拉取失败: " + e.message, true); }
-}
-async function saveSettings() {
-  const btn = document.getElementById("btn-settings-save");
-  const note = document.getElementById("settings-result");
-  const payload = {
-    refresh_seconds: getVal("set-refresh"),
-    dial_timeout: getVal("set-timeout"),
-    real_topk: getVal("set-topk"),
-    limit: getVal("set-limit"),
-    dial_workers: getVal("set-dialw"),
-    full_probe_workers: getVal("set-fpw"),
-    probe_workers: getVal("set-probew"),
-    auto_repin: getVal("set-repin"),
-    auto_rescue: getVal("set-rescue"),
-    resi_session_ttl: getVal("set-resittl")
-  };
-  if (btn) { btn.disabled = true; }
-  try {
-    await api("/api/settings", "POST", payload);
-    if (note) note.textContent = "已保存 · 下轮生效";
-    loadSettings();
-  } catch (e) {
-    if (!isAbort(e)) {
-      if (note) note.textContent = "";
-      toast("保存失败: " + e.message, true);
-    }
-  }
-  if (btn) { btn.disabled = false; }
-}
-function logLevel(line) {
-  if (/error|fail|refus|denied|exception/i.test(line)) return "err";
-  if (/warn|timeout|retry|invalid/i.test(line)) return "warn";
-  if (/verify|switch|refresh-ok|restarted|started|exit=/i.test(line)) return "ok";
-  return "info";
-}
-function renderLogs() {
-  const box = document.getElementById("logbox");
-  if (!box) return;
-  const lv = (document.getElementById("loglevel") || {}).value || "";
-  const q = ((document.getElementById("log-search") || {}).value || "").trim().toLowerCase();
-  const rows = lastLogLines.filter(l => (!lv || logLevel(l) === lv) && (!q || l.toLowerCase().includes(q)));
-  box.innerHTML = rows.length ? rows.map(l => '<div><span class="' + logLevel(l) + '">' + esc(l.slice(0, 300)) + "</span></div>").join("")
-    : '<div style="color:#8b91a5">暂无日志</div>';
-  const auto = document.getElementById("log-auto");
-  if (!auto || auto.checked) box.scrollTop = box.scrollHeight;
-}
-function toggleTheme() {
-  const cur = document.documentElement.dataset.theme === "light" ? "dark" : "light";
-  document.documentElement.dataset.theme = cur;
-  try { localStorage.setItem("theme", cur); } catch (e) {}
-  syncThemeLabel();
-}
-function syncThemeLabel() {
-  const light = document.documentElement.dataset.theme === "light";
-  document.querySelectorAll("#btn-theme,#btn-theme-gate").forEach((b) => { b.textContent = light ? "切换到深色" : "切换到浅色"; });
-}
-function toggleToken() {
-  const input = document.getElementById("login-token");
-  const btn = document.getElementById("btn-show-token");
-  if (!input || !btn) return;
-  const show = input.type !== "text";
-  input.type = show ? "text" : "password";
-  btn.textContent = show ? "隐藏" : "显示";
-  btn.setAttribute("aria-pressed", show ? "true" : "false");
-}
-function skeletonRows() {
-  let s = "";
-  for (let i = 0; i < 5; i++) s += "<tr class='skel' aria-hidden='true'><td><div class='sk' style='width:60%'></div></td><td><div class='sk' style='width:40%'></div></td><td><div class='sk' style='width:50%'></div></td><td><div class='sk' style='width:70%'></div></td><td><div class='sk' style='width:30%'></div></td><td><div class='sk' style='width:70%'></div></td></tr>";
-  document.getElementById("bench-body").innerHTML = s;
-  const note = document.getElementById("load-note");
-  if (note) note.hidden = false;
-}
-function verifyStale(v, preferredTag) {
-  if (!v || v.state !== "done" || !v.exit_ip) return false;
-  if (v.via_tag && preferredTag && v.via_tag !== preferredTag) return true;
-  try {
-    if (v.checked_at) {
-      const age = Date.now() - Date.parse(v.checked_at);
-      if (age > 10*60*1000) return true;
-    }
-  } catch(e) {}
-  return false;
-}
-function maybeAutoVerify(s) {
-  if (!s || !s.preferred_tag) return;
-  const v = s.verify;
-  const needs = (!v || v.state === "idle" || verifyStale(v, s.preferred_tag));
-  if (!needs || autoVerifiedFor === s.preferred_tag) return;
-  if (document.querySelector(".btn.busy")) return;
-  if (s.probe && s.probe.state === "running") return;
-  autoVerifiedFor = s.preferred_tag;
-  verifyExit();
-}
-function renderVerify(v, pref) {
-  const el = document.getElementById("verify-result");
-  el.className = "";
-  const preferredTag = lastStatus ? lastStatus.preferred_tag : null;
-  if (verifyStale(v, preferredTag)) {
-    el.textContent = "验证已过期或已切换，出口待重新验证";
-    return;
-  }
-  if (!v || v.state === "idle") {
-    el.textContent = pref ? "尚未验证当前出口，点击「验证出口 IP」真实走一次 VPN 链路。" : "";
-    return;
-  }
-  if (v.state === "running") {
-    el.textContent = "正在验证出口…";
-    return;
-  }
-  if (v.exit_ip) {
-    el.className = "verify-ok";
-    el.textContent = "当前出口 IP：" + v.exit_ip + "（" + v.ms + "ms）";
-  } else {
-    el.className = "verify-err";
-    el.textContent = "验证失败" + (v.error ? "：" + v.error : "");
-  }
-}
-function renderProbeProgress(fp) {
-  const box = document.getElementById("probe-progress");
-  if (!fp || fp.state === "idle" || !fp.total) { box.classList.remove("show"); return; }
-  box.classList.add("show");
-  const pct = fp.total ? Math.round(fp.done / fp.total * 100) : 0;
-  const fill = document.getElementById("probe-fill");
-  fill.style.width = pct + "%";
-  fill.setAttribute("aria-valuenow", String(pct));
-  const stName = fp.state === "done" ? "已完成" : "进行中";
-  let eta = "";
-  if (fp.state !== "done" && fp.done > 0 && fullT0) {
-    const left = Math.max(0, Math.round((Date.now() - fullT0) / fp.done * (fp.total - fp.done) / 1000));
-    eta = " · 预计还需" + (left >= 60 ? Math.floor(left / 60) + "分" + (left % 60) + "秒" : left + "秒");
-  }
-  document.getElementById("probe-txt").textContent = "全量真测" + stName + " " + fp.done + "/" + fp.total + "（" + pct + "%）" + eta;
-}
-var undoFrom = null, undoTimer = null;
-function ipOf(tag) {
-  const ep = (lastStatus && lastStatus.endpoints || []).find(x => x.tag === tag);
-  return (ep && ep.server) || tag;
-}
-function focusCurrentSwitch() {
-  const tag = lastStatus ? lastStatus.preferred_tag : null;
-  const b = tag ? document.querySelector("[data-switch='" + safeTag(tag) + "']") : null;
-  if (b && !b.disabled) b.focus();
-  else { const ns = document.getElementById("node-search"); if (ns) ns.focus(); }
-}
-function showUndo(fromTag, toTag) {
-  if (!fromTag || fromTag === toTag) return;
-  undoFrom = fromTag;
-  document.getElementById("undo-from").textContent = ipOf(fromTag);
-  document.getElementById("undo-to").textContent = ipOf(toTag);
-  document.getElementById("switch-undo").hidden = false;
-  const link = document.getElementById("undo-link");
-  if (link) link.focus();
-  if (undoTimer) clearTimeout(undoTimer);
-  undoTimer = setTimeout(() => { document.getElementById("switch-undo").hidden = true; undoFrom = null; focusCurrentSwitch(); }, 15000);
-}
-function onUndo() {
-  if (!undoFrom) return;
-  const back = undoFrom;
-  undoFrom = null;
-  document.getElementById("switch-undo").hidden = true;
-  switchTag(back);
-}
-async function switchTag(tag) {
-  if (pendingTag && pendingTag !== tag) { toast("正在切换中，请稍候", true); return; }
-  const fromTag = lastStatus ? lastStatus.preferred_tag : null;
-  const ep = (lastStatus && lastStatus.endpoints || []).find(x => x.tag === tag);
-  if (ep && ep.real_latency_ms == null) { toast("先测速再切换：该节点还未测通", true); return; }
-  pendingTag = tag;
-  if (pendingTimer) clearTimeout(pendingTimer);
-  pendingTimer = setTimeout(() => { pendingTag = null; renderFiltered(); }, 20000);
-  renderFiltered();
-  try {
-    const r = await api("/api/switch", "POST", {"tag": tag});
-    autoVerifiedFor = r.preferred_tag || tag;
-    showUndo(fromTag, r.preferred_tag || tag);
-    await verifyExit();
-  } catch (e) {
-    if (!isAbort(e)) toast("切换失败: " + e.message, true);
-    pendingTag = null;
-    refresh();
-  }
-}
-async function probeOne(tag) {
-  const my = ++probeSeq;
-  if (probeCtl) probeCtl.abort();
-  probeCtl = new AbortController();
-  const sig = probeCtl.signal;
-  const probeT0 = Date.now();
-  const btn = document.querySelector("[data-probe='" + safeTag(tag) + "']");
-  if (btn) btn.textContent = "测速中…";
-  try {
-    await api("/api/probe", "POST", {"tag": tag}, sig);
-    refresh();
-    for (let i = 0; i < 60; i++) {
-      if (my !== probeSeq) break;
-      await new Promise(r => setTimeout(r, 3000));
-      if (my !== probeSeq) break;
-      const s = await api("/api/status", "GET", null, sig);
-      lastStatus = s;
-      renderAll(s);
-      if (s.probe && s.probe.state === "done" && s.probe.tag === tag) {
-        if (s.probe.ms == null) toast("单测 " + tag + " 未打通", true);
-        break;
-      }
-      renderProbeWait(tag, probeT0);
-      if (i === 59) toast("单测超时，任务仍在后台运行，请稍后查看", true);
-    }
-  } catch (e) {
-    if (isAbort(e)) { restoreProbeBtn(tag); refresh(); return; }
-    if (/409/.test(e.message || "")) { const t = runningTagOf(e.message); toast("已有单测进行中，稍后再试" + (t ? "（" + t + "）" : ""), true); refresh(); return; }
-    toast("单测失败: " + e.message, true);
-  }
-  restoreProbeBtn(tag);
-  refresh();
-}
-function renderProbeWait(tag, t0) {
-  const b = document.querySelector("[data-probe='" + safeTag(tag) + "']");
-  if (!b) return;
-  b.textContent = "测速中…（已等待" + Math.round((Date.now() - t0) / 1000) + "s）";
-}
-function restoreProbeBtn(tag) {
-  // renderAll owns button state; this only resets transient text.
-  const b = document.querySelector("[data-probe='" + safeTag(tag) + "']");
-  if (b) b.textContent = "测速";
-}
-async function refreshNow() {
-  const btn = document.getElementById("btn-refresh");
-  if (btn && btn.disabled) return;
-  setBusy("btn-refresh", true, "刷新中…");
-  const benchTable = document.querySelector("table.bench");
-  const thin = document.getElementById("thinbar");
-  if (lastStatus) {
-    if (benchTable) benchTable.classList.add("loading");
-    if (thin) thin.classList.add("show");
-  } else skeletonRows();
-  try {
-    const r = await api("/api/refresh", "POST", {});
-    if (r && r.accepted) {
-      for (let i = 0; i < 200; i++) {
-        await new Promise(rr => setTimeout(rr, 3000));
-        const s = await api("/api/status");
-        lastStatus = s;
-        renderAll(s);
-        const j = s.refresh_job;
-        if (j && j.state === "done") {
-          if (j.ok === false) toast("刷新完成但有失败" + (j.error ? ": " + j.error : ""), true);
-          break;
-        }
-        if (i === 199) toast("刷新仍在后台运行，请稍后查看", true);
-      }
-    } else if (r && !r.ok) toast("刷新完成但有失败", true);
-    refreshLogs(null);
-  } catch (e) {
-    if (isAbort(e)) return;
-    toast(/409/.test(e.message || "") ? "已有刷新进行中，稍后再试" : ("刷新失败: " + e.message), true);
-  }
-  if (benchTable) benchTable.classList.remove("loading");
-  if (thin) thin.classList.remove("show");
-  setBusy("btn-refresh", false);
-  refresh();
-}
-async function fullProbeNow() {
-  const my = ++fullSeq;
-  if (fullCtl) fullCtl.abort();
-  fullCtl = new AbortController();
-  const sig = fullCtl.signal;
-  setBusy("btn-fullprobe", true, "真测中…");
-  const cancelBtn = document.getElementById("btn-fullprobe-cancel");
-  try {
-    await api("/api/full_probe", "POST", {}, sig);
-  } catch (e) {
-    setBusy("btn-fullprobe", false);
-    if (cancelBtn) cancelBtn.style.display = "none";
-    if (isAbort(e)) return;
-    toast(/409/.test(e.message || "") ? "已有全量任务进行中，稍后再试" : ("全量真测失败: " + e.message), true);
-    return;
-  }
-  fullT0 = Date.now();
-  if (cancelBtn) cancelBtn.style.display = "";
-  try {
-    for (let i = 0; i < 200; i++) {
-      if (my !== fullSeq) break;
-      await new Promise(r => setTimeout(r, 3000));
-      if (my !== fullSeq) break;
-      const s = await api("/api/status", "GET", null, sig);
-      lastStatus = s;
-      renderAll(s);
-      if (s.full_probe && s.full_probe.state === "done") break;
-      if (i === 199) toast("全量真测超时，请重试", true);
-    }
-  } catch (e) { if (!isAbort(e)) toast("全量真测失败: " + e.message, true); }
-  setBusy("btn-fullprobe", false);
-  if (cancelBtn) cancelBtn.style.display = "none";
-  refresh();
-}
-function cancelFullProbe() {
-  fullSeq++;
-  if (fullCtl) { fullCtl.abort(); fullCtl = null; }
-  setBusy("btn-fullprobe", false);
-  const cancelBtn = document.getElementById("btn-fullprobe-cancel");
-  if (cancelBtn) cancelBtn.style.display = "none";
-  refresh();
-}
-async function verifyExit() {
-  const my = ++verifySeq;
-  if (verifyCtl) verifyCtl.abort();
-  verifyCtl = new AbortController();
-  const sig = verifyCtl.signal;
-  setBusy("btn-verify", true, "验证中…");
-  document.getElementById("verify-result").textContent = "正在验证新出口…";
-  const verifyT0 = Date.now();
-  try {
-    await api("/api/verify", "POST", {}, sig);
-    for (let i = 0; i < 60; i++) {
-      if (my !== verifySeq) break;
-      await new Promise(r => setTimeout(r, 3000));
-      if (my !== verifySeq) break;
-      const s = await api("/api/status", "GET", null, sig);
-      lastStatus = s;
-      const vp = preferredEp(s);
-      renderVerify(s.verify, vp);
-      if (s.verify && s.verify.state === "done") {
-        if (!s.verify.exit_ip) toast("验证未拿到出口 IP", true);
-        break;
-      }
-      if (s.verify && s.verify.state !== "done") {
-        const vr = document.getElementById("verify-result");
-        vr.textContent += "（已等待 " + Math.round((Date.now() - verifyT0) / 1000) + "s）";
-      }
-      if (i === 59) toast("验证超时，任务仍在后台运行，请稍后查看", true);
-    }
-  } catch (e) {
-    if (isAbort(e)) { setBusy("btn-verify", false); refresh(); return; }
-    if (/409/.test(e.message || "")) {
-      const t = runningTagOf(e.message);
-      toast("已有验证进行中，稍后再试" + (t ? "（" + t + "）" : ""), true);
-      setBusy("btn-verify", false);
-      refresh();
-      return;
-    }
-    const el = document.getElementById("verify-result");
-    el.textContent = "验证失败：" + e.message;
-    el.className = "verify-err";
-    toast("验证失败: " + e.message, true);
-  }
-  setBusy("btn-verify", false);
-  refresh();
-}
-silentLogin();
-syncThemeLabel();
-document.getElementById("sortsel").addEventListener("change", (ev) => { sortKey = ev.target.value; sortDir = 1; renderFiltered(); });
-document.getElementById("scope").addEventListener("change", (ev) => { activeCountry = ev.target.value; renderFiltered(); });
-function sortBy(k) {
-  if (sortKey === k) sortDir *= -1;
-  else { sortKey = k; sortDir = 1; }
-  const sel = document.getElementById("sortsel");
-  if (sel) sel.value = k;
-  renderFiltered();
-}
-document.querySelectorAll(".thsort").forEach((b) => {
-  b.onclick = () => sortBy(b.getAttribute("data-k"));
-});
-function syncSortHeaders() {
-  document.querySelectorAll(".thsort").forEach((b) => {
-    const k = b.getAttribute("data-k");
-    const label = b.getAttribute("data-label") || "";
-    const th = b.closest ? b.closest("th") : null;
-    if (k === sortKey) {
-      if (th) th.setAttribute("aria-sort", sortDir === 1 ? "ascending" : "descending");
-      b.textContent = label + (sortDir === 1 ? " ▲" : " ▼");
-    } else {
-      if (th) th.removeAttribute("aria-sort");
-      b.textContent = label;
-    }
-  });
-}
-document.getElementById("loglevel").addEventListener("change", renderLogs);
-const spySecs = ["sec-overview", "sec-nodes", "sec-logs", "sec-sub", "sec-hist", "sec-settings"];
-window.addEventListener("scroll", () => {
-  let cur = spySecs[0];
-  spySecs.forEach((id) => { const el = document.getElementById(id); if (el && el.getBoundingClientRect().top < 170) cur = id; });
-  document.querySelectorAll("#topnav .links a").forEach((a) => a.classList.toggle("on", a.getAttribute("href") === "#" + cur));
-}, {passive: true});
-document.getElementById("bench-body").onclick = (ev) => {
-  const link = ev.target && ev.target.closest ? ev.target.closest("[data-probe],[data-switch]") : null;
-  if (!link) return;
-  if (link.getAttribute("aria-disabled") === "true") {
-    if (link.getAttribute("data-switch")) toast("先测速再切换：该节点还未测通", true);
-    else if (link.getAttribute("data-probe")) toast("该节点测速中，请稍候", true);
-    return;
-  }
-  const p = link.getAttribute("data-probe");
-  const sw = link.getAttribute("data-switch");
-  if (p) probeOne(p);
-  else if (sw) switchTag(sw);
-};
-document.getElementById("bench-body").onkeydown = (ev) => {
-  if (ev.key !== "Enter" && ev.key !== " ") return;
-  const link = ev.target && ev.target.closest ? ev.target.closest("[data-probe],[data-switch]") : null;
-  if (!link) return;
-  if (link.getAttribute("aria-disabled") === "true") {
-    if (link.getAttribute("data-switch")) toast("先测速再切换：该节点还未测通", true);
-    else if (link.getAttribute("data-probe")) toast("该节点测速中，请稍候", true);
-    if (ev.key === " ") ev.preventDefault();
-    return;
-  }
-  if (ev.key === " ") { ev.preventDefault(); return; }
-  ev.preventDefault();
-  const p = link.getAttribute("data-probe");
-  const sw = link.getAttribute("data-switch");
-  if (p) probeOne(p);
-  else if (sw) switchTag(sw);
-};
-setInterval(() => {
-  if (document.getElementById("console").style.display === "none") return;
-  if (document.hidden) return;
-  if (document.querySelector(".btn.busy")) return;
-  refresh();
-  const auto = document.getElementById("log-auto");
-  const lv = document.getElementById("loglevel");
-  const qs = document.getElementById("log-search");
-  if (auto && auto.checked && lv && !lv.value && qs && !qs.value.trim()) refreshLogs(null);
-}, 15000);
-</script>
-</body></html>
-"""
+
+@lru_cache(maxsize=1)
+def _load_console_html() -> str:
+    """Read the console once, preserving its line endings byte for byte."""
+    try:
+        with _CONSOLE_HTML_PATH.open("r", encoding="utf-8", newline="") as handle:
+            return handle.read()
+    except (OSError, UnicodeError):
+        return _CONSOLE_HTML_FALLBACK
+
+
+UI_HTML = _load_console_html()
 
 def default_fetch(url: str, timeout: int = 20) -> str:
     if urllib.parse.urlsplit(url).scheme != "https":
@@ -1505,6 +247,10 @@ def build_config_from_env(env: dict) -> dict:
             generated = True
     mixed_port = _int_env(env, "MIXED_PORT", 40000, 1, 65535)
     port = _int_env(env, "PORT", 3000, 1, 65535)
+    admin_raw = str(env.get("ADMIN_PORT", "") or "").strip()
+    admin_port = _int_env(env, "ADMIN_PORT", port, 1, 65535) if admin_raw else port
+    bind_host = "127.0.0.1" if admin_raw else "0.0.0.0"
+    edge_metrics_url = str(env.get("EDGE_METRICS_URL", "") or "").strip()
     vless_direct_port = _int_env(env, "VLESS_DIRECT_PORT", 8080, 1, 65535)
     vless_chain_port = _int_env(env, "VLESS_CHAIN_PORT", 8082, 1, 65535)
     resi_port = _int_env(env, "RESI_PORT", DEFAULT_RESI_PORT, 1, 65535)
@@ -1528,13 +274,15 @@ def build_config_from_env(env: dict) -> dict:
     reserved = {8080, 8081, 8082, 4096, mixed_port, vless_direct_port, vless_chain_port}
     if resi is not None or resi_rotate:
         reserved.add(resi_port)
-    if port in reserved:
-        _safe_print(f"refusing to start: PORT={port} collides {sorted(reserved)}; set PORT=3000", flush=True)
+    if admin_port in reserved:
+        name = "ADMIN_PORT" if admin_raw else "PORT"
+        _safe_print(f"refusing to start: {name}={admin_port} collides {sorted(reserved)}", flush=True)
         raise SystemExit(2)
-    if port != 3000:
-        _safe_print(f"warning: PORT={port} is not 3000", flush=True)
+    if not admin_raw and admin_port != 3000:
+        _safe_print(f"warning: PORT={admin_port} is not 3000", flush=True)
     return {
-        "port": port, "mixed_port": mixed_port,
+        "port": admin_port, "mixed_port": mixed_port, "bind_host": bind_host,
+        "edge_metrics_url": edge_metrics_url,
         "username": env.get("PROXY_USER", "u"), "password": password,
         "admin_token": admin_token, "admin_token_generated": generated,
         "snapshot_url": snapshot_url, "snapshot_urls": snapshot_urls,
@@ -1561,12 +309,33 @@ def build_config_from_env(env: dict) -> dict:
         "disguise_path": env.get("DISGUISE_PATH", ""),
     }
 def assign_stable_tags(nodes: list[dict], old_nodes: list[dict], tag_prefix: str = "vpngate") -> None:
-    tag_by_key: dict[str, str] = {}
+    """Give every node a tag that is stable per server:port.
+
+    Two passes on purpose: the old tag of every *surviving* server:port is
+    reserved before any node gets a tag. The previous single pass let a new
+    fast node inserted at the top of the snapshot take ``vpngate-0`` and only
+    then discovered that the old ``vpngate-0`` owner was still present - the
+    owner was renamed to a fresh tag, so the persisted pin silently jumped to
+    the new server after a refresh.
+    """
+    def _key(node: dict) -> str:
+        return f"{node.get('server')}:{node.get('server_port')}"
+
+    old_tag_by_key: dict[str, str] = {}
     for old in old_nodes:
         old_ep = old.get("endpoint") or {}
         if old_ep.get("tag"):
-            tag_by_key.setdefault(f"{old.get('server')}:{old.get('server_port')}", old_ep["tag"])
-    used: set[str] = set()
+            old_tag_by_key.setdefault(_key(old), old_ep["tag"])
+    # Pass 1: reserve the old tag for every key that survives this refresh.
+    reserved_by_key: dict[str, str] = {}
+    reserved_tags: set[str] = set()
+    for node in nodes:
+        key = _key(node)
+        tag = old_tag_by_key.get(key)
+        if tag and tag not in reserved_tags:
+            reserved_by_key[key] = tag
+            reserved_tags.add(tag)
+    used: set[str] = set(reserved_tags)
     counter = 0
     def _fresh() -> str:
         nonlocal counter
@@ -1575,19 +344,25 @@ def assign_stable_tags(nodes: list[dict], old_nodes: list[dict], tag_prefix: str
         tag = f"{tag_prefix}-{counter}"
         counter += 1
         return tag
+    claimed_reserved: set[str] = set()
     for node in nodes:
         endpoint = node.get("endpoint") or {}
+        key = _key(node)
         tag = endpoint.get("tag") or ""
+        reserved = reserved_by_key.get(key)
+        if reserved and reserved not in claimed_reserved:
+            endpoint["tag"] = reserved
+            node["endpoint"] = endpoint
+            claimed_reserved.add(reserved)
+            continue
         if tag and tag not in used:
+            # An explicit tag survives only when no surviving key owns it.
             used.add(tag)
             continue
-        key = f"{node.get('server')}:{node.get('server_port')}"
-        reused = tag_by_key.get(key)
-        if not reused or reused in used:
-            reused = _fresh()
-        endpoint["tag"] = reused
+        fresh = _fresh()
+        endpoint["tag"] = fresh
         node["endpoint"] = endpoint
-        used.add(reused)
+        used.add(fresh)
 def _rss_mb() -> float | None:
     try:
         import resource
@@ -1654,7 +429,16 @@ def _query_param(query: str, name: str) -> str:
             return urllib.parse.unquote(value.strip())
     return ""
 def _http_response(status: str, content_type: str, body: bytes, extra_headers: dict | None = None) -> bytes:
-    lines = [f"HTTP/1.1 {status}", f"Content-Type: {content_type}", f"Content-Length: {len(body)}"]
+    lines = [
+        f"HTTP/1.1 {status}",
+        f"Content-Type: {content_type}",
+        f"Content-Length: {len(body)}",
+        "X-Content-Type-Options: nosniff",
+        "X-Frame-Options: DENY",
+        "Content-Security-Policy: frame-ancestors 'none'",
+        "Referrer-Policy: no-referrer",
+        "Cache-Control: no-store",
+    ]
     if extra_headers:
         lines.extend(f"{name}: {value}" for name, value in extra_headers.items())
     lines.append("Connection: close")
@@ -1820,7 +604,8 @@ class RailwayManager:
         settings_path: str | None = None, singbox_bin: str = "sing-box", start_singbox: bool = True,
         auto_refresh: bool = True, fetch_on_start: bool = True, retry_delays: tuple = (5, 10),
         max_mux_connections: int = MAX_MUX_CONNECTIONS, health_check_interval: int = HEALTH_CHECK_INTERVAL, fetcher=None,
-        clash_api_port: int = 9090) -> None:
+        clash_api_port: int = 9090, edge_metrics_url: str = "",
+        bind_host: str = "0.0.0.0") -> None:
         self.port = port; self.mixed_port = mixed_port; self.username = username; self.password = password
         self.admin_token = admin_token; self.snapshot_url = snapshot_url
         self.snapshot_urls = list(snapshot_urls) if snapshot_urls else [snapshot_url]
@@ -1843,8 +628,23 @@ class RailwayManager:
         self._resi_health: dict[str, dict] = {}
         self._resi_session_id = ""; self._resi_session_started = 0.0; self._resi_lock = threading.Lock(); self._resi_probe_lock = threading.Lock()
         self.tunnel_token = tunnel_token; self.cloudflared_bin = cloudflared_bin; self.disguise_path = disguise_path
+        self.edge_metrics_url = edge_metrics_url
+        self.bind_host = bind_host
         self._cloudflared_proc = None; self.preferred_tag = None; self.backup_tag = None; self._auto_pinned = False
+        # Optional loopback probe sidecar (docs/probe-sidecar.md). Fail-open:
+        # every caller still has the pure-Python fallback.
+        self.probe = None
+        if ProbeClient is not None:
+            try:
+                self.probe = ProbeClient.from_env()
+            except Exception:
+                self.probe = None
+        # Per-node liveness/exit evidence keyed by "server:port". It is the
+        # only evidence that survives a refresh (tags alone are not enough:
+        # a tag can be recycled after its server vanished).
+        self._node_evidence: dict[str, dict] = {}
         self._nodes: list[dict] = []; self._first_seen: dict[str, str] = {}
+        self._nodes_rev = 0
         self._cpu_model = _cpu_model(); self._cpu_cores = os.cpu_count(); self._cpu_last = None
         self._fail_streak = 0; self._pinned_fail_streak = 0; self._rescue_round = 0; self._crash_streak = 0; self._retry_after = 0.0; self._mixed_fail_streak = 0; self._mixed_retry_after = 0.0; self._health_mixed_streak = 0; self._refresh_generation = 0
         self._chain_fail_streak = 0; self._chain_rescue_at = 0.0; self._chain_rescue_attempts = 0
@@ -1873,6 +673,10 @@ class RailwayManager:
         self.clash_api_secret = os.urandom(16).hex()
         self._clash_ready_at = 0.0
         self._clash_switch_lock = threading.Lock()
+        # Serializes a whole manual switch / rescue: mutate selector, verify
+        # the served exit, then commit. Lock order is pin_switch -> config ->
+        # clash; the health thread can never start a rescue mid-switch.
+        self._pin_switch_lock = threading.RLock()
         self._lock = threading.RLock(); self._refresh_lock = threading.Lock(); self._config_lock = threading.Lock()
         if resi:
             resi_status = {"enabled": True, "mode": ("sticky" if self.resi_session_ttl > 0 else "rotation"),
@@ -1897,6 +701,10 @@ class RailwayManager:
             "chain_switch": {"mode": ("clash" if (clash_api_port and resi_rotate) else "config"),
                              "clash_port": int(clash_api_port or 0), "ready": False, "switches": 0},
             "resi": resi_status}
+        self.status["pin_health"] = {"state": "unknown", "fail_streak": 0, "checked_at": None,
+            "exit_ip": None, "error": None,
+            "chain_switch": {"mode": self.status["chain_switch"]["mode"],
+                             "ready": False, "switches": 0}}
         self._full_probe_thread = None; self._single_probe_thread = None; self._verify_thread = None; self._verify_generation = 0; self._refresh_thread = None
         self._stop_event = threading.Event(); self._mux_slots = threading.BoundedSemaphore(max_mux_connections); self._mux_inflight = 0
         # A fourth-path storm must not starve the first two paths. Every mux
@@ -1919,7 +727,7 @@ class RailwayManager:
     def start(self) -> int:
         self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._listener.bind(("0.0.0.0", self.port))
+        self._listener.bind((self.bind_host, self.port))
         self._listener.listen(128)
         self._listener.settimeout(1.0)
         self.bound_port = self._listener.getsockname()[1]
@@ -1936,7 +744,7 @@ class RailwayManager:
         if self.fetch_on_start:
             threading.Thread(target=self._initial_refresh, daemon=True, name="initial-refresh").start()
         self._start_cloudflared()
-        _safe_print(f"listening on 0.0.0.0:{self.bound_port}, backend 127.0.0.1:{self.mixed_port}", flush=True)
+        _safe_print(f"listening on {self.bind_host}:{self.bound_port}, backend 127.0.0.1:{self.mixed_port}", flush=True)
         return self.bound_port
     def _initial_refresh(self) -> None:
         if self._boot_from_last_good():
@@ -2056,7 +864,18 @@ class RailwayManager:
     def _authorized(self, headers: dict) -> bool:
         if not self.admin_token:
             return True
-        return headers.get("authorization", "") == f"Bearer {self.admin_token}"
+        provided = headers.get("authorization", "")
+        if not isinstance(provided, str):
+            return False
+        expected = f"Bearer {self.admin_token}"
+        try:
+            provided_bytes = provided.encode("utf-8")
+            expected_bytes = expected.encode("utf-8")
+        except UnicodeError:
+            return False
+        if len(provided_bytes) != len(expected_bytes):
+            return False
+        return secrets.compare_digest(provided_bytes, expected_bytes)
     @staticmethod
     def _parse_request(data: bytes):
         try:
@@ -2419,6 +1238,19 @@ class RailwayManager:
                 ep["alive_seconds"] = max(0, int((now - seen).total_seconds()))
             except (ValueError, TypeError):
                 ep["alive_seconds"] = 0
+            ev = self._node_evidence.get(f"{host}:{port}") or {}
+            ep["alive"] = ev.get("alive")
+            ep["exit_ip"] = ev.get("exit_ip")
+            ep["verified_at"] = ev.get("verified_at")
+            ep["verify_ms"] = ev.get("verify_ms")
+            ep["verify_error"] = ev.get("verify_error")
+            ep["verify_fresh"] = self._evidence_is_fresh(ev)
+        pin_health = snapshot.get("pin_health")
+        chain_switch = snapshot.get("chain_switch") or {}
+        if isinstance(pin_health, dict):
+            pin_health["chain_switch"] = {"mode": chain_switch.get("mode"),
+                                          "ready": chain_switch.get("ready"),
+                                          "switches": chain_switch.get("switches")}
         resi = snapshot.get("resi")
         if isinstance(resi, dict) and resi.get("enabled") and self.resi_rotate:
             with self._lock:
@@ -2428,6 +1260,29 @@ class RailwayManager:
                 resi["inbounds"] = len(self._resi_routes)
                 resi["nodes"] = usable
                 resi["reserved"] = self.status["resi"].get("reserved", 0)
+        if self.edge_metrics_url:
+            # The Go edge owns /ws-node and /ws-chain byte counts; Python
+            # keeps counting /ws-resi and measurement traffic. Merge only into
+            # the returned snapshot: self.status stays Python-derived.
+            try:
+                request = urllib.request.Request(
+                    self.edge_metrics_url, headers={"Accept": "application/json"})
+                with urllib.request.urlopen(request, timeout=0.3) as response:
+                    payload = json.loads(response.read(65536).decode("utf-8"))
+                if isinstance(payload, dict) and payload.get("ok") is True:
+                    traffic = snapshot.get("traffic")
+                    if not isinstance(traffic, dict):
+                        traffic = {}
+                        snapshot["traffic"] = traffic
+                    for key in ("bytes_up", "bytes_down"):
+                        value = payload.get(key)
+                        if (isinstance(value, (int, float))
+                                and not isinstance(value, bool)):
+                            traffic[key] = int(traffic.get(key, 0) or 0) + int(value)
+            except Exception:
+                # Metrics are advisory; a missing/broken sidecar must never
+                # break the status endpoint or the manager.
+                pass
         return snapshot
     def _record_history(self, event: str, detail: str = "") -> None:
         with self._lock:
@@ -2518,6 +1373,7 @@ class RailwayManager:
             pass
         with self._lock:
             self._nodes = nodes; self._first_seen = first_seen
+            self._nodes_rev += 1
             # Rotate mode reserves exactly one node for the chain; a backup left
             # over from an older version would shrink the rotation pool for a
             # standby the hot switch does not need.
@@ -2563,6 +1419,12 @@ class RailwayManager:
             self.status["preferred_tag"] = self.preferred_tag; self.status["backup_tag"] = self.backup_tag
             self.status["auto_pinned"] = self._auto_pinned
             self.status["last_error"] = "booted from last-good config (refresh failed)"
+        if self.resi_rotate:
+            # The last-good config already bakes one rotate inbound per serving
+            # node; rebuild the same tag -> port table so the balancer and
+            # /ws-resi work before the first successful refresh/apply. Tags are
+            # final here (nodes_to_endpoints assigned them above).
+            self._set_resi_routes(self._rotate_routes(self._ordered_serving()))
         if self.want_singbox:
             self._restart_singbox()
         self._record_history("boot-from-last-good", f"{len(endpoints)} endpoints")
@@ -2695,78 +1557,308 @@ class RailwayManager:
             # collateral restart is indistinguishable from third-path churn.
             self._log(f"refresh triggered: {reason}", flush=True)
             self._record_history("health-trigger-refresh", reason)
-    def _fresh_probe_tags(self, cands: list[dict]) -> list[str]:
-        """Fresh-handshake filter for rescue targets (bounded, parallel).
 
-        Stale real_latency_ms alone must not decide a rescue: return only
-        tags with a live handshake right now, in ranking order.
+    @staticmethod
+    def _node_key(node: dict) -> str:
+        return f"{node.get('server')}:{node.get('server_port')}"
+
+    @staticmethod
+    def _tag_key(tag: str | None, nodes: list[dict]) -> str | None:
+        if not tag:
+            return None
+        for node in nodes:
+            if (node.get("endpoint") or {}).get("tag") == tag:
+                return f"{node.get('server')}:{node.get('server_port')}"
+        return None
+
+    @staticmethod
+    def _evidence_age(evidence: dict | None) -> float | None:
+        if not evidence:
+            return None
+        stamp = evidence.get("verified_at")
+        if not stamp:
+            return None
+        try:
+            then = datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            return None
+        return max(0.0, (datetime.now(timezone.utc) - then).total_seconds())
+
+    def _evidence_is_fresh(self, evidence: dict | None) -> bool:
+        age = self._evidence_age(evidence)
+        return age is not None and age <= VERIFY_STALE_AFTER_SEC
+
+    def _record_evidence(self, node: dict, alive: bool | None, exit_ip: str | None,
+                         verify_ms: int | None, error: str | None) -> None:
+        """Write the single source of truth for one node's liveness."""
+        key = self._node_key(node)
+        with self._lock:
+            self._node_evidence[key] = {"alive": alive, "exit_ip": exit_ip,
+                "verified_at": _now_iso(), "verify_ms": verify_ms,
+                "verify_error": error}
+
+    def _note_dial_ok(self, node: dict, ms: int | None) -> None:
+        """A real dial proved the node is reachable, without an exit IP.
+
+        Never overwrite fresher exit evidence: a probe that carried traffic is
+        stronger than a handshake and must survive the next refresh.
         """
-        short = cands[:EXIT_VERIFY_CAP]
-        if not short:
+        key = self._node_key(node)
+        with self._lock:
+            ev = self._node_evidence.get(key)
+            if self._evidence_is_fresh(ev):
+                return
+            self._node_evidence[key] = {"alive": True, "exit_ip": None,
+                "verified_at": _now_iso(), "verify_ms": ms, "verify_error": None}
+
+    def _fresh_alive_evidence(self, node: dict) -> bool:
+        ev = self._node_evidence.get(self._node_key(node))
+        return bool(self._evidence_is_fresh(ev) and ev.get("alive") is True)
+
+    def _endpoint_row(self, ep: dict, node: dict) -> dict:
+        ev = self._node_evidence.get(self._node_key(node)) or {}
+        return {"tag": ep["tag"], "server": primary_server(ep)[0], "server_port": primary_server(ep)[1],
+            "country": node.get("country", ""), "country_short": node.get("country_short", ""),
+            "latency_ms": node.get("latency_ms"), "real_latency_ms": node.get("real_latency_ms"),
+            "speed": node.get("speed", 0),
+            "alive": ev.get("alive"), "exit_ip": ev.get("exit_ip"),
+            "verified_at": ev.get("verified_at"), "verify_ms": ev.get("verify_ms"),
+            "verify_error": ev.get("verify_error"),
+            "verify_fresh": self._evidence_is_fresh(ev)}
+
+    def _set_pin_health(self, state: str | None = None, error: str | None = None) -> None:
+        with self._lock:
+            tag = self.preferred_tag
+            node = next((n for n in self._nodes
+                         if (n.get("endpoint") or {}).get("tag") == tag), None) if tag else None
+            ev = (self._node_evidence.get(self._node_key(node)) or {}) if node else {}
+            if state is None:
+                if tag is None:
+                    state = "unpinned"
+                elif self._pinned_fail_streak or self._chain_fail_streak:
+                    state = "degraded"
+                else:
+                    state = "unknown"
+            chain = self.status.get("chain_switch") or {}
+            self.status["pin_health"] = {
+                "state": state,
+                "fail_streak": max(int(self._pinned_fail_streak), int(self._chain_fail_streak)),
+                "checked_at": _now_iso(),
+                "exit_ip": ev.get("exit_ip"),
+                "error": error if error is not None else ev.get("verify_error"),
+                "chain_switch": {"mode": chain.get("mode"), "ready": chain.get("ready"),
+                                 "switches": chain.get("switches")},
+            }
+
+    def _probe_delays(self, tags: list[str]) -> dict[str, int] | None:
+        probe = getattr(self, "probe", None)
+        if probe is None or not tags:
+            return None
+        try:
+            got = probe.delays(list(tags))
+        except Exception:
+            return None
+        return got if isinstance(got, dict) else None
+
+    def _mixed_listening(self, timeout: float = 0.5) -> bool:
+        """Is the local mixed inbound accepting connections right now?"""
+        try:
+            with socket.create_connection(("127.0.0.1", self.mixed_port), timeout=timeout):
+                return True
+        except OSError:
+            return False
+
+    def _verifier_configured(self) -> bool:
+        return getattr(self, "probe", None) is not None or callable(measure_mixed_exit_ip)
+
+    def _served_exit_available(self) -> bool:
+        return self._verifier_configured() and self._mixed_listening()
+
+    def _served_exit_probe(self) -> tuple[str | None, int | None, bool]:
+        """Exit IP through the live mixed inbound, plus "was it attempted".
+
+        The third value separates "the chain answered with no exit IP" (a
+        real tunnel failure) from "no verifier is configured" (unknown, which
+        must never be treated as death).
+        """
+        with self._lock:
+            mixed_port = self.mixed_port; username = self.username; password = self.password
+        if not self.want_singbox:
+            return None, None, False
+        if not self._mixed_listening():
+            # The serving socket itself is down (restart/backoff). That is an
+            # unknown node state, not proof that the pinned tunnel is dead.
+            return None, None, False
+        probe = getattr(self, "probe", None)
+        if probe is not None:
+            try:
+                got = probe.exit_ip("127.0.0.1", mixed_port, username, password)
+            except Exception:
+                got = None
+            if isinstance(got, dict):
+                if got.get("ok") and got.get("exit_ip"):
+                    return str(got["exit_ip"]), got.get("ms"), True
+                return None, None, True
+        fallback = measure_mixed_exit_ip
+        if callable(fallback):
+            try:
+                ip, ms = fallback("127.0.0.1", mixed_port, username, password)
+            except Exception:
+                return None, None, False
+            if ip:
+                return str(ip), ms, True
+            return None, None, True
+        return None, None, False
+
+    def _served_exit_ip(self) -> tuple[str | None, int | None]:
+        exit_ip, ms, _attempted = self._served_exit_probe()
+        return exit_ip, ms
+
+    def _singbox_live(self) -> bool:
+        """True for a real running sing-box process (not a unit-test mock)."""
+        proc = self._singbox_proc
+        if proc is None or proc.poll() is not None:
+            return False
+        # A Mock's pid is not an int; requiring one keeps unit tests from
+        # sleeping out the real restart window.
+        return isinstance(getattr(proc, "pid", None), int)
+
+    def _verify_served(self, retries: int = 2,
+                       budget: float = 18.0) -> tuple[bool, str | None, int | None, bool]:
+        """(ok, exit_ip, ms, attempted) for the served chain.
+
+        A config apply restarts sing-box; the mixed inbound can be down for
+        seconds. Waiting for it is mandatory: "not listening yet" is unknown,
+        never tunnel death. The whole wait is bounded (~18s by default).
+        """
+        if not self._verifier_configured():
+            return False, None, None, False
+        deadline = time.monotonic() + max(0.0, budget)
+        attempted = False
+        probe_attempts = 0
+        while True:
+            remaining = deadline - time.monotonic()
+            if not self._mixed_listening():
+                if not self._singbox_live() or remaining <= 0:
+                    return False, None, None, False
+                time.sleep(min(0.5, max(0.0, remaining)))
+                continue
+            exit_ip, ms, attempted = self._served_exit_probe()
+            if exit_ip:
+                return True, exit_ip, ms, True
+            if attempted:
+                probe_attempts += 1
+                if probe_attempts >= max(1, retries) or remaining <= 0:
+                    return False, None, None, True
+                time.sleep(min(1.0, max(0.0, remaining)))
+                continue
+            if remaining <= 0:
+                return False, None, None, False
+            time.sleep(min(0.5, max(0.0, remaining)))
+
+    def _restore_runtime_pin(self, pin: str | None, hot: bool) -> None:
+        if hot and pin:
+            self._repin_runtime(pin, "rollback")
+            return
+        with self._config_lock:
+            self._apply_config(final="auto", preferred=pin, backup=None)
+    def _fresh_probe_tags(self, cands: list[dict]) -> list[str]:
+        """Candidates with fresh evidence right now, in ranking order.
+
+        Stored proof (exit evidence, recent rotation payload/bytes) is free;
+        the probe sidecar's real delay check is next; a raw TCP handshake is
+        only the last resort. A handshake alone is not tunnel evidence, which
+        is why it can no longer be the sole rescue trigger.
+        """
+        if not cands:
             return []
-        alive: dict[str, int] = {}
-        alive_lock = threading.Lock()
-        def _one(node: dict) -> None:
-            endpoint = node.get("endpoint") or node
-            ms = 0
-            # Every remote, not just the first: sing-box fails over inside the
-            # endpoint, so one dead address must not hide a live node.
-            for host, port in endpoint_remotes(endpoint):
-                try:
-                    ms = probe_tcp_latency(host, port, 5)
-                except Exception:
-                    ms = 0
-                if ms and ms > 0:
-                    break
-            if ms and ms > 0:
-                with alive_lock:
-                    alive[((node.get("endpoint") or {}).get("tag"))] = ms
-        with ThreadPoolExecutor(max_workers=min(len(short), 3)) as ex:
-            list(ex.map(_one, short))
         order = {((n.get("endpoint") or {}).get("tag")): k for k, n in enumerate(cands)}
+        alive: set[str] = set()
+        remaining: list[dict] = []
+        now = time.monotonic()
+        for node in cands:
+            tag = (node.get("endpoint") or {}).get("tag")
+            if not tag:
+                continue
+            if self._fresh_alive_evidence(node):
+                alive.add(tag)
+                continue
+            proof = self._resi_payload_at.get(tag, 0.0)
+            answered = self._resi_ok_at.get(tag, 0.0)
+            if ((proof and now - proof <= CHAIN_ALIVE_WINDOW)
+                    or (answered and now - answered <= CHAIN_ALIVE_WINDOW)):
+                alive.add(tag)
+                continue
+            remaining.append(node)
+        if remaining:
+            delays = self._probe_delays([
+                (n.get("endpoint") or {}).get("tag") for n in remaining
+                if (n.get("endpoint") or {}).get("tag")])
+            if delays is not None:
+                alive.update(delays)
+                remaining = [n for n in remaining
+                             if (n.get("endpoint") or {}).get("tag") not in delays]
+        if remaining and self.resi_rotate and self.vless_uuid:
+            # The node's own rotate inbound is the only honest witness that
+            # is guaranteed not to open a second session.
+            still: list[dict] = []
+            for node in remaining:
+                tag = (node.get("endpoint") or {}).get("tag")
+                if tag and self._chain_candidate_carries_traffic(node):
+                    alive.add(tag)
+                else:
+                    still.append(node)
+            remaining = still
+        if remaining:
+            def _one(node: dict) -> None:
+                endpoint = node.get("endpoint") or node
+                ms = 0
+                # Every remote, not just the first: sing-box fails over inside
+                # the endpoint, so one dead address must not hide a live node.
+                for host, port in endpoint_remotes(endpoint):
+                    try:
+                        ms = probe_tcp_latency(host, port, 5)
+                    except Exception:
+                        ms = 0
+                    if ms and ms > 0:
+                        break
+                if ms and ms > 0:
+                    tag = (node.get("endpoint") or {}).get("tag")
+                    if tag:
+                        with alive_lock:
+                            alive.add(tag)
+            alive_lock = threading.Lock()
+            with ThreadPoolExecutor(max_workers=min(len(remaining), 3)) as ex:
+                list(ex.map(_one, remaining))
         return sorted(alive, key=lambda t: order.get(t, 10 ** 9))
 
     def _chain_probe_ok(self) -> bool | None:
-        """End-to-end exit-IP probe of the chain path through the live instance.
+        """End-to-end exit-IP probe of the served chain in every mode.
 
-        Cheap by design: it opens one client connection to our own mux and rides
-        the endpoint session the chain already holds, so it neither creates a
-        second VPNGate session (duplicate-cn) nor disturbs the rotation.
-        Returns None when the check does not apply (not rotate mode).
+        It rides the live mixed inbound (see `_served_exit_probe`), so it
+        applies to a gateway pin exactly like a rotate pin and never opens a
+        second VPNGate session. Returns None when the result is unknown
+        (no pin, no verifier, serving down): None is NOT tunnel death.
         """
-        if not (self.resi_rotate and self.vless_uuid):
+        with self._lock:
+            pinned = self.preferred_tag is not None
+        if not (pinned and self.want_singbox):
             return None
-        try:
-            result = measure_resi_rotate(
-                self.vless_uuid, self.port, self.vless_chain_path,
-                count=1, singbox_bin=self.singbox_bin,
-                timeout=CHAIN_PROBE_TIMEOUT)
-        except Exception:
-            result = None
-        return bool(result and result.get("ips"))
-
-    def _served_exit_ip(self) -> tuple[str | None, int | None]:
-        """Exit IP of the chain exactly as served, measured through our mux.
-
-        Verifying the pin with a throwaway client (`measure_exit_ip`) opens a
-        SECOND VPNGate session for that node. duplicate-cn is off server side,
-        so the login kicks the session the chain is using: the verification
-        itself kills the thing it was meant to check, and a verification loop
-        turns into "chain dies every time it gets verified". Riding the mux
-        reuses the session the chain already holds.
-        """
-        if not (self.resi_rotate and self.vless_uuid):
-            return None, None
-        try:
-            got = measure_resi_rotate(
-                self.vless_uuid, self.port, self.vless_chain_path,
-                count=1, singbox_bin=self.singbox_bin,
-                timeout=CHAIN_PROBE_TIMEOUT)
-        except Exception:
-            got = None
-        if not got or not got.get("ips"):
-            return None, None
-        return got["ips"][0], got.get("first_ms")
+        if not self._serving_ok():
+            return None
+        exit_ip, ms, attempted = self._served_exit_probe()
+        if not attempted:
+            return None
+        with self._lock:
+            tag = self.preferred_tag
+            node = next((n for n in self._nodes
+                         if (n.get("endpoint") or {}).get("tag") == tag), None) if tag else None
+        if node is not None:
+            if exit_ip:
+                self._record_evidence(node, True, exit_ip, ms, None)
+            else:
+                self._record_evidence(node, False, None, None, "served chain has no exit ip")
+        return bool(exit_ip)
 
     def _chain_candidates_locked(self, now: float) -> list[dict]:
         """Nodes the chain may be pinned to, best evidence first.
@@ -2799,9 +1891,10 @@ class RailwayManager:
             tag = (node.get("endpoint") or {}).get("tag")
             if not tag or tag in reserved:
                 continue
-            if node.get("real_latency_ms") is None:
-                continue
             if self._chain_dead_until.get(tag, 0.0) > now:
+                continue
+            ev = self._node_evidence.get(f"{node.get('server')}:{node.get('server_port')}")
+            if self._evidence_is_fresh(ev) and ev.get("alive") is False:
                 continue
             entry = self._resi_health.get(tag) or {}
             down_until = float(entry.get("down_until", 0.0))
@@ -2815,78 +1908,169 @@ class RailwayManager:
                 answered.append(node)
             else:
                 fresh.append(node)
+        def _real(node: dict):
+            real = node.get("real_latency_ms")
+            return real if real is not None else 10**9
         def _recent(table: dict[str, float]):
             return lambda n: (-table.get((n.get("endpoint") or {}).get("tag") or "", 0.0),
-                              n["real_latency_ms"])
+                              _real(n))
         proven.sort(key=_recent(self._resi_payload_at))
         answered.sort(key=_recent(self._resi_ok_at))
-        fresh.sort(key=lambda n: (n["real_latency_ms"],
+        fresh.sort(key=lambda n: (_real(n),
                                   (n.get("endpoint") or {}).get("tag") or ""))
         parked.sort(key=lambda n: (
             float((self._resi_health.get((n.get("endpoint") or {}).get("tag") or "") or {})
-                  .get("down_until", 0.0)), n["real_latency_ms"]))
+                  .get("down_until", 0.0)), _real(n)))
         return proven + answered + fresh + parked
 
-    def _rescue_chain(self, reason: str, round_id: int) -> str:
-        """Repin the chain when the tunnel behind a TCP-alive pin is dead.
+    def _candidate_has_fresh_proof(self, node: dict) -> bool:
+        tag = (node.get("endpoint") or {}).get("tag")
+        if not tag:
+            return False
+        if self._fresh_alive_evidence(node):
+            return True
+        now = time.monotonic()
+        proof = self._resi_payload_at.get(tag, 0.0)
+        answered = self._resi_ok_at.get(tag, 0.0)
+        return bool((proof and now - proof <= CHAIN_ALIVE_WINDOW)
+                    or (answered and now - answered <= CHAIN_ALIVE_WINDOW))
 
-        Rotate mode must not unpin (an unpinned chain turns the urltest group
-        into a second client of the very nodes the rotation dials), so the only
-        safe move is another pin - but a pin that is *live now*. The switch is
-        done through the Clash API when the running config already lists the
-        tag: a local HTTP call, no config rewrite and no sing-box restart, so
-        the rotation keeps every connection. The failing pin goes into the
-        dead-memory so consecutive rescues walk through the pool instead of
-        bouncing between the same two corpses.
+    def _rescue_chain(self, reason: str, round_id: int) -> str:
+        with self._pin_switch_lock:
+            return self._rescue_chain_impl(reason, round_id)
+
+    def _rescue_chain_impl(self, reason: str, round_id: int) -> str:
+        """Repin the chain only onto a node that verifies right now.
+
+        Every candidate is tried in ranking order: a hot switch when the
+        running selector lists it, otherwise a config rewrite. The served
+        chain must then carry a real exit IP (or the candidate must already
+        have fresh evidence when no verifier is configured). Failed candidates
+        go into the dead-memory, so consecutive rescues walk the pool instead
+        of bouncing between two corpses. If nothing verifies the current pin
+        is kept and a refresh is requested - never a stale fallback.
         """
         now = time.monotonic()
         with self._lock:
+            if not self.auto_rescue:
+                self._record_history("chain-rescue-skipped", f"{reason}: auto_rescue off")
+                return "pinned"
             if now - self._chain_rescue_at < min(
                     CHAIN_RESCUE_COOLDOWN_MAX,
                     CHAIN_RESCUE_COOLDOWN * (2 ** max(0, self._chain_rescue_attempts - 1))):
                 return "pinned"
+            if self._rescue_round != round_id:
+                self._record_history("chain-rescue-skipped", f"{reason}: manual switch won the race")
+                return "pinned"
             tag = self.preferred_tag
             cands = self._chain_candidates_locked(now)
-        # Measured outside the lock: the check opens a tunnel round trip.
-        cands = self._chain_traffic_candidates(cands)
-        with self._lock:
-            best = (cands[0].get("endpoint") or {}).get("tag") if cands else None
-        if not best:
+        if not cands:
             with self._lock:
                 self._chain_rescue_attempts += 1
                 self._chain_rescue_at = now
-            self._record_history("chain-rescue-skipped", f"{reason}: no tunnel-verified alternative")
-            self._log(f"chain rescue skipped: {reason}: no tunnel-verified alternative", flush=True)
+                if tag:
+                    self._chain_dead_until[tag] = now + CHAIN_DEAD_MEMORY
+            self._record_history("chain-rescue-skipped", f"{reason}: no alternative candidate")
+            self._log(f"chain rescue skipped: {reason}: no alternative candidate", flush=True)
+            self._trigger_bg_refresh(f"{reason}: no verified alternative")
             return "pinned"
-        hot = self._repin_runtime(best, reason)
-        with self._config_lock:
-            ok = self._commit_rescue(round_id, best, None) if hot else (
-                self._apply_config(final="auto", preferred=best, backup=None)
-                and self._commit_rescue(round_id, best, None))
-        if not ok:
-            return "pinned"
+        failed: list[str] = []
+        # Bounded: a dead pool must not make one health tick walk 100 nodes at
+        # two multi-second probes each. Six best candidates fit in ~60s.
+        cands = cands[:6]
+        deadline = time.monotonic() + 60.0
+        touched = False
+        last_hot = False
+        for node in cands:
+            best = (node.get("endpoint") or {}).get("tag")
+            if not best:
+                continue
+            if time.monotonic() > deadline:
+                self._record_history("chain-rescue-skipped", f"{reason}: deadline reached")
+                break
+            with self._lock:
+                if self._rescue_round != round_id:
+                    self._record_history("chain-rescue-skipped", f"{reason}: manual switch won the race")
+                    return "pinned"
+            hot = self._repin_runtime(best, reason)
+            if hot:
+                touched = True; last_hot = True
+            else:
+                with self._config_lock:
+                    if not self._apply_config(final="auto", preferred=best, backup=None):
+                        failed.append(best)
+                        with self._lock:
+                            self._chain_dead_until[best] = now + CHAIN_DEAD_MEMORY
+                        continue
+                touched = True; last_hot = False
+            if not self.want_singbox:
+                # No serving chain exists (start_singbox=False): there is
+                # nothing to verify, and a real dial here would be pointless.
+                ok, exit_ip, ms, attempted = True, None, None, False
+            else:
+                ok, exit_ip, ms, attempted = self._verify_served(retries=2)
+                if not ok and not attempted and self._candidate_has_fresh_proof(node):
+                    # No verifier is configured yet; a fresh liveness proof is
+                    # the best available evidence. It still must not be stale.
+                    ok = True
+            if ok:
+                if exit_ip:
+                    self._record_evidence(node, True, exit_ip, ms, None)
+                with self._lock:
+                    committed = self._commit_rescue(round_id, best, None)
+                if committed:
+                    with self._lock:
+                        self._chain_rescue_attempts += 1
+                        self._chain_rescue_at = now
+                        self._chain_fail_streak = 0
+                        self._pinned_fail_streak = 0
+                        if tag and tag != best:
+                            self._chain_dead_until[tag] = now + CHAIN_DEAD_MEMORY
+                            self._resi_payload_at.pop(tag, None)
+                            self._resi_ok_at.pop(tag, None)
+                        self._chain_dead_until.pop(best, None)
+                    self._invalidate_verify(f"chain rescue to {best}")
+                    self._set_pin_health("ok")
+                    self._record_history("chain-rescue", f"{reason}: {tag} -> {best}" + (" (hot)" if hot else ""))
+                    self._log(f"chain rescue: {reason}: {tag} -> {best}" + (" (hot switch)" if hot else ""), flush=True)
+                    return "rescued"
+                # Verified but the round changed (refresh): never leave the
+                # selector on a candidate the state does not pin.
+                with self._lock:
+                    restore_tag = self.preferred_tag
+                self._restore_runtime_pin(restore_tag, last_hot)
+                self._record_history("chain-rescue-skipped", f"{reason}: manual switch won the race")
+                return "pinned"
+            with self._lock:
+                self._chain_dead_until[best] = now + CHAIN_DEAD_MEMORY
+                self._resi_payload_at.pop(best, None)
+                self._resi_ok_at.pop(best, None)
+            failed.append(best)
+        if touched:
+            # Restore once at abort, not between candidates: the next
+            # candidate is about to overwrite the selector anyway.
+            with self._lock:
+                restore_tag = self.preferred_tag
+            self._restore_runtime_pin(restore_tag, last_hot)
         with self._lock:
             self._chain_rescue_attempts += 1
             self._chain_rescue_at = now
-            self._chain_fail_streak = 0
-            if tag and tag != best:
-                # It just failed an end-to-end probe: keep it out of the
-                # next rescue's ranking (A->B->A loops never recover).
+            if tag:
                 self._chain_dead_until[tag] = now + CHAIN_DEAD_MEMORY
-                self._resi_payload_at.pop(tag, None)
-        self._invalidate_verify(f"chain rescue to {best}")
-        self._record_history("chain-rescue", f"{reason}: {tag} -> {best}" + (" (hot)" if hot else ""))
-        self._log(f"chain rescue: {reason}: {tag} -> {best}" + (" (hot switch)" if hot else ""), flush=True)
-        return "rescued"
+        self._record_history("chain-rescue-skipped",
+                             f"{reason}: no candidate verified ({len(failed)} tried)")
+        self._log(f"chain rescue skipped: {reason}: no candidate verified", flush=True)
+        self._trigger_bg_refresh(f"{reason}: no candidate verified")
+        self._set_pin_health("degraded", "no candidate verified for the chain")
+        return "pinned"
 
     def check_pinned_health(self, probe_fn=None) -> str:
-        """Simple health: pinned handshake must pass; serving handled gated.
+        """Judge the pin on handshake + served exit, every tick, every mode.
 
-        No real tunnel dial here (real dials kill serving via duplicate-cn
-        and OOM storms). Real dials only on demand (probe/verify/full_probe).
-        Rescue targets are fresh-handshake verified; stale ranking is only a
-        stopgap when every handshake is dead (pool likely stale: a background
-        refresh is triggered while the stale best holds the pin).
+        Handshake death needs PINNED_FAIL_THRESHOLD strikes; tunnel death needs
+        CHAIN_FAIL_THRESHOLD. A None probe result (no verifier / Clash or the
+        serving socket unavailable) is unknown, never death. No real dial is
+        ever made here: a second VPNGate session would kick the serving one.
         """
         with self._lock:
             tag = self.preferred_tag
@@ -2895,14 +2079,16 @@ class RailwayManager:
             round_id = self._rescue_round
             warmed = (time.monotonic() - self._chain_pin_at) < CHAIN_SETTLE_GRACE
         if tag is None:
+            self._set_pin_health("unpinned")
             return "no-preferred"
         if node is None:
             # The pinned node fell out of the snapshot. Leaving the pin dangling
             # makes build_singbox_config drop it and route the chain through the
             # all-nodes urltest group, which then competes with the rotation for
-            # VPNGate's single session per node ("one dead, two dead"). Repin to
-            # a live node instead of waiting for the next hourly repin.
-            return self._rescue_chain(f"pin {tag} left the snapshot", round_id)
+            # VPNGate's single session per node ("one dead, two dead").
+            result = self._rescue_chain(f"pin {tag} left the snapshot", round_id)
+            self._set_pin_health("ok" if result == "rescued" else "degraded")
+            return result
         endpoint = node.get("endpoint") or node
         probe = probe_fn or (lambda host, port: probe_tcp_latency(host, port, 5))
         hand = 0
@@ -2917,27 +2103,32 @@ class RailwayManager:
             if hand and hand > 0:
                 break
         alive = hand > 0
+        # Served-chain evidence in gateway AND rotate mode. None means the
+        # verifier itself is unavailable, which must not trigger a rescue.
+        chain_ok = self._chain_probe_ok()
         if alive:
             with self._lock:
                 node["latency_ms"] = hand
-                if self._pinned_fail_streak > 0:
-                    self._record_history("health-dial-ok", f"{tag} handshake recovered ms={hand}")
+                recovered = self._pinned_fail_streak > 0
                 self._pinned_fail_streak = 0
                 self._pinned_standby_noted = None
+            if recovered:
+                self._record_history("health-dial-ok", f"{tag} handshake recovered ms={hand}")
             if self.want_singbox and not self._serving_ok():
                 self._note_mixed_down(f"{tag} serving down, watching")
+                self._set_pin_health("degraded", "serving unreachable")
                 return "pinned"
-            chain_ok = self._chain_probe_ok()
             if chain_ok is None:
+                self._set_pin_health("unknown", "served exit probe unavailable")
                 return "pinned"
-            recovered = False
             with self._lock:
                 if chain_ok:
-                    recovered = self._chain_fail_streak > 0
+                    chain_recovered = self._chain_fail_streak > 0
                     self._chain_fail_streak = 0
                     self._chain_rescue_attempts = 0
                     # This node carries the chain again: it is not dead.
                     self._chain_dead_until.pop(tag, None)
+                    chain_streak = 0
                 elif warmed:
                     # Too early to judge: the endpoint may still be dialing.
                     self._chain_fail_streak = 0
@@ -2946,22 +2137,29 @@ class RailwayManager:
                     self._chain_fail_streak += 1
                     chain_streak = self._chain_fail_streak
             if chain_ok:
-                if recovered:
+                if chain_recovered:
                     self._record_history("chain-probe-ok", f"{tag} chain carries traffic again")
+                self._set_pin_health("ok")
                 return "pinned"
             if chain_streak < CHAIN_FAIL_THRESHOLD:
                 self._record_history("chain-probe-fail",
                                      f"{tag} {chain_streak}/{CHAIN_FAIL_THRESHOLD} tunnel probes failed")
+                self._set_pin_health("degraded",
+                                     f"tunnel probe {chain_streak}/{CHAIN_FAIL_THRESHOLD} failed")
                 return "pinned"
-            return self._rescue_chain(f"{tag} tunnel dead {chain_streak}x", round_id)
+            result = self._rescue_chain(f"{tag} tunnel dead {chain_streak}x", round_id)
+            self._set_pin_health("ok" if result == "rescued" else "degraded",
+                                 None if result == "rescued" else "tunnel dead, no verified alternative")
+            return result
         with self._lock:
             self._pinned_fail_streak += 1
             streak = self._pinned_fail_streak
         if warmed:
-            # Same reason as above: a pin we just moved to needs time to come
-            # up before its handshake failure means anything.
+            # A pin we just moved to needs time to come up before its
+            # handshake failure means anything.
+            self._set_pin_health("degraded")
             return "pinned"
-        if self.want_singbox and self._chain_probe_ok():
+        if chain_ok is True:
             # The pin's handshake is gone, but the chain still exits a real IP
             # (a hot switch already moved the selector). Repinning here would
             # rewrite the config and restart sing-box for zero benefit, so leave
@@ -2974,86 +2172,75 @@ class RailwayManager:
                         "chain-on-standby",
                         f"{tag} handshake dead but the chain still exits")
                 self._pinned_fail_streak = 0
+            self._set_pin_health("ok")
+            return "pinned"
+        attempted_rescue = False
+        if chain_ok is False:
+            with self._lock:
+                self._chain_fail_streak += 1
+                chain_streak = self._chain_fail_streak
+            if chain_streak >= CHAIN_FAIL_THRESHOLD:
+                attempted_rescue = True
+                result = self._rescue_chain(f"{tag} tunnel dead {chain_streak}x", round_id)
+                if result == "rescued":
+                    self._set_pin_health("ok")
+                    return result
+        if streak < PINNED_FAIL_THRESHOLD:
+            self._record_history("pin-handshake-fail",
+                                 f"{tag} {streak}/{PINNED_FAIL_THRESHOLD} handshakes failed")
+            self._set_pin_health("degraded",
+                                 f"handshake {streak}/{PINNED_FAIL_THRESHOLD} failed")
             return "pinned"
         with self._lock:
-            if not self.auto_rescue:
-                cands = []
-            else:
-                # Evidence-first ranking, exactly like the chain rescue: live
-                # payload proof, then unparked verified nodes, then parked ones.
-                now = time.monotonic()
-                cands = self._chain_candidates_locked(now)
-                if not cands:
-                    # Nothing is tunnel-verified yet (cold start): handshake
-                    # verification is enough to move the pin off a dead node.
-                    cands = sorted(
-                        (n for n in self._nodes
-                         if (n.get("endpoint") or {}).get("tag") != tag
-                         and n.get("latency_ms") is not None
-                         and self._chain_dead_until.get(
-                             (n.get("endpoint") or {}).get("tag") or "", 0.0) <= now),
-                        key=lambda n: (n.get("latency_ms") or 10**9,))
-        if not cands:
-            if streak < PINNED_FAIL_THRESHOLD:
-                return "pinned"
-            if self.resi_rotate:
-                # Rotate mode keeps the chain pinned to exactly one node. With
-                # the pin dropped the chain falls back to urltest over the very
-                # endpoints the rotation is dialing, and both paths fight for
-                # VPNGate's single session per node: /ws-resi keeps working
-                # while /ws-chain silently dies ("one dead, two dead").
-                with self._lock:
-                    self._pinned_fail_streak = 0
-                self._record_history("auto-pin-kept", f"{tag} dead but rotate mode keeps the chain pinned")
-                return "pinned"
+            now = time.monotonic()
+            cands = self._chain_candidates_locked(now) if self.auto_rescue else []
+            if not cands and self.auto_rescue:
+                # Nothing is tunnel-verified yet (cold start): handshake
+                # verification is enough to move the pin off a dead node.
+                cands = sorted(
+                    (n for n in self._nodes
+                     if (n.get("endpoint") or {}).get("tag") != tag
+                     and n.get("latency_ms") is not None
+                     and self._chain_dead_until.get(
+                         (n.get("endpoint") or {}).get("tag") or "", 0.0) <= now),
+                    key=lambda n: (n.get("latency_ms") or 10**9,))
+        alive_tags = self._fresh_probe_tags(cands) if self.auto_rescue else []
+        if alive_tags:
+            if not attempted_rescue:
+                result = self._rescue_chain(f"{tag} handshake failed {streak}x", round_id)
+                if result == "rescued":
+                    self._set_pin_health("ok")
+                    return result
+            # A verifiable alternative exists but none passed the served-exit
+            # check: keep the pin and ask for a fresh snapshot.
+            self._trigger_bg_refresh(f"{tag} no candidate verified")
+            self._set_pin_health("degraded", "no verified alternative for the dead pin")
+            return "pinned"
+        # Every candidate handshake is dead too: the pool is stale.
+        self._trigger_bg_refresh(f"{tag} all handshakes dead")
+        if self.resi_rotate:
+            # Rotate mode keeps the chain pinned to exactly one node. With
+            # the pin dropped the chain falls back to urltest over the very
+            # endpoints the rotation is dialing, and both paths fight for
+            # VPNGate's single session per node: /ws-resi keeps working
+            # while /ws-chain silently dies ("one dead, two dead").
             with self._lock:
                 self._pinned_fail_streak = 0
-            with self._config_lock:
-                with self._lock:
-                    self.preferred_tag = None; self.backup_tag = None; self._auto_pinned = True
-                    self.status["preferred_tag"] = None; self.status["backup_tag"] = None; self.status["auto_pinned"] = True
-                    self._persist_state(); self._invalidate_verify(f"unpinned after {tag} failed")
-                self._apply_config(final="auto")
-            self._record_history("auto-unpin", f"{tag} handshake failed {PINNED_FAIL_THRESHOLD}x")
-            try:
-                self._trigger_bg_refresh(f"{tag} pool exhausted")
-            except Exception:
-                pass
-            return "unpinned"
-        # Only nodes that carry traffic right now may be picked: the
-        # handshake proves the node is up, not that its tunnel still works.
-        cands = self._chain_traffic_candidates(cands)
-        alive_tags = self._fresh_probe_tags(cands) if self.auto_rescue else []
-        stale = False
-        if alive_tags:
-            best = alive_tags[0]
-        else:
-            stale = True
-            best = ((cands[0].get("endpoint") or {}).get("tag"))
-            try:
-                self._trigger_bg_refresh(f"{tag} all handshakes dead")
-            except Exception:
-                pass
-        if streak < PINNED_FAIL_THRESHOLD and not (streak == 1 and best is not None):
+            self._record_history("auto-pin-kept", f"{tag} dead but rotate mode keeps the chain pinned")
+            self._set_pin_health("dead", "pin dead, rotate mode keeps it")
             return "pinned"
         with self._lock:
             self._pinned_fail_streak = 0
-        hot = self._repin_runtime(best, f"{tag} handshake failed")
         with self._config_lock:
-            ok = self._commit_rescue(round_id, best, None) if hot else (
-                self._apply_config(final="auto", preferred=best, backup=None)
-                and self._commit_rescue(round_id, best, None))
-        if not ok:
-            if not hot:
-                with self._lock:
-                    cur = self.preferred_tag
-                if cur is not None:
-                    self._apply_config(final="auto", preferred=cur, backup=None)
-            return "pinned"
-        self._invalidate_verify(f"rescued to {best}")
-        self._record_history("auto-rescue" + ("-stale" if stale else ""),
-                             f"{tag} handshake failed, rescued to {best}" + (" (hot)" if hot else ""))
-        return "rescued"
+            with self._lock:
+                self.preferred_tag = None; self.backup_tag = None; self._auto_pinned = True
+                self.status["preferred_tag"] = None; self.status["backup_tag"] = None; self.status["auto_pinned"] = True
+                self._rescue_round += 1
+                self._persist_state(); self._invalidate_verify(f"unpinned after {tag} failed")
+            self._apply_config(final="auto")
+        self._record_history("auto-unpin", f"{tag} handshake failed {PINNED_FAIL_THRESHOLD}x")
+        self._set_pin_health("unpinned")
+        return "unpinned"
 
     def _commit_rescue(self, round_id: int, best: str | None, second: str | None) -> bool:
         with self._lock:
@@ -3066,6 +2253,10 @@ class RailwayManager:
             self._persist_state()
             return True
     def switch(self, tag: str | None = None, country: str | None = None) -> tuple[bool, str]:
+        with self._pin_switch_lock:
+            return self._switch_impl(tag=tag, country=country)
+
+    def _switch_impl(self, tag: str | None = None, country: str | None = None) -> tuple[bool, str]:
         with self._lock:
             if not self._nodes:
                 return False, "no nodes loaded"
@@ -3085,40 +2276,81 @@ class RailwayManager:
                     return False, f"unknown tag {tag}"
             target = node["endpoint"]["tag"] if node is not None else None
             effective = "chain" if target else "auto"
-        # trylock: a long refresh apply must not wedge switch for minutes.
-        hot = bool(target) and self._repin_runtime(target, "manual switch")
-        if hot:
-            # Nothing to write: the running config already lists the target as
-            # a chain candidate, so the whole switch is one loopback HTTP call.
-            with self._lock:
-                old = self.preferred_tag
-                self.preferred_tag = target; self.backup_tag = None; self._auto_pinned = False
-                self._chain_pin_at = time.monotonic()
-                self.status["preferred_tag"] = target; self.status["backup_tag"] = None; self.status["auto_pinned"] = False
-                self._rescue_round += 1; self._persist_state()
-        else:
+            old_preferred = self.preferred_tag
+            # Invalidate every rescue/verify round that started before this
+            # switch BEFORE any side effect, so a slow rescuer cannot commit
+            # over the operator's choice while the selector is half moved.
+            self._rescue_round += 1
+        if target is None:
+            # Unpin: back to the urltest group. A config rewrite is the safe
+            # path here (the selector may still point at a hot-switched tag).
             if not self._config_lock.acquire(timeout=5):
                 return False, "busy, retry later"
             try:
-                if not self._apply_config(final="auto", preferred=target):
+                if not self._apply_config(final="auto", preferred=None):
                     return False, "config check failed, kept previous"
-                with self._lock:
-                    old = self.preferred_tag
-                    self.preferred_tag = target; self.backup_tag = None; self._auto_pinned = False
-                    self._chain_pin_at = time.monotonic()
-                    self.status["preferred_tag"] = target; self.status["backup_tag"] = None; self.status["auto_pinned"] = False
-                    self._rescue_round += 1; self._persist_state()
             finally:
                 try:
                     self._config_lock.release()
                 except Exception:
                     pass
+            with self._lock:
+                self.preferred_tag = None; self.backup_tag = None; self._auto_pinned = True
+                self.status["preferred_tag"] = None; self.status["backup_tag"] = None
+                self.status["auto_pinned"] = True
+                self._chain_pin_at = time.monotonic()
+                self._rescue_round += 1
+                self._persist_state()
+                self._pinned_fail_streak = 0; self._chain_fail_streak = 0
+            if old_preferred is not None:
+                self._invalidate_verify("pin-cleared")
+            self._set_pin_health("unpinned")
+            self._record_history("switch", "final=auto")
+            return True, effective
+        candidate_node = next(n for n in self._nodes
+                              if n.get("endpoint", {}).get("tag") == target)
+        fresh_evidence = self._fresh_alive_evidence(candidate_node)
+        hot = self._repin_runtime(target, "manual switch")
+        if not hot:
+            if not self._config_lock.acquire(timeout=5):
+                return False, "busy, retry later"
+            try:
+                if not self._apply_config(final="auto", preferred=target):
+                    return False, "config check failed, kept previous"
+            finally:
+                try:
+                    self._config_lock.release()
+                except Exception:
+                    pass
+        if self.want_singbox:
+            ok_verify, exit_ip, ms, attempted = self._verify_served(retries=2)
+            if not ok_verify and not attempted and fresh_evidence:
+                # No verifier configured yet: a fresh tunnel/dial proof is the
+                # strongest evidence available, so the switch may proceed.
+                ok_verify = True
+            if not ok_verify:
+                self._restore_runtime_pin(old_preferred, hot)
+                detail = ("node tunnel dead: served chain has no exit ip"
+                          if attempted else "node tunnel dead: no verifier available")
+                self._record_history("switch-rejected", f"{target}: {detail}")
+                self._set_pin_health("degraded", detail)
+                return False, detail
+            if exit_ip:
+                self._record_evidence(candidate_node, True, exit_ip, ms, None)
         with self._lock:
-            self._pinned_fail_streak = 0
-        if old != target:
+            self.preferred_tag = target; self.backup_tag = None; self._auto_pinned = False
+            self.status["preferred_tag"] = target; self.status["backup_tag"] = None
+            self.status["auto_pinned"] = False
+            self._chain_pin_at = time.monotonic()
+            self._pinned_fail_streak = 0; self._chain_fail_streak = 0
+            self._rescue_round += 1
+            self._persist_state()
+        if old_preferred != target:
             self._invalidate_verify(f"pin-changed to {target}")
+        self._set_pin_health("ok")
         self._record_history("switch", f"final={effective}")
         return True, effective
+
     def _serving_nodes(self) -> list[dict]:
         with self._lock:
             nodes = list(self._nodes); preferred = self.preferred_tag; backup = self.backup_tag
@@ -3216,14 +2448,28 @@ class RailwayManager:
             return False
         with self._clash_switch_lock:
             code, _ = self._clash_call("/proxies/chain", {"name": tag})
-        if code in (200, 204):
+            if code not in (200, 204):
+                return False
+            # A 200 from PUT is not proof the selector moved. Read it back
+            # before the caller commits the pin; otherwise a "successful"
+            # switch reports 200 while the live selector still points at the
+            # old node.
+            now_code, body = self._clash_call("/proxies/chain", timeout=2.0)
+            moved = False
+            if now_code == 200:
+                try:
+                    moved = (json.loads(body).get("now") == tag)
+                except (ValueError, AttributeError):
+                    moved = False
+            if not moved:
+                self._record_history("chain-select-unconfirmed", f"{tag} not selected")
+                return False
             self._clash_ready_at = time.monotonic()
             chain_status = self.status.get("chain_switch")
             if isinstance(chain_status, dict):
                 chain_status["ready"] = True
                 chain_status["switches"] = int(chain_status.get("switches", 0)) + 1
             return True
-        return False
 
     def _chain_selector_tags(self) -> list[str]:
         """Every serving tag the "chain" selector may hot-switch to.
@@ -3404,16 +2650,26 @@ class RailwayManager:
         # been dialed first. The full probe measures the same nodes through
         # their own serving endpoints (no second session), so it is the one
         # that fills the pool.
+        with self._lock:
+            old_nodes = list(self._nodes)
+            old_preferred = self.preferred_tag
+            old_backup = self.backup_tag
+            old_auto = self._auto_pinned
+            old_tag_key = {((n.get("endpoint") or {}).get("tag")): f"{n.get('server')}:{n.get('server_port')}"
+                           for n in old_nodes if (n.get("endpoint") or {}).get("tag")}
+            reserved_tags = {t for t in (old_preferred, old_backup) if t}
         skip_keys: set[tuple[str, int]] = set()
         carried: dict[tuple[str, int], int] = {}
-        with self._lock:
-            if self.resi_rotate:
-                for node in self._nodes:
-                    key = (node.get("server"), node.get("server_port"))
-                    skip_keys.add(key)
-                    real = node.get("real_latency_ms")
-                    if real is not None:
-                        carried[key] = real
+        for node in old_nodes:
+            key = (node.get("server"), node.get("server_port"))
+            tag = (node.get("endpoint") or {}).get("tag")
+            serving = self.resi_rotate or tag in reserved_tags
+            if serving:
+                skip_keys.add(key)
+            real = node.get("real_latency_ms")
+            evidence = self._node_evidence.get(f"{key[0]}:{key[1]}")
+            if real is not None and (serving or self._evidence_is_fresh(evidence)):
+                carried[key] = real
         try:
             fetch = fetcher or self.fetcher
             csv_text = self._fetch_with_retry(fetch)
@@ -3432,6 +2688,13 @@ class RailwayManager:
                 real = carried.get((node.get("server"), node.get("server_port")))
                 if real is not None:
                     node["real_latency_ms"] = real
+        for node in nodes:
+            # A TCP handshake is weak evidence, so it never overwrites a fresh
+            # exit proof; it only revives a node whose evidence went stale.
+            if (node.get("real_latency_ms") is not None or node.get("latency_ms") is not None):
+                ev = self._node_evidence.get(f"{node.get('server')}:{node.get('server_port')}")
+                if not self._evidence_is_fresh(ev):
+                    self._note_dial_ok(node, node.get("real_latency_ms"))
         with self._lock:
             old_seen = dict(self._first_seen); now = _now_iso(); cur_keys = set()
             for node in nodes:
@@ -3440,37 +2703,80 @@ class RailwayManager:
                 self._first_seen.setdefault(key, old_seen.get(key, now))
             for key in [k for k in self._first_seen if k not in cur_keys]:
                 del self._first_seen[key]
-            assign_stable_tags(nodes, self._nodes)
+            assign_stable_tags(nodes, old_nodes)
             self._nodes = nodes
+            self._nodes_rev += 1
             endpoints = nodes_to_endpoints(nodes)
             tags = {ep["tag"] for ep in endpoints}
-            if self.preferred_tag is not None and self.preferred_tag not in tags:
-                self._record_history("preferred-gone", f"{self.preferred_tag} vanished, back to auto")
-                self.preferred_tag = None; self.backup_tag = None; self._auto_pinned = True
-            elif self.preferred_tag is None:
-                self.backup_tag = None
-            preferred = self.preferred_tag
-            backup = self.backup_tag if self.backup_tag in tags else None
-            if backup != self.backup_tag:
-                self.backup_tag = backup
-        with self._config_lock:
-            with self._lock:
-                preferred = self.preferred_tag
-                backup = self.backup_tag if (self.backup_tag in tags) else None
-                self.backup_tag = backup
-            if not self._apply_config(final="auto", preferred=preferred, backup=backup):
+            new_tag_key = {ep["tag"]: f"{primary_server(ep)[0]}:{primary_server(ep)[1]}"
+                           for ep in endpoints}
+            pin_gone = False
+            next_preferred = old_preferred
+            if old_preferred is not None:
+                # A tag is only the same pin when it still maps to the same
+                # server:port. If the old owner vanished, the tag may have
+                # been recycled by a new node - following it would silently
+                # jump the pin to a different server.
+                if (old_preferred not in tags
+                        or new_tag_key.get(old_preferred) != old_tag_key.get(old_preferred)):
+                    pin_gone = True
+                    next_preferred = None
+            next_backup = old_backup
+            if (next_preferred is None or old_backup is None
+                    or old_backup not in tags
+                    or new_tag_key.get(old_backup) != old_tag_key.get(old_backup)):
+                next_backup = None
+        with self._pin_switch_lock:
+          with self._lock:
+            # A manual switch may have landed while the snapshot was fetched
+            # and probed. Never overwrite it with the stale snapshot pin.
+            live_preferred = self.preferred_tag
+            live_backup = self.backup_tag
+            live_auto = self._auto_pinned
+            pin_gone = False
+            if live_preferred != old_preferred or live_backup != old_backup:
+                next_preferred = live_preferred
+                next_backup = live_backup
+                if next_preferred is not None:
+                    old_key = old_tag_key.get(next_preferred)
+                    if (next_preferred not in tags
+                            or (old_key is not None
+                                and new_tag_key.get(next_preferred) != old_key)):
+                        pin_gone = True
+                        next_preferred = None
+                if (next_preferred is None or next_backup is None
+                        or next_backup not in tags
+                        or (old_tag_key.get(next_backup) is not None
+                            and new_tag_key.get(next_backup) != old_tag_key.get(next_backup))):
+                    next_backup = None
+                old_auto = live_auto
+          with self._config_lock:
+            if not self._apply_config(final="auto", preferred=next_preferred, backup=next_backup):
                 return self._refresh_failed("config check failed, kept previous")
             with self._lock:
-                self.status["endpoints"] = [{"tag": ep["tag"], "server": primary_server(ep)[0], "server_port": primary_server(ep)[1],
-                    "country": n.get("country", ""), "country_short": n.get("country_short", ""), "latency_ms": n.get("latency_ms"),
-                    "real_latency_ms": n.get("real_latency_ms"), "speed": n.get("speed", 0)} for ep, n in zip(endpoints, nodes)]
+                pin_changed = (self.preferred_tag != next_preferred) or pin_gone
+                if pin_gone and old_preferred:
+                    self._record_history("preferred-gone", f"{old_preferred} vanished, back to auto")
+                    self._auto_pinned = True
+                else:
+                    self._auto_pinned = old_auto
+                self.preferred_tag = next_preferred; self.backup_tag = next_backup
+                if pin_changed:
+                    self._rescue_round += 1
+                self.status["endpoints"] = [self._endpoint_row(ep, n)
+                                            for ep, n in zip(endpoints, nodes)]
                 self.status["countries"] = self._countries()
                 self.status["preferred_tag"] = self.preferred_tag; self.status["backup_tag"] = self.backup_tag
                 self.status["auto_pinned"] = self._auto_pinned; self.status["last_refresh"] = _now_iso()
                 self.status["last_error"] = None; self.status["refresh_ok"] += 1
                 self._fail_streak = 0; self._crash_streak = 0
+                live_keys = {f"{n.get('server')}:{n.get('server_port')}" for n in nodes}
+                self._node_evidence = {k: v for k, v in self._node_evidence.items()
+                                       if k in live_keys}
+        if pin_gone:
+            self._invalidate_verify(f"pin {old_preferred} left the snapshot")
         self._persist_nodes(); self._persist_state()
-        effective = "chain" if preferred else "auto"
+        effective = "chain" if next_preferred else "auto"
         self._record_history("refresh-ok", f"{len(endpoints)} endpoints, final={effective}")
         self._log(f"refreshed {len(endpoints)} endpoints, final={effective}", flush=True)
         # Startup/refresh only real-dials REAL_TOPK nodes so the first serving
@@ -3479,6 +2785,7 @@ class RailwayManager:
         # third path may only rotate over verified nodes).
         self._start_full_probe()
         return True
+
     def _refresh_failed(self, reason: str) -> bool:
         with self._lock:
             self.status["last_error"] = reason; self.status["refresh_fail"] += 1; self._fail_streak += 1
@@ -3604,26 +2911,21 @@ class RailwayManager:
     def _chain_traffic_candidates(self, cands: list[dict]) -> list[dict]:
         """The candidates that carry traffic right now, best first.
 
-        A node's measured latency is not evidence that it still works, so
-        the chain may only move onto a node that answers now. At most a few
-        candidates are asked (each measurement is a tunnel round trip) and,
-        if none answers, the best ranked one is kept - a dead candidate is
-        still better than no candidate.
+        A node's measured latency is not evidence that it still works, so only
+        nodes that answer now may be returned. There is deliberately no
+        candidate cap and no "best ranked dead node" fallback: a rescue that
+        cannot find live traffic must keep the current pin (the caller records
+        chain-rescue-skipped and refreshes) instead of moving onto a corpse.
         """
         if not (self.resi_rotate and self.vless_uuid) or not cands:
             return cands
-        limit = min(len(cands), 3)
-        alive = [n for n in cands[:limit]
-                 if self._chain_candidate_carries_traffic(n)]
+        alive = [n for n in cands if self._chain_candidate_carries_traffic(n)]
         if not alive:
-            # Say it out loud: the chain cannot be moved onto a node that
-            # carries traffic, because there is none right now. That is a
-            # state of the pool, not a failure of the rescue.
+            # A state of the pool, not a rescue failure.
             self._record_history(
                 "chain-rescue-blind",
                 f"no candidate carries traffic right now "
                 f"({len(cands)} candidates asked)")
-            return cands[:1]
         return alive
 
     def _probe_target_started_serving(self, tag: str) -> bool:
@@ -3662,8 +2964,16 @@ class RailwayManager:
                 return
             ms = self._measure_for_probe(node)
             with self._lock:
-                node["real_latency_ms"] = ms
+                # A failed probe must not erase the last working measurement:
+                # the node stays ranked by its old number, but its evidence
+                # says it is dead right now (and rescue/auto-pin skip it).
+                if ms is not None:
+                    node["real_latency_ms"] = ms
                 self.status["full_probe"]["done"] += 1
+            if ms is not None:
+                self._note_dial_ok(node, ms)
+            elif not self._fresh_alive_evidence(node):
+                self._record_evidence(node, False, None, None, "probe failed")
         with ThreadPoolExecutor(max_workers=self.full_probe_workers) as executor:
             list(executor.map(_dial_one, ordered))
         with self._lock:
@@ -3700,28 +3010,120 @@ class RailwayManager:
             self._apply_config(final="auto", preferred=preferred, backup=backup)
 
     def _auto_pin_best(self, nodes: list[dict], start_preferred: str | None) -> None:
-        measured = sorted((n for n in nodes if n.get("real_latency_ms") is not None and (n.get("endpoint") or {}).get("tag")),
+        with self._pin_switch_lock:
+            return self._auto_pin_best_impl(nodes, start_preferred)
+
+    def _auto_pin_best_impl(self, nodes: list[dict], start_preferred: str | None) -> None:
+        def _fresh_dead(node: dict) -> bool:
+            ev = self._node_evidence.get(self._node_key(node))
+            return bool(self._evidence_is_fresh(ev) and ev.get("alive") is False)
+        measured = sorted((n for n in nodes
+                           if n.get("real_latency_ms") is not None
+                           and (n.get("endpoint") or {}).get("tag")
+                           and not _fresh_dead(n)),
             key=lambda n: (n["real_latency_ms"], (n.get("endpoint") or {}).get("tag") or ""))
         if not measured:
             self._record_history("auto-pin-skipped", "nothing measured")
             return
-        best = (measured[0].get("endpoint") or {}).get("tag")
-        second = ((measured[1].get("endpoint") or {}).get("tag") if len(measured) > 1 else None)
         with self._lock:
-            if self.preferred_tag is not None:
-                self._record_history("auto-pin-skipped", "pin exists, manual full-probe keeps pin (use switch to change)")
+            rev = self._nodes_rev
+            current = self.preferred_tag
+            current_node = next((n for n in nodes
+                                 if (n.get("endpoint") or {}).get("tag") == current), None) if current else None
+            if current is not None:
+                if not (self._auto_pinned and self.auto_repin):
+                    self._record_history("auto-pin-skipped",
+                                         "pin exists, manual full-probe keeps pin (use switch to change)")
+                    return
+                best_real = measured[0].get("real_latency_ms")
+                current_real = current_node.get("real_latency_ms") if current_node else None
+                if best_real is None or current_real is None or best_real >= current_real * 0.8:
+                    self._record_history("auto-pin-skipped",
+                                         "auto pin has no materially better verified node")
+                    return
+            elif start_preferred is not None and current != start_preferred:
+                self._record_history("auto-pin-skipped", f"switched mid-run to {current}")
                 return
-            if start_preferred is not None and self.preferred_tag != start_preferred:
-                self._record_history("auto-pin-skipped", f"switched mid-run to {self.preferred_tag}")
+        if not self.want_singbox:
+            self._auto_pin_unserved(measured, current)
+            return
+        # Never pin a node the served chain has not exited through. A fresh
+        # tunnel dial alone is not an exit proof, and a throwaway client would
+        # kick the serving session (duplicate-cn).
+        if not self._verifier_configured():
+            self._record_history("auto-pin-skipped", "no served exit verifier")
+            return
+        if not (self._mixed_listening() or self._singbox_live()):
+            # The serving stack is still coming up (or absent in a unit test):
+            # do not rewrite/restart the config just to fail verification.
+            self._record_history("auto-pin-skipped", "serving stack not ready")
+            return
+        expected = current
+        if current is not None:
+            candidates = [measured[0]]
+        else:
+            candidates = measured[:EXIT_VERIFY_CAP]
+        for cand in candidates:
+            tag = (cand.get("endpoint") or {}).get("tag")
+            if not tag or tag == expected:
+                continue
+            cand_key = self._node_key(cand)
+            hot = self._repin_runtime(tag, "auto-pin verify")
+            if not hot:
+                with self._config_lock:
+                    if not self._apply_config(final="auto", preferred=tag, backup=None):
+                        self._record_history("auto-pin-failed", tag)
+                        continue
+            ok, exit_ip, ms, attempted = self._verify_served(retries=2)
+            if ok and exit_ip:
+                self._record_evidence(cand, True, exit_ip, ms, None)
+                committed = False
+                with self._config_lock:
+                    with self._lock:
+                        live_node = next((n for n in self._nodes
+                                          if (n.get("endpoint") or {}).get("tag") == tag), None)
+                        if self._nodes_rev != rev:
+                            skip = "node set changed during verify"
+                        elif self.preferred_tag != expected:
+                            skip = f"pin won the race to {self.preferred_tag}"
+                        elif live_node is None or self._node_key(live_node) != cand_key:
+                            skip = "candidate tag was remapped during verify"
+                        else:
+                            self.preferred_tag = tag
+                            self.backup_tag = None
+                            self._auto_pinned = True
+                            self._chain_pin_at = time.monotonic()
+                            self.status["preferred_tag"] = tag
+                            self.status["backup_tag"] = None
+                            self.status["auto_pinned"] = True
+                            self._rescue_round += 1
+                            self._persist_state()
+                            committed = True
+                            skip = ""
+                if committed:
+                    self._invalidate_verify(f"auto-pinned to {tag}")
+                    self._set_pin_health("ok")
+                    self._record_history("auto-pin", tag)
+                    return
+                with self._lock:
+                    cur = self.preferred_tag
+                self._restore_runtime_pin(cur, hot)
+                self._record_history("auto-pin-skipped", skip)
                 return
+            with self._lock:
+                cur = self.preferred_tag
+            self._restore_runtime_pin(cur, hot)
+            self._record_history("auto-pin-skipped", f"{tag} served chain did not verify")
+        self._record_history("auto-pin-skipped", "no exit ip")
+
+    def _auto_pin_unserved(self, measured: list[dict], current: str | None) -> None:
+        """Legacy no-sing-box path: verify with `verify_fn`, which is safe
+        because nothing is serving. Kept for start_singbox=False callers and
+        cold-start tests."""
+        if current is not None:
+            self._record_history("auto-pin-skipped", "pin exists")
+            return
         pinned = None; pinned_second = None
-        # Rotate mode must NOT verify by dialing. `verify_fn` starts a
-        # throwaway sing-box client: that opens a SECOND VPNGate session and
-        # duplicate-cn kicks the one the rotation is serving right now - the
-        # same rule `_run_verify` follows through `_served_exit_ip` (D13).
-        # The candidates here are already dial-verified (real_latency_ms is
-        # only set after a real dial), so rotate mode pins the best of them
-        # directly and never dials a serving node.
         if not self.resi_rotate:
             for i, cand in enumerate(measured[:EXIT_VERIFY_CAP]):
                 tag = (cand.get("endpoint") or {}).get("tag")
@@ -3732,8 +3134,8 @@ class RailwayManager:
                     ip = None
                 if ip:
                     pinned = tag
-                    rest = [n for n in measured[i+1:] if (n.get("endpoint") or {}).get("tag") != tag]
-                    pinned_second = None
+                    rest = [n for n in measured[i + 1:]
+                            if (n.get("endpoint") or {}).get("tag") != tag]
                     for r in rest[:EXIT_VERIFY_CAP]:
                         try:
                             rip, _ = self.verify_fn(r.get("endpoint") or r)
@@ -3745,26 +3147,26 @@ class RailwayManager:
                     break
         if pinned is None:
             if self.resi_rotate:
-                # Rotate mode must never run with the chain unpinned: an
-                # unpinned chain uses the urltest group, i.e. the same nodes the
-                # rotation dials, and the two fight over VPNGate's one session
-                # per node. Pin the best *dial-verified* node even without an
-                # exit probe; the pin is what lets the rotation exclude it.
-                pinned = best
-                pinned_second = None    # never invent an unverified standby
+                # Rotate mode must never run with the chain unpinned; it may
+                # not dial serving nodes either. Pin the best dial-verified
+                # node without an exit probe.
+                pinned = (measured[0].get("endpoint") or {}).get("tag")
+                pinned_second = None
                 with self._config_lock:
-                    if not self._apply_config(final="auto", preferred=pinned, backup=pinned_second):
+                    if not self._apply_config(final="auto", preferred=pinned, backup=None):
                         self._record_history("auto-pin-failed", pinned)
                         return
                     with self._lock:
                         if self.preferred_tag is not None:
                             self._record_history("auto-pin-skipped", "pin won the race")
                             return
-                        self.preferred_tag = pinned; self.backup_tag = pinned_second; self._auto_pinned = True
+                        self.preferred_tag = pinned; self.backup_tag = None; self._auto_pinned = True
                         self._chain_pin_at = time.monotonic()
-                        self.status["preferred_tag"] = pinned; self.status["backup_tag"] = pinned_second; self.status["auto_pinned"] = True
+                        self.status["preferred_tag"] = pinned; self.status["backup_tag"] = None
+                        self.status["auto_pinned"] = True
+                        self._rescue_round += 1
                         self._persist_state()
-                self._invalidate_verify(f"auto-pinned to {pinned} (unverified, rotate mode)")
+                self._invalidate_verify(f"auto-pinned to {pinned}")
                 self._record_history("auto-pin-unverified", f"rotate mode pins {pinned} without exit ip")
                 return
             self._record_history("auto-pin-skipped", "no exit ip")
@@ -3776,14 +3178,19 @@ class RailwayManager:
             with self._lock:
                 if self.preferred_tag is not None:
                     self._record_history("auto-pin-skipped", "pin won the race")
-                    self._apply_config(final="auto", preferred=self.preferred_tag, backup=self.backup_tag)
+                    self._apply_config(final="auto", preferred=self.preferred_tag,
+                                       backup=self.backup_tag)
                     return
                 self.preferred_tag = pinned; self.backup_tag = pinned_second; self._auto_pinned = True
                 self._chain_pin_at = time.monotonic()
-                self.status["preferred_tag"] = pinned; self.status["backup_tag"] = pinned_second; self.status["auto_pinned"] = True
+                self.status["preferred_tag"] = pinned
+                self.status["backup_tag"] = pinned_second
+                self.status["auto_pinned"] = True
+                self._rescue_round += 1
                 self._persist_state()
         self._invalidate_verify(f"auto-pinned to {pinned}")
         self._record_history("auto-pin", pinned + (f" backup={pinned_second}" if pinned_second else ""))
+
     def _sync_probe_results(self, nodes: list[dict]) -> None:
         by_key: dict = {}
         for ep in self.status["endpoints"]:
@@ -3803,6 +3210,8 @@ class RailwayManager:
             entry = {"tag": tag, "server": node.get("server"), "server_port": node.get("server_port"),
                 "country": node.get("country", ""), "country_short": node.get("country_short", ""),
                 "latency_ms": node.get("latency_ms"), "real_latency_ms": node.get("real_latency_ms"), "speed": node.get("speed", 0)}
+            entry.update({"alive": None, "exit_ip": None, "verified_at": None,
+                          "verify_ms": None, "verify_error": None, "verify_fresh": False})
             self.status["endpoints"].append(entry)
             by_key[key] = [entry]
     @staticmethod
@@ -3824,9 +3233,47 @@ class RailwayManager:
             self._single_probe_thread = thread
             thread.start()
         return True, tag
+    def _tag_may_be_serving(self, tag: str | None) -> bool:
+        if not tag:
+            return False
+        with self._lock:
+            if tag in (self.preferred_tag, self.backup_tag):
+                return True
+            if self.resi_rotate and any(served == tag for served, _ in self._resi_routes):
+                return True
+        return False
+
     def _run_single_probe(self, node: dict) -> None:
         time.sleep(0.2)
         tag = node.get("endpoint", {}).get("tag")
+        if self._tag_may_be_serving(tag):
+            # A throwaway client would open a second VPNGate session for a
+            # node that is serving right now; duplicate-cn kicks the live one.
+            # Ask the sidecar for its real delay, or measure through the
+            # node's own rotate inbound. Refuse rather than dial.
+            ms = None
+            error = None
+            delays = self._probe_delays([tag] if tag else [])
+            if delays is not None and tag in delays:
+                ms = delays[tag]
+            else:
+                # Only a real rotate inbound may be measured; _measure_for_probe
+                # falls back to dial_fn, which must never run for a serving tag.
+                if (self.resi_rotate and self.vless_uuid and tag
+                        and self._resi_port_for_tag(tag)):
+                    ms = self._measure_for_probe(node)
+                if ms is None:
+                    error = "node is serving; refused to dial it (duplicate-cn)"
+            with self._lock:
+                if ms is not None:
+                    live = next((n for n in self._nodes
+                                 if (n.get("endpoint") or {}).get("tag") == tag), node)
+                    live["real_latency_ms"] = ms
+                    node["real_latency_ms"] = ms
+                    self._sync_probe_results([node])
+                self.status["probe"] = {"state": "done", "tag": tag, "ms": ms, "error": error}
+            self._record_history("single-probe", f"{tag} ms={ms}" + (" (serving, no dial)" if error else ""))
+            return
         try:
             ms = self.dial_fn(node) if self.dial_fn else None
             error = None
@@ -3863,28 +3310,48 @@ class RailwayManager:
         time.sleep(0.2)
         tag = node.get("endpoint", {}).get("tag")
         endpoint = node.get("endpoint") or node
-        try:
-            if self.resi_rotate and not self._verify_custom:
-                # Rotate mode: never dial the pinned node with a throwaway
-                # client (it would kick the live session). Measure the served
-                # chain through the mux instead.
-                exit_ip, ms = self._served_exit_ip()
+        with self._lock:
+            pin_tag = self.preferred_tag
+        via_tag = pin_tag or tag
+        attempted = False
+        if self.want_singbox:
+            # Gateway AND rotate mode: verify the chain that is actually
+            # served, through the local mixed inbound. Never start a throwaway
+            # client while sing-box is running - it opens a second VPNGate
+            # session and duplicate-cn kicks the serving one.
+            exit_ip, ms, attempted = self._served_exit_probe()
+            if exit_ip:
+                error = None
+            elif attempted:
+                error = "served chain has no exit ip"
             else:
+                error = "served exit probe unavailable"
+            if pin_tag and attempted:
+                pin_node = next((n for n in self._nodes
+                                 if (n.get("endpoint") or {}).get("tag") == pin_tag), None)
+                if pin_node is not None:
+                    self._record_evidence(pin_node, bool(exit_ip), exit_ip, ms, error)
+        else:
+            try:
                 result = self.verify_fn(endpoint)
                 exit_ip, ms = result if result else (None, None)
-            error = None if exit_ip else "no exit ip measured"
-        except Exception as exc:
-            exit_ip, ms = None, None
-            error = f"{type(exc).__name__}: {exc}"
-        if exit_ip and self.want_singbox and not self._serving_ok():
-            error = "serving down, throwaway ok"; exit_ip, ms = None, None
+                error = None if exit_ip else "no exit ip measured"
+                attempted = True
+            except Exception as exc:
+                exit_ip, ms = None, None
+                error = f"{type(exc).__name__}: {exc}"
+                attempted = True
+            if attempted:
+                self._record_evidence(node, bool(exit_ip), exit_ip, ms, error)
         checked_at = _now_iso()
         with self._lock:
             if gen != self._verify_generation:
                 self._record_history("verify-discarded", f"{tag} superseded")
                 return
-            self.status["verify"] = {"state": "done", "exit_ip": exit_ip, "ms": ms, "via_tag": tag, "error": error, "generation": gen, "checked_at": checked_at}
-        self._record_history("verify-done", f"{tag} exit={exit_ip} ms={ms}")
+            self.status["verify"] = {"state": "done", "exit_ip": exit_ip, "ms": ms,
+                                     "via_tag": via_tag, "error": error,
+                                     "generation": gen, "checked_at": checked_at}
+        self._record_history("verify-done", f"{via_tag} exit={exit_ip} ms={ms}")
     def _invalidate_verify(self, reason: str) -> None:
         with self._lock:
             self._verify_generation += 1
@@ -4467,7 +3934,8 @@ def main() -> int:
         tunnel_token=cfg["tunnel_token"], cloudflared_bin=cfg["cloudflared_bin"], disguise_path=cfg["disguise_path"],
         config_path=os.path.join(data_dir, "singbox-railway.json"), nodes_path=os.path.join(data_dir, "nodes.json"),
         state_path=os.path.join(data_dir, "state.json"), settings_path=os.path.join(data_dir, "settings.json"),
-        clash_api_port=cfg["clash_api_port"])
+        clash_api_port=cfg["clash_api_port"], edge_metrics_url=cfg["edge_metrics_url"],
+        bind_host=cfg["bind_host"])
     stop_event = threading.Event()
     def _on_signal(signum, frame) -> None:
         stop_event.set()

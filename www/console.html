@@ -1,0 +1,1529 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>vpngate console</title>
+<script>try{document.documentElement.dataset.theme=localStorage.getItem("theme")||(matchMedia("(prefers-color-scheme: light)").matches?"light":"dark")}catch(e){document.documentElement.dataset.theme="dark"}</script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#000;color:#fff;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;min-height:100vh}
+body::before{content:"";position:fixed;inset:0;z-index:-1;background:radial-gradient(ellipse 55% 40% at 75% 8%,rgba(99,102,241,.28),transparent 70%),radial-gradient(ellipse 45% 35% at 12% 25%,rgba(34,211,238,.16),transparent 70%),radial-gradient(ellipse 50% 45% at 50% 100%,rgba(16,185,129,.14),transparent 70%),#000}
+#topnav{position:sticky;top:0;z-index:50;display:flex;align-items:center;gap:26px;padding:14px 32px;font-size:14px;background:rgba(10,12,24,.88);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);border-bottom:1px solid rgba(255,255,255,.09)}
+#topnav .logo{font-weight:800;font-size:16px;background:linear-gradient(90deg,#a5b4fc,#67e8f9);-webkit-background-clip:text;background-clip:text;color:transparent}
+#topnav .live{font-size:11px;color:#6ee7b7;border:1px solid rgba(110,231,183,.4);border-radius:999px;padding:2px 10px}
+#topnav .links{display:flex;gap:22px;color:#ccc}
+#topnav .right{margin-left:auto;display:flex;gap:14px;align-items:center}
+#topnav .cta{border:1px solid rgba(255,255,255,.2);border-radius:999px;padding:7px 18px;cursor:pointer;background:rgba(255,255,255,.06)}
+#topnav .cta:hover{background:rgba(255,255,255,.14)}
+.wrap{max-width:1180px;margin:0 auto;padding:34px 28px 60px}
+.glass-card{background:rgba(255,255,255,.055);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,.11);border-radius:22px;padding:28px 30px;margin-bottom:22px;box-shadow:0 18px 50px rgba(0,0,0,.45)}
+.glass-card h2{font-size:19px;font-weight:700;margin-bottom:6px}
+.glass-card .desc{color:#a8adbd;font-size:13px;line-height:1.7;margin-bottom:16px}
+#exit-card{background:linear-gradient(135deg,rgba(99,102,241,.2),rgba(34,211,238,.1)),rgba(255,255,255,.055)}
+#hero-kicker{font-size:52px;font-weight:800;letter-spacing:-.03em;line-height:1.08;background:linear-gradient(92deg,#fff,#a5b4fc 60%,#67e8f9);-webkit-background-clip:text;background-clip:text;color:transparent}
+#hero-sub{color:#c2c7d6;font-size:14px;margin-top:10px}
+#verify-result{margin-top:12px;font-size:14px;color:#6ee7b7;min-height:22px}
+.verify-ok{color:#6ee7b7}.verify-err{color:#fca5a5}
+.linklike{color:#8ab4ff;cursor:pointer;text-decoration:none}
+.linklike:hover{text-decoration:underline}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px;margin-bottom:22px}
+.stat{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:16px;padding:16px 18px;backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px)}
+.stat .k{font-size:12px;color:#8b91a5}
+.stat .v{font-size:24px;font-weight:700;margin-top:4px}
+.btn{border-radius:999px;padding:10px 24px;font-size:14px;cursor:pointer;border:1px solid rgba(255,255,255,.2);color:#fff;background:rgba(255,255,255,.07);transition:transform .12s ease,background .15s ease}
+.btn:hover{background:rgba(255,255,255,.15)}
+.btn:active{transform:scale(.97)}
+.btn:disabled{opacity:.55;cursor:wait;transform:none}
+.btn.primary{background:linear-gradient(92deg,#4338CA,#0369A3);border:none;font-weight:600;box-shadow:0 6px 24px rgba(99,102,241,.45)}
+.btn.busy{animation:pulse 1.1s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.55}}
+#pills{display:flex;gap:10px;margin:14px 0;flex-wrap:wrap}
+#scope{margin:14px 0;min-width:180px}
+.opbtn{min-height:28px;padding:5px 16px;border-radius:999px;border:1px solid rgba(138,180,255,.5);background:rgba(138,180,255,.08);color:#8ab4ff;font-size:12.5px;cursor:pointer;margin-right:8px;white-space:nowrap}
+.opbtn:hover{background:rgba(138,180,255,.18)}
+.opbtn:disabled{opacity:.45;cursor:not-allowed}
+.opbtn[aria-disabled="true"]{opacity:.45;cursor:not-allowed}
+#node-search::placeholder{color:#9aa0b2}
+.ip{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px}
+#thinbar{display:none;height:2px;border-radius:999px;background:rgba(255,255,255,.08);overflow:hidden;margin:10px 0 2px}
+#thinbar.show{display:block}
+#thinbar i{display:block;height:100%;width:30%;border-radius:999px;background:linear-gradient(90deg,#6366f1,#22d3ee);animation:slide 1s ease-in-out infinite}
+@keyframes slide{0%{margin-left:-30%}100%{margin-left:100%}}
+.spin{display:inline-block;width:12px;height:12px;border:2px solid rgba(255,255,255,.25);border-top-color:#fff;border-radius:50%;animation:rot .7s linear infinite;vertical-align:-2px;margin-right:6px}
+@keyframes rot{to{transform:rotate(360deg)}}
+table.bench.loading tbody{opacity:.55}
+#switch-undo{margin-top:8px;font-size:13px;color:#a8adbd}
+#switch-undo b{font-family:ui-monospace,Menlo,Consolas,monospace;color:#e5e7eb}
+#undo-link{color:#8ab4ff;cursor:pointer;text-decoration:none}
+#undo-link:hover{text-decoration:underline}
+.actions{display:flex;gap:12px;margin-top:16px;flex-wrap:wrap}
+#btn-verify{background:linear-gradient(92deg,#4338CA,#0369A3);color:#fff;border-radius:999px;padding:10px 26px;font-size:14px;font-weight:600;cursor:pointer;border:none;box-shadow:0 6px 24px rgba(99,102,241,.45)}
+#btn-refresh{border:1px solid rgba(255,255,255,.2);border-radius:999px;padding:10px 26px;font-size:14px;color:#fff;background:rgba(255,255,255,.07);cursor:pointer}
+#btn-fullprobe{border:1px solid rgba(138,180,255,.55);border-radius:999px;padding:10px 26px;font-size:14px;color:#8ab4ff;background:rgba(138,180,255,.08);cursor:pointer}
+#btn-verify:disabled,#btn-refresh:disabled,#btn-fullprobe:disabled{opacity:.55;cursor:wait}
+#node-search{background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.14);color:#fff;border-radius:10px;padding:8px 14px;font-size:13px;width:230px}
+table.bench{width:100%;border-collapse:collapse;font-size:14px}
+table.bench th,table.bench td{text-align:left;padding:11px 14px;border-bottom:1px solid rgba(255,255,255,.08)}
+table.bench th{color:#8b91a5;font-weight:500;font-size:12px}
+table.bench tr:hover td{background:rgba(255,255,255,.035)}
+table.bench td.hl{color:#fff;font-weight:600}
+.badge{display:inline-block;font-size:11px;border-radius:999px;padding:2px 10px;margin-left:8px;background:linear-gradient(92deg,#4338CA,#0369A3);color:#fff}
+.badge.probing{background:rgba(251,191,36,.18);color:#fbbf24;border:1px solid rgba(251,191,36,.4)}
+#probe-progress{display:none;margin:14px 0 4px}
+#probe-progress.show{display:block}
+#probe-progress .bar{height:8px;border-radius:999px;background:rgba(255,255,255,.1);overflow:hidden}
+#probe-progress .fill{height:100%;width:0;border-radius:999px;background:linear-gradient(90deg,#6366f1,#22d3ee);transition:width .4s ease}
+#probe-progress .txt{font-size:12px;color:#8b91a5;margin-top:6px}
+#history-line{color:#8b91a5;font-size:13px;margin-top:14px}
+#history-list{list-style:none;margin-top:10px;max-height:220px;overflow:auto}
+#history-list li{font-size:12.5px;color:#a8adbd;padding:7px 4px;border-bottom:1px dashed rgba(255,255,255,.08)}
+#history-list li b{color:#e5e7eb;font-weight:600}
+#toast{position:fixed;right:22px;bottom:22px;z-index:100;display:flex;flex-direction:column;gap:10px}
+.toast-msg{background:rgba(16,20,36,.92);border:1px solid rgba(110,231,183,.45);color:#d1fae5;border-radius:14px;padding:12px 18px;font-size:13px;max-width:360px;box-shadow:0 10px 30px rgba(0,0,0,.5);animation:slidein .25s ease}
+.toast-msg.err{border-color:rgba(248,113,113,.55);color:#fecaca}
+@keyframes slidein{from{transform:translateY(12px);opacity:0}to{transform:none;opacity:1}}
+.footer{color:#9AA0B2;font-size:12.5px;text-align:center;padding:10px 0 30px}
+#login-gate{position:fixed;inset:0;z-index:200;display:flex;align-items:center;justify-content:center;padding:20px;background:radial-gradient(ellipse 55% 40% at 75% 8%,rgba(99,102,241,.28),transparent 70%),radial-gradient(ellipse 45% 35% at 12% 25%,rgba(34,211,238,.16),transparent 70%),rgba(0,0,0,.72);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px)}
+#login-gate.hidden{display:none}
+.login-card{width:380px;max-width:92vw;text-align:center;padding:40px 36px}
+.login-card .logo{font-weight:800;font-size:22px;background:linear-gradient(90deg,#a5b4fc,#67e8f9);-webkit-background-clip:text;background-clip:text;color:transparent}
+.login-card .sub{color:#8b91a5;font-size:13px;margin:10px 0 22px}
+#login-token{width:100%;background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.16);color:#fff;border-radius:12px;padding:12px 16px;font-size:14px;margin-bottom:14px;text-align:center}
+#btn-login{width:100%;background:linear-gradient(92deg,#4338CA,#0369A3);color:#fff;border-radius:12px;padding:12px;font-size:15px;font-weight:600;cursor:pointer;border:none;box-shadow:0 6px 24px rgba(99,102,241,.45)}
+#btn-login:disabled{opacity:.55;cursor:wait}
+#login-err{color:#fca5a5;font-size:13px;min-height:20px;margin-top:12px}
+.shake{animation:shake .4s ease}
+@keyframes shake{0%,100%{transform:translateX(0)}25%{transform:translateX(-8px)}75%{transform:translateX(8px)}}
+#console.hidden{display:none}
+#btn-lock{border:1px solid rgba(255,255,255,.2);border-radius:999px;padding:7px 18px;cursor:pointer;background:rgba(255,255,255,.06);font-size:13px;color:#ddd}
+#btn-lock:hover{background:rgba(255,255,255,.14)}
+@media(max-width:768px){#hero-kicker{font-size:34px}.wrap{padding:20px 14px 44px}.stats{grid-template-columns:repeat(2,1fr)}#topnav{gap:14px}#topnav .links{display:flex;gap:8px;overflow-x:auto;flex:none;max-width:46vw}#topnav .links a{padding:6px 10px;font-size:12px;white-space:nowrap}}
+#bench-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
+table.bench{min-width:560px}
+@media(max-width:640px){.wrap{padding:16px 12px 40px}.glass-card{padding:20px 16px;border-radius:18px}#hero-kicker{font-size:30px}.stats{gap:10px}.stat{padding:12px 14px}.stat .v{font-size:20px}#node-search{width:100%;max-width:none}.actions .btn{flex:1 1 100%;text-align:center}#topnav{padding:12px 16px;gap:14px}#topnav .live{display:none}.glass-card,.stat{backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}#toast{right:max(12px,env(safe-area-inset-right));bottom:max(12px,env(safe-area-inset-bottom));left:max(12px,env(safe-area-inset-left))}.toast-msg{max-width:none}}
+@media(max-width:640px){table.bench th:first-child,table.bench td:first-child{position:sticky;left:0;background:#0b0e1c;z-index:2}table.bench th:last-child,table.bench td:last-child{position:sticky;right:0;background:#0b0e1c;z-index:2}}
+html[data-theme="light"] table.bench th:first-child,html[data-theme="light"] table.bench td:first-child,html[data-theme="light"] table.bench th:last-child,html[data-theme="light"] table.bench td:last-child{background:#fff}
+/* v2 新增元素（与深色皮肤同语言） */
+.num,.stat .v{font-variant-numeric:tabular-nums}
+#topnav .links a{color:#ccc;text-decoration:none;font-size:13px;padding:6px 12px;border-radius:10px}
+#topnav .links a:hover{color:#fff;background:rgba(255,255,255,.07)}
+#topnav .links a.on{color:#fff;background:rgba(255,255,255,.1)}
+#btn-theme{border:1px solid rgba(255,255,255,.2);border-radius:999px;padding:7px 18px;cursor:pointer;background:rgba(255,255,255,.06);font-size:13px;color:#ddd}
+#btn-theme:hover{background:rgba(255,255,255,.14)}
+#statusbar{position:sticky;top:57px;z-index:49;display:flex;gap:20px;align-items:center;flex-wrap:wrap;background:rgba(10,12,24,.88);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);padding:9px 32px;border-bottom:1px solid rgba(255,255,255,.09);font-size:12.5px;color:#a8adbd}
+#statusbar b{color:#fff;font-weight:600;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}
+#statusbar .dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:#6ee7b7;margin-right:6px;box-shadow:0 0 8px #6ee7b7}
+#statusbar .dot.stale{background:#fbbf24;box-shadow:0 0 8px #fbbf24}
+#statusbar .dot.err{background:#fca5a5;box-shadow:0 0 8px #fca5a5}
+#statusbar .sp{flex:1}
+section{scroll-margin-top:130px}
+.route-strip{display:flex;gap:12px;margin-top:16px;flex-wrap:wrap}
+.route-strip .rt{flex:1;min-width:230px;background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.09);border-radius:14px;padding:10px 16px;font-size:12.5px;color:#c2c7d6}
+.route-strip .rt b{display:block;font-size:11.5px;color:#8b91a5;font-weight:600;margin-bottom:2px}
+.route-strip .rt code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;color:#7dd3fc}
+#spark{width:100%;height:64px;display:block}
+.rate-legend{display:flex;gap:18px;font-size:12px;color:#8b91a5;margin-top:8px}
+.rate-legend i{display:inline-block;width:18px;height:2px;vertical-align:middle;margin-right:6px}
+#sortsel,#scope,#loglevel,#log-search{background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.14);color:#fff;border-radius:10px;padding:8px 10px;font-size:13px}
+#sortsel option,#scope option,#loglevel option{background:#121826}
+.node-count{margin-left:auto;font-size:12px;color:#8b91a5}
+.errchip{display:inline-block;font-size:11px;border-radius:999px;padding:2px 10px;margin-left:8px;background:rgba(251,191,36,.15);color:#fbbf24;border:1px solid rgba(251,191,36,.4);font-weight:400}
+.vh{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+.subtag{display:inline-block;font-size:11px;border-radius:8px;padding:2px 10px;margin-right:10px;background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.14);color:#ddd;white-space:nowrap;flex:none}
+.hostnote{font-size:12px;color:#8b91a5;margin-top:10px}
+.logtools{display:flex;gap:10px;align-items:center;margin-bottom:12px;flex-wrap:wrap}
+.logtools .chk{font-size:12.5px;color:#a8adbd;display:flex;gap:6px;align-items:center;cursor:pointer;white-space:nowrap}
+.setgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:4px}
+.setgrid label{font-size:12.5px;color:#a8adbd;display:flex;flex-direction:column;gap:6px}
+.setgrid label.chk{flex-direction:row;align-items:center;gap:8px;cursor:pointer;min-height:28px}
+.setgrid input[type="number"]{background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.14);color:#fff;border-radius:10px;padding:8px 12px;font-size:13px;width:100%}
+.setgrid input[type="checkbox"]{width:16px;height:16px;accent-color:#0ea5e9}
+#settings-result{margin-top:10px;font-size:13px;color:#6ee7b7;min-height:20px}
+#log-search{width:180px}
+table.bench th.sortable{cursor:pointer;user-select:none}
+table.bench th.sortable:hover{color:#fff}
+.thsort{background:none;border:none;color:inherit;font:inherit;font-size:inherit;cursor:pointer;padding:6px 8px;margin:-6px -8px;min-height:28px;border-radius:8px;white-space:nowrap}
+.thsort:hover{color:#fff}
+table.bench tr.pinned td{background:rgba(99,102,241,.12)}
+table.bench tr.pending td{opacity:.55}
+.cc{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;color:#7dd3fc;border:1px solid rgba(125,211,252,.35);border-radius:6px;padding:1px 7px;margin-right:8px}
+.badge.unmeasured{background:rgba(125,211,252,.13);color:#7dd3fc}
+.health-badge{display:inline-block;border-radius:999px;padding:1px 9px;font-size:11px;font-weight:600;border:1px solid transparent}
+.health-badge.health-ok{background:rgba(110,231,183,.16);color:#6ee7b7;border-color:rgba(110,231,183,.4)}
+.health-badge.health-warn{background:rgba(251,191,36,.16);color:#fbbf24;border-color:rgba(251,191,36,.4)}
+.health-badge.health-err{background:rgba(248,113,113,.16);color:#fca5a5;border-color:rgba(248,113,113,.45)}
+.health-badge.health-idle{background:rgba(255,255,255,.08);color:#a8adbd;border-color:rgba(255,255,255,.14)}
+.badge.rescued{background:rgba(110,231,183,.16);color:#6ee7b7;border:1px solid rgba(110,231,183,.4)}
+.badge.replaced{background:rgba(251,191,36,.15);color:#fbbf24;border:1px solid rgba(251,191,36,.4)}
+.badge.errbadge{background:rgba(248,113,113,.16);color:#fca5a5;border:1px solid rgba(248,113,113,.45)}
+.ev{display:block;font-size:11px;font-weight:400;color:#8b91a5;margin-top:3px}
+#hero-evidence{font-size:12px;color:#8b91a5;margin:6px 0 0}
+#health-line{color:#a8adbd;font-size:12.5px;margin-top:6px}
+.linklike:focus-visible{outline:2px solid #8ab4ff;outline-offset:2px}
+html[data-theme="light"] .health-badge.health-ok,html[data-theme="light"] .badge.rescued{background:#e6f4ea;color:#137333;border-color:#ceead6}
+html[data-theme="light"] .health-badge.health-warn,html[data-theme="light"] .badge.replaced{background:#fef7e0;color:#7A4A00;border-color:#fde293}
+html[data-theme="light"] .health-badge.health-err,html[data-theme="light"] .badge.errbadge{background:#fce8e6;color:#c5221f;border-color:#f5c6c2}
+html[data-theme="light"] .health-badge.health-idle{background:#f1f3f4;color:#5f6368;border-color:#dadce0}
+html[data-theme="light"] #hero-evidence,html[data-theme="light"] #health-line,html[data-theme="light"] .ev{color:#5f6368}
+.lat{display:flex;align-items:center;gap:9px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px}
+.lat .bar{width:66px;height:6px;border-radius:999px;background:rgba(255,255,255,.1);overflow:hidden}
+.lat .bar i{display:block;height:100%;border-radius:999px}
+.l-good{color:#6ee7b7}.l-mid{color:#fbbf24}.l-bad{color:#fca5a5}.l-na{color:#9AA0B2}
+tr.skel td{padding:13px 14px}
+.skel .sk{height:13px;border-radius:6px;background:linear-gradient(90deg,rgba(255,255,255,.05),rgba(255,255,255,.14),rgba(255,255,255,.05));background-size:200% 100%;animation:sh 1.1s linear infinite}
+@keyframes sh{to{background-position:-200% 0}}
+.empty{padding:30px;text-align:center;color:#8b91a5;font-size:13px}
+#logbox{background:rgba(0,0,0,.45);border:1px solid rgba(255,255,255,.09);border-radius:14px;padding:14px 18px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;line-height:1.8;max-height:300px;overflow:auto}
+#logbox .t{color:#69707f}#logbox .ok{color:#6ee7b7}#logbox .warn{color:#fbbf24}#logbox .err{color:#fca5a5}
+.subrow{display:flex;gap:12px;align-items:center;background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.09);border-radius:14px;padding:11px 16px;margin-bottom:10px}
+.subrow code{flex:1;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11.5px;color:#8b91a5;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.subrow .btn{padding:7px 18px;font-size:12.5px}
+:focus-visible{outline:2px solid #67e8f9;outline-offset:2px}
+/* 浅色模式：Google 式白——纯白底、无渐变、无毛玻璃，蓝只用 #1a73e8 一处 */
+html[data-theme="light"] body{background:#fff;color:#202124}
+html[data-theme="light"] body::before{display:none}
+html[data-theme="light"] #topnav,html[data-theme="light"] #statusbar{background:#fff;border-bottom-color:#dadce0}
+html[data-theme="light"] #topnav .links a,html[data-theme="light"] #statusbar{color:#5f6368}
+html[data-theme="light"] #topnav .links a:hover{color:#202124;background:#f1f3f4}
+html[data-theme="light"] #topnav .links a.on{color:#1a73e8;background:#e8f0fe}
+html[data-theme="light"] #btn-lock,html[data-theme="light"] #btn-theme{border-color:#dadce0;background:#fff;color:#1a73e8}
+html[data-theme="light"] #btn-lock:hover,html[data-theme="light"] #btn-theme:hover{background:#f6fafe}
+html[data-theme="light"] #topnav .live{color:#188038;border-color:#188038}
+html[data-theme="light"] #topnav .logo{background:none;color:#1a73e8}
+html[data-theme="light"] .glass-card,html[data-theme="light"] .stat{background:#fff;border-color:#dadce0;box-shadow:0 1px 2px rgba(60,64,67,.15)}
+html[data-theme="light"] .glass-card .desc,html[data-theme="light"] .stat .k,html[data-theme="light"] table.bench th,html[data-theme="light"] #history-line,html[data-theme="light"] #history-list li,html[data-theme="light"] #probe-progress .txt,html[data-theme="light"] .rate-legend,html[data-theme="light"] .empty,html[data-theme="light"] .footer,html[data-theme="light"] .node-count{color:#5f6368}
+html[data-theme="light"] #history-list li{border-bottom-color:#e8eaed}
+html[data-theme="light"] #history-list li b{color:#202124}
+html[data-theme="light"] #hero-kicker{background:none;color:#202124}
+html[data-theme="light"] #hero-sub{color:#5f6368}
+html[data-theme="light"] #verify-result{color:#188038}
+html[data-theme="light"] .verify-ok{color:#188038}
+html[data-theme="light"] .verify-err{color:#d93025}
+html[data-theme="light"] .linklike{color:#1a73e8}
+html[data-theme="light"] #switch-undo{color:#5f6368}
+html[data-theme="light"] #switch-undo b{color:#202124}
+html[data-theme="light"] #undo-link{color:#1a73e8}
+html[data-theme="light"] #exit-card{background:#fff}
+html[data-theme="light"] .route-strip .rt{background:#f8f9fa;border-color:#e8eaed;color:#3c4043}
+html[data-theme="light"] .route-strip .rt b{color:#5f6368}
+html[data-theme="light"] .route-strip .rt code{color:#1a73e8}
+html[data-theme="light"] .btn{border-color:#dadce0;color:#1a73e8;background:#fff}
+html[data-theme="light"] .btn:hover{background:#f6fafe}
+html[data-theme="light"] .btn:active{transform:none}
+html[data-theme="light"] #btn-verify{background:#1a73e8;box-shadow:none}
+html[data-theme="light"] #btn-verify:hover{background:#1b66c9}
+html[data-theme="light"] #btn-fullprobe{border-color:#1a73e8;color:#1a73e8;background:#fff}
+html[data-theme="light"] #node-search,html[data-theme="light"] #sortsel,html[data-theme="light"] #scope,html[data-theme="light"] #loglevel,html[data-theme="light"] #log-search{background:#fff;border-color:#dadce0;color:#202124}
+html[data-theme="light"] #sortsel option,html[data-theme="light"] #scope option,html[data-theme="light"] #loglevel option{background:#fff}
+html[data-theme="light"] #thinbar{background:#e8eaed}
+html[data-theme="light"] #thinbar i{background:#1a73e8}
+html[data-theme="light"] #probe-progress .bar{background:#e8eaed}
+html[data-theme="light"] #probe-progress .fill{background:#1a73e8}
+html[data-theme="light"] table.bench th,html[data-theme="light"] table.bench td{border-bottom-color:#e8eaed}
+html[data-theme="light"] table.bench tr:hover td{background:#f6fafe}
+html[data-theme="light"] table.bench tr.pinned td{background:#e8f0fe}
+html[data-theme="light"] table.bench td.hl{color:#202124}
+html[data-theme="light"] .opbtn{border-color:#dadce0;background:#fff;color:#1a73e8}
+html[data-theme="light"] .opbtn:hover{background:#f6fafe}
+html[data-theme="light"] .opbtn:disabled{color:#70757A;border-color:#e8eaed;background:#fff}
+html[data-theme="light"] .opbtn[aria-disabled="true"]{color:#70757A;border-color:#e8eaed;background:#fff}
+html[data-theme="light"] #node-search::placeholder{color:#5f6368}
+html[data-theme="light"] .ip{color:#202124}
+html[data-theme="light"] table.bench th.sortable:hover{color:#202124}
+html[data-theme="light"] .cc{color:#1a73e8;border-color:#c2dbff}
+html[data-theme="light"] .badge{background:#e6f4ea;color:#137333}
+html[data-theme="light"] .badge.probing{background:#fef7e0;color:#7A4A00;border-color:#fde293}
+html[data-theme="light"] .badge.unmeasured{background:#e8f0fe;color:#174EA6}
+html[data-theme="light"] .lat .bar{background:#e8eaed}
+html[data-theme="light"] .l-good{color:#188038}html[data-theme="light"] .l-mid{color:#B06000}html[data-theme="light"] .l-bad{color:#d93025}html[data-theme="light"] .l-na{color:#70757A}
+html[data-theme="light"] #foot-cpu.l-good,html[data-theme="light"] #foot-mem.l-good{color:#188038}
+html[data-theme="light"] #foot-cpu.l-mid,html[data-theme="light"] #foot-mem.l-mid{color:#e37400}
+html[data-theme="light"] #foot-cpu.l-bad,html[data-theme="light"] #foot-mem.l-bad{color:#d93025}
+html[data-theme="light"] .skel .sk{background:linear-gradient(90deg,#e8eaed,#f1f3f4,#e8eaed);background-size:200% 100%}
+html[data-theme="light"] .subrow{background:#f8f9fa;border-color:#e8eaed}
+html[data-theme="light"] .subrow code{color:#5f6368}
+html[data-theme="light"] #statusbar b{color:#202124}
+html[data-theme="light"] #statusbar .dot{background:#188038;box-shadow:none}
+html[data-theme="light"] #statusbar .dot.stale{background:#B06000;box-shadow:none}
+html[data-theme="light"] #statusbar .dot.err{background:#d93025;box-shadow:none}
+html[data-theme="light"] .spin{border-color:rgba(26,115,232,.25);border-top-color:#1a73e8}
+html[data-theme="light"] #logbox{background:#f8f9fa;border-color:#e8eaed}
+html[data-theme="light"] #logbox .t{color:#70757A}
+html[data-theme="light"] #logbox .ok{color:#188038}html[data-theme="light"] #logbox .warn{color:#b06000}html[data-theme="light"] #logbox .err{color:#d93025}
+html[data-theme="light"] #login-gate{background:rgba(255,255,255,.9)}
+html[data-theme="light"] .login-card{background:#fff;border-color:#dadce0;box-shadow:0 1px 3px rgba(60,64,67,.2)}
+html[data-theme="light"] .login-card .logo{background:none;color:#1a73e8}
+html[data-theme="light"] .login-card .sub{color:#5f6368}
+html[data-theme="light"] #login-token{background:#fff;border-color:#dadce0;color:#202124}
+html[data-theme="light"] #btn-login{background:#1a73e8;box-shadow:none}
+html[data-theme="light"] #login-err{color:#d93025}
+html[data-theme="light"] .errchip{background:#fef7e0;color:#7A4A00;border-color:#fde293}
+html[data-theme="light"] .subtag{background:#f1f3f4;border-color:#dadce0;color:#5f6368}
+html[data-theme="light"] .hostnote,html[data-theme="light"] .logtools .chk{color:#5f6368}
+html[data-theme="light"] .setgrid label{color:#5f6368}
+html[data-theme="light"] .setgrid input[type="number"]{background:#fff;border-color:#dadce0;color:#202124}
+html[data-theme="light"] #settings-result{color:#188038}
+html[data-theme="light"] .toast-msg{background:#fff;color:#3c4043;border-color:#dadce0}
+html[data-theme="light"] .toast-msg.err{background:#fff;color:#d93025;border-color:#d93025}
+html[data-theme="light"] :focus-visible{outline-color:#1a73e8}
+@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+
+</style></head>
+<body>
+<div id="topnav"><span class="logo">vpngate</span><span class="live" title="自动刷新每15秒">● <span lang="en">LIVE</span></span><span class="links"><a href="#sec-overview">总览</a><a href="#sec-nodes">节点</a><a href="#sec-logs">日志</a><a href="#sec-sub" id="nav-sub">订阅</a><a href="#sec-hist">事件</a><a href="#sec-settings">设置</a></span><span class="right"><button id="btn-theme" onclick="toggleTheme()">浅色</button><button id="btn-lock" onclick="lockConsole()">锁定</button></span></div>
+<div id="statusbar" aria-label="实时状态"><span><span class="dot" id="sb-dot"></span><span class="vh" id="sb-dot-txt">正常</span>出口 <b id="sb-exit">—</b></span><span>节点 <b id="sb-node">—</b></span><span>链路 <span id="sb-health" class="health-badge health-idle">待测</span></span><span id="sb-chain">切链 —</span><span id="sb-probe">探测 —</span><span class="sp"></span><span>↓ <b id="rate-dn">—</b> Mb/s</span><span>↑ <b id="rate-up">—</b> Mb/s</span></div>
+<div id="login-gate"><div class="login-card glass-card"><div class="logo">vpngate</div><div class="sub">输入 Railway 环境变量 ADMIN_TOKEN（部署页 Variables 中查看）</div><div style="display:flex;gap:8px;margin-bottom:14px"><input id="login-token" type="password" autocomplete="off" aria-label="ADMIN_TOKEN" aria-describedby="login-err" placeholder="ADMIN_TOKEN" style="margin-bottom:0;flex:1" onkeydown="if(event.key==='Enter')loginEnter()"><button id="btn-show-token" class="btn" style="padding:12px 14px;font-size:13px;white-space:nowrap" aria-pressed="false" onclick="toggleToken()">显示</button></div><button id="btn-login" onclick="loginEnter()">进入控制台</button><button id="btn-theme-gate" class="btn" style="width:100%;margin-top:10px;padding:10px;font-size:13px" onclick="toggleTheme()">浅色</button><p id="login-err" role="alert"></p></div></div>
+<div class="wrap" id="console" style="display:none">
+<section id="sec-overview" aria-label="总览">
+<div id="exit-card" class="glass-card">
+<div id="hero-kicker">—<br>—</div>
+<p id="hero-sub">加载中…</p>
+<p id="hero-evidence" aria-live="polite"></p>
+<p id="verify-result" aria-live="polite"></p>
+<p id="switch-undo" hidden>已从 <b id="undo-from"></b> 切换到 <b id="undo-to"></b> · <button id="undo-link" class="opbtn" onclick="onUndo()">撤销换回</button></p>
+<div class="route-strip" id="route-strip" hidden>
+<div class="rt"><b>/ws-node → Railway 本机</b><code id="route-direct">—</code></div>
+<div class="rt"><b>/ws-chain → VPN 节点</b><code id="route-chain">—</code></div>
+<div class="rt" id="route-resi-wrap" hidden><b>/ws-resi → <span id="route-resi-kind">出口</span></b><code id="route-resi">—</code></div>
+</div>
+<div class="actions"><button id="btn-verify" onclick="verifyExit()">验证出口 IP</button></div>
+</div>
+<div class="glass-card" id="resi-card" hidden>
+<h2>第三出口（轮换）</h2>
+<p class="desc">默认从所有实测有效节点里按连接环形轮换：第 1 条走节点 1、第 2 条走节点 2，用完一圈回到第 1 个。配置了住宅网关时改为连固定 backconnect 网关。</p>
+<p id="resi-line">—</p>
+<p id="resi-ips" class="ip" aria-live="polite">—</p>
+<div class="actions"><button id="btn-resi-probe" class="btn" onclick="resiProbe()">探测出口 IP</button></div>
+</div>
+<div class="stats">
+<div class="stat"><div class="k">可用节点</div><div class="v" id="stat-nodes">—</div></div>
+<div class="stat"><div class="k">最优实测</div><div class="v" id="stat-best">—</div></div>
+<div class="stat"><div class="k">运行时间</div><div class="v" id="stat-uptime">—</div></div>
+<div class="stat"><div class="k">累计流量 ↓/↑</div><div class="v num" style="font-size:17px;padding-top:7px"><span id="stat-down">—</span> / <span id="stat-up">—</span></div></div>
+<div class="stat"><div class="k">刷新成功/失败 <span id="stat-err" class="errchip" hidden></span></div><div class="v" id="stat-refresh">—</div></div>
+</div>
+<div class="glass-card" id="rate-card" hidden>
+<h2>实时速率</h2>
+<p class="desc">由 traffic 计数器差分绘制，console 可见时每轮更新。</p>
+<canvas id="spark" width="1000" height="64" role="img" aria-label="速率曲线"></canvas><p id="spark-alt" class="vh" role="status"></p>
+<div class="rate-legend"><span><i style="background:#6ee7b7"></i>下行</span><span><i style="background:#7dd3fc"></i>上行</span></div>
+</div>
+</section>
+<section id="sec-nodes" aria-label="节点">
+<div class="glass-card">
+<h2>可用节点</h2>
+<p class="desc">全部节点握手发现，真拨先测 TopK（REAL_TOPK）让服务先起来，启动/刷新后会自动在后台补齐全量真测；Speed 排名不等于可拨通，首选由 urltest 实测决定，多 endpoint 兜底。点击表头可排序，未测通节点不可切换。</p>
+<div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap"><input id="node-search" aria-label="搜索节点（IP 或国家）" placeholder="搜索 IP / 国家…" oninput="debouncedRefresh()"><select id="sortsel" aria-label="排序"><option value="real">按实测延迟</option><option value="hand">按握手延迟</option><option value="country">按国家</option><option value="alive">按存活时间</option><option value="server">按出口 IP</option></select><button id="btn-refresh" class="btn" onclick="refreshNow()">刷新节点</button><button id="btn-fullprobe" class="btn" onclick="fullProbeNow()">全量真测</button><button id="btn-fullprobe-cancel" class="btn" style="display:none" onclick="cancelFullProbe()">取消真测</button><span class="node-count" id="node-count"></span></div>
+<select id="scope" aria-label="范围"><option value="">全部国家</option></select>
+<div id="thinbar" aria-hidden="true"><i></i></div><div id="probe-progress"><div class="bar"><div class="fill" id="probe-fill" role="progressbar" aria-label="全量真测进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></div></div><div class="txt" id="probe-txt"></div></div>
+<div id="empty-note" class="empty" hidden></div>
+<p id="load-note" class="vh" role="status" hidden>加载中…</p><div id="bench-wrap"><table class="bench" aria-label="可用节点"><thead><tr><th class="sortable" scope="col"><button class="thsort" data-k="server" data-label="出口 IP">出口 IP</button></th><th class="sortable" scope="col"><button class="thsort" data-k="country" data-label="国家">国家</button></th><th class="sortable" scope="col"><button class="thsort" data-k="hand" data-label="握手">握手</button></th><th class="sortable" scope="col"><button class="thsort" data-k="real" data-label="实测">实测</button></th><th class="sortable" scope="col"><button class="thsort" data-k="alive" data-label="存活">存活</button></th><th scope="col">操作</th></tr></thead><tbody id="bench-body"></tbody></table></div>
+</div>
+</section>
+<section id="sec-logs" aria-label="日志">
+<div class="glass-card">
+<h2>日志</h2>
+<p class="desc">sing-box 最近输出，排查拨号失败时看这里。</p>
+<div class="logtools"><input id="log-search" placeholder="搜索日志…" aria-label="搜索日志" oninput="renderLogs()"><select id="loglevel" aria-label="级别" title="error≈fail·refus·denied·exception；warn≈timeout·retry；ok≈verify·switch·refresh"><option value="">全部级别</option><option value="info">info</option><option value="warn">warn</option><option value="error">error</option></select><label class="chk"><input type="checkbox" id="log-auto" checked onchange="renderLogs()"> 自动滚动</label><button class="btn" style="padding:7px 18px;font-size:12.5px" id="btn-logrefresh" onclick="refreshLogs(this)">刷新</button></div>
+<div id="logbox" role="log" aria-label="服务日志"><div style="color:#8b91a5">加载中…</div></div>
+</div>
+</section>
+<section id="sec-sub" aria-label="订阅" hidden>
+<div class="glass-card">
+<h2>订阅</h2>
+<p class="desc">双路 VLESS，一键复制。域名取当前访问 host。</p>
+<div class="subrow"><span class="subtag">直连 /ws-node（VPN 故障时可用）</span><code id="sub-direct">—</code><button class="btn" onclick="copySub('direct',this)">复制</button></div>
+<div class="subrow"><span class="subtag">经 VPN /ws-chain（跟随当前出口）</span><code id="sub-chain">—</code><button class="btn" onclick="copySub('chain',this)">复制</button></div>
+<div class="subrow" id="sub-resi-row" hidden><span class="subtag">第三出口 /ws-resi（轮换）</span><code id="sub-resi">—</code><button class="btn" onclick="copySub('resi',this)">复制</button></div>
+<p class="hostnote" id="sub-host"></p>
+<div class="actions" style="margin-top:4px"><button class="btn" id="btn-copy-all" style="padding:7px 18px;font-size:12.5px" onclick="copyAll(this)">复制全部</button></div>
+</div>
+</section>
+<section id="sec-hist" aria-label="事件">
+<div class="glass-card">
+<h2>事件</h2>
+<p class="desc">刷新 / 切换 / 测速 / 验证记录，最近 20 条。</p>
+<p id="history-line"></p>
+<p id="health-line" aria-live="polite"></p>
+<ul id="history-list"></ul>
+</div>
+</section>
+<section id="sec-settings" aria-label="设置">
+<div class="glass-card">
+<h2>设置</h2>
+<p class="desc">运行参数，保存后下轮生效（刷新间隔、全量并发等），重启不丢失。</p>
+<div class="setgrid">
+<label>刷新间隔秒<input id="set-refresh" type="number" aria-label="刷新间隔秒"></label>
+<label>真拨超时秒<input id="set-timeout" type="number" aria-label="真拨超时秒"></label>
+<label>TopK 真拨数<input id="set-topk" type="number" aria-label="TopK 真拨数"></label><label>节点数(0=全量)<input id="set-limit" type="number" aria-label="节点数"></label>
+<label>刷新真拨并发<input id="set-dialw" type="number" aria-label="刷新真拨并发"></label>
+<label>全量真测并发<input id="set-fpw" type="number" aria-label="全量真测并发"></label>
+<label>握手并发<input id="set-probew" type="number" aria-label="握手并发"></label>
+<label class="chk"><input type="checkbox" id="set-repin"> 每小时自动重 pin 最优</label>
+<label class="chk"><input type="checkbox" id="set-rescue"> 手动 pin 挂了自动救最优</label>
+<label>住宅粘性秒(0=旋转)<input id="set-resittl" type="number" aria-label="住宅粘性秒"></label>
+</div>
+<div class="actions"><button id="btn-settings-save" class="btn" onclick="saveSettings()">保存设置</button></div>
+<p id="settings-result" aria-live="polite"></p>
+</div>
+</section>
+<div class="footer"><span id="foot-cpu" class="num">CPU —</span> · <span id="foot-mem" class="num">MEM —</span></div>
+</div>
+<div id="toast" role="status" aria-live="polite"></div><div id="alerts" role="alert" aria-live="assertive"></div>
+<script>
+var activeCountry = "";
+var lastStatus = null;
+var probeSeq = 0, fullSeq = 0, verifySeq = 0, fullT0 = 0, lastOkAt = 0;
+var searchTimer = null, probeCtl = null, verifyCtl = null, fullCtl = null, autoVerifiedFor = null;
+var sortKey = "real", sortDir = 1, pendingTag = null, pendingTimer = null, scopeSig = null;
+var lastBytes = null, rateHist = {dn: [], up: []}, lastLogLines = [];
+function authHeaders() {
+  return {"Authorization": "Bearer " + (localStorage.getItem("admin_token") || "")};
+}
+function showConsole() {
+  document.getElementById("login-gate").classList.add("hidden");
+  document.getElementById("console").style.display = "";
+  refresh();
+  refreshLogs(null);
+  loadSettings();
+}
+function backToLogin(msg) {
+  probeSeq++; fullSeq++; verifySeq++;
+  if (probeCtl) { probeCtl.abort(); probeCtl = null; }
+  if (verifyCtl) { verifyCtl.abort(); verifyCtl = null; }
+  if (fullCtl) { fullCtl.abort(); fullCtl = null; }
+  localStorage.removeItem("admin_token");
+  document.getElementById("console").style.display = "none";
+  const gate = document.getElementById("login-gate");
+  gate.classList.remove("hidden");
+  const input = document.getElementById("login-token");
+  input.value = "";
+  document.getElementById("login-err").textContent = msg || "";
+  input.focus();
+}
+function lockConsole() {
+  if (pendingTimer) { clearTimeout(pendingTimer); pendingTimer = null; }
+  pendingTag = null;
+  clearUndo();
+  backToLogin("");
+}
+async function loginEnter() {
+  const input = document.getElementById("login-token");
+  const btn = document.getElementById("btn-login");
+  if (btn.disabled) return;
+  const err = document.getElementById("login-err");
+  const trial = input.value.trim();
+  if (!trial) { err.textContent = "请先填写 token"; input.focus(); return; }
+  btn.disabled = true;
+  btn.textContent = "验证中…";
+  err.textContent = "";
+  localStorage.setItem("admin_token", trial);
+  try {
+    await api("/api/status");
+    showConsole();
+  } catch (e) {
+    localStorage.removeItem("admin_token");
+    err.textContent = "token 不对，请重试";
+    input.select();
+    input.focus();
+    const card = document.querySelector(".login-card");
+    card.classList.remove("shake");
+    void card.offsetWidth;
+    card.classList.add("shake");
+  }
+  btn.disabled = false;
+  btn.textContent = "进入控制台";
+}
+async function silentLogin() {
+  if (!localStorage.getItem("admin_token")) return;
+  try {
+    await api("/api/status");
+    showConsole();
+  } catch (e) {
+    localStorage.removeItem("admin_token");
+  }
+}
+function toast(msg, isErr) {
+  const box = document.getElementById(isErr ? "alerts" : "toast") || document.getElementById("toast");
+  if ([...box.children].some(c => c.textContent === msg)) return;
+  while (box.children.length >= 3) box.firstChild.remove();
+  const el = document.createElement("div");
+  el.className = "toast-msg" + (isErr ? " err" : "");
+  el.textContent = msg;
+  box.appendChild(el);
+  setTimeout(() => el.remove(), isErr ? 6000 : 4500);
+}
+function setBusy(id, busy, busyText) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  if (busy) {
+    if (el.dataset.orig === undefined) el.dataset.orig = el.textContent;
+    el.disabled = true;
+    el.classList.add("busy");
+    el.textContent = busyText || "进行中…";
+  } else {
+    el.disabled = false;
+    el.classList.remove("busy");
+    if (el.dataset.orig !== undefined) el.textContent = el.dataset.orig;
+  }
+}
+async function api(path, method, body, signal) {
+  const r = await fetch(path, {method: method || "GET", headers: authHeaders(),
+    body: body ? JSON.stringify(body) : undefined, signal: signal || undefined});
+  if (r.status === 401) throw new Error("unauthorized: save ADMIN_TOKEN first");
+  if (!r.ok) {
+    const raw = (await r.text()).slice(0, 160);
+    let detail = raw;
+    try { const j = JSON.parse(raw); detail = j.detail || j.error || raw; } catch (_e) {}
+    throw new Error("HTTP " + r.status + ": " + detail);
+  }
+  return r.json();
+}
+function runningTagOf(msg) { const m = /"tag"\s*:\s*"([^"]+)"/.exec(msg || ""); return m ? m[1] : ""; }
+// Charset note: tags are safeTag-stripped ([a-zA-Z0-9-_]) and only minted as
+// vpngate-N, so they never contain quotes/escapes that could break [^"]+.
+function isAbort(e) { return !!e && e.name === "AbortError"; }
+function fmtMs(v) { return v == null ? "—" : v + "ms"; }
+function safeTag(t) { return String(t || "").replace(/[^a-zA-Z0-9-_]/g, ""); }
+function esc(s) { return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;"); }
+function latCls(v) { if (v == null) return "l-na"; if (v < 250) return "l-good"; if (v < 600) return "l-mid"; return "l-bad"; }
+function latBar(v) {
+  if (v == null) return '<span class="l-na">—</span>';
+  const w = Math.max(6, Math.min(100, Math.round(v / 8)));
+  return '<span class="lat"><span class="bar"><i style="width:' + w + '%;background:currentColor" class="' + latCls(v) + '"></i></span><span class="' + latCls(v) + '">' + v + 'ms</span></span>';
+}
+function fmtGB(v) { return v == null ? "—" : (v / 1e9).toFixed(1) + " GB"; }
+function fmtDur(sec) {
+  sec = Math.max(0, Math.floor(sec || 0));
+  if (sec < 3600) return Math.floor(sec / 60) + "m";
+  if (sec < 172800) return Math.floor(sec / 3600) + "h" + Math.floor(sec % 3600 / 60) + "m";
+  return Math.floor(sec / 86400) + "d" + Math.floor(sec % 86400 / 3600) + "h";
+}
+function nodeQuery() { const el = document.getElementById("node-search"); return el ? el.value.trim().toLowerCase() : ""; }
+function preferredEp(s) { const all = (s && s.endpoints) || []; return all.find(e => e.tag === s.preferred_tag) || all[0]; }
+function endpointOf(s, tag) {
+  return ((s && s.endpoints) || []).find(x => x.tag === tag) || null;
+}
+function pinHealthMeta(state) {
+  const table = {
+    ok: ["正常", "health-ok", "链路活着，最近验证通过"],
+    degraded: ["降级", "health-warn", "链路降级或正在自愈"],
+    dead: ["已死", "health-err", "链路已死，等待救援"],
+    unpinned: ["自动", "health-idle", "未 pin，由 urltest 选择"],
+    unknown: ["待测", "health-idle", "链路状态未知"]
+  };
+  const hit = table[state] || table.unknown;
+  return {label: hit[0], cls: hit[1], title: hit[2]};
+}
+function fmtAgo(ts) {
+  if (!ts) return "未知";
+  const t = Date.parse(ts);
+  if (isNaN(t)) return String(ts);
+  const sec = Math.max(0, Math.round((Date.now() - t) / 1000));
+  if (sec < 60) return sec + "s前";
+  if (sec < 3600) return Math.floor(sec / 60) + "m前";
+  return Math.floor(sec / 3600) + "h" + Math.floor(sec % 3600 / 60) + "m前";
+}
+function verifyEvidenceText(e) {
+  if (!e) return "无节点证据";
+  const bits = [];
+  if (e.verify_fresh) bits.push(e.alive === true ? "验证新鲜·活" : (e.alive === false ? "验证新鲜·死" : "验证新鲜"));
+  else if (e.alive === false) bits.push("历史失联");
+  else if (e.alive === true) bits.push("历史存活");
+  else bits.push("未验证");
+  if (e.exit_ip) bits.push("出口 " + e.exit_ip);
+  if (e.verified_at) bits.push("验证于 " + fmtAgo(e.verified_at));
+  if (e.verify_error) bits.push("错误 " + e.verify_error);
+  return bits.join(" · ");
+}
+function rescueMarks(s) {
+  const hist = (s && s.refresh_history) || [];
+  for (let i = hist.length - 1; i >= 0; i--) {
+    const h = hist[i];
+    if (!h || h.event !== "chain-rescue") continue;
+    const parts = String(h.detail || "").split("->");
+    if (parts.length < 2) return null;
+    const fromTag = (parts[0].trim().split(" ").pop() || "").replace(/[^a-zA-Z0-9_-]/g, "");
+    const toTag = (parts[1].trim().split(" ")[0] || "").replace(/[^a-zA-Z0-9_-]/g, "");
+    return (fromTag && toTag) ? {fromTag: fromTag, toTag: toTag} : null;
+  }
+  return null;
+}
+function probeServiceText(s) {
+  const svc = (s && (s.probe_service || s.probe_service_state)) || null;
+  if (svc && typeof svc === "object") {
+    if (svc.ready === false) return "单测服务不可用";
+    if (svc.ready === true) return "单测服务就绪";
+  }
+  const p = (s && s.probe) || {};
+  if (p.state === "running") return "单测服务运行中" + (p.tag ? " · " + p.tag : "");
+  if (p.state === "done" && p.error) return "单测服务可用 · 上次失败";
+  return "单测服务就绪";
+}
+function servedExitText(s) {
+  const se = (s && (s.served_exit || s.served_exit_available));
+  if (se && typeof se === "object") {
+    if (se.available === false) return "服务出口探测不可用";
+    if (se.available === true) return "服务出口探测可用";
+  } else if (se === false) return "服务出口探测不可用";
+  else if (se === true) return "服务出口探测可用";
+  const err = ((s && s.pin_health && s.pin_health.error) || (s && s.verify && s.verify.error) || "");
+  if (/unavailable|no verifier|没有可用/i.test(err)) return "服务出口探测不可用";
+  if (s && s.verify && s.verify.exit_ip) return "服务出口可用";
+  return "服务出口待验证";
+}
+function switchBlockReason(s, tag) {
+  if (tag == null || tag === "auto") return "";
+  const e = endpointOf(s, tag);
+  if (!e) return "节点不存在或已被刷新移除";
+  if (e.verify_fresh && e.alive === false) {
+    return "证据显示该节点已失联" + (e.verify_error ? "：" + e.verify_error : "");
+  }
+  if (e.verify_fresh && e.alive === true) return "";
+  if (e.real_latency_ms != null) return "";
+  if (e.alive === false) {
+    return "证据显示该节点已失联" + (e.verify_error ? "：" + e.verify_error : "");
+  }
+  if (e.verify_error) return "先测速再切换：该节点还未测通（" + e.verify_error + "）";
+  return "先测速再切换：该节点还未测通";
+}
+function emptyActionKey(ev) {
+  if (ev.key !== "Enter" && ev.key !== " ") return;
+  const el = ev.currentTarget || ev.target;
+  const action = el && el.getAttribute ? el.getAttribute("data-empty-action") : null;
+  if (!action || typeof window[action] !== "function") return;
+  ev.preventDefault();
+  window[action]();
+}
+function renderHealth(s, pref) {
+  const ph = (s && s.pin_health) || {};
+  const meta = pinHealthMeta(ph.state || "unknown");
+  const chain = ph.chain_switch || (s && s.chain_switch) || {};
+  const chainReady = chain.ready === true;
+  const chainTxt = "切链" + (chain.mode ? "(" + chain.mode + ")" : "") + (chainReady ? "就绪" : "未就绪");
+  const probeTxt = probeServiceText(s) + " · " + servedExitText(s);
+  const badge = document.getElementById("sb-health");
+  if (badge) {
+    badge.textContent = meta.label;
+    badge.className = "health-badge " + meta.cls;
+    badge.title = meta.title + " · 连续失败 " + (ph.fail_streak || 0) + " · 检查于 " + fmtAgo(ph.checked_at) +
+      (ph.exit_ip ? " · 出口 " + ph.exit_ip : "") + (ph.error ? " · " + ph.error : "");
+  }
+  const chainEl = document.getElementById("sb-chain");
+  if (chainEl) {
+    chainEl.textContent = chainTxt;
+    chainEl.title = "链切换模式 " + (chain.mode || "—") + " · " + (chainReady ? "就绪" : "未就绪") + " · 已切换 " + (chain.switches || 0) + " 次";
+  }
+  const probeEl = document.getElementById("sb-probe");
+  if (probeEl) { probeEl.textContent = probeTxt; probeEl.title = probeTxt; }
+  const line = document.getElementById("health-line");
+  if (line) {
+    const ep = pref || endpointOf(s, s && s.preferred_tag);
+    line.textContent = "链路 " + meta.label + " · 连续失败 " + (ph.fail_streak || 0) +
+      " · 检查于 " + fmtAgo(ph.checked_at) +
+      (ph.exit_ip ? " · 出口 " + ph.exit_ip : "") +
+      (ph.error ? " · " + ph.error : "") +
+      " · " + chainTxt + " · " + probeTxt +
+      (ep ? " · 节点证据 " + verifyEvidenceText(ep) : "");
+  }
+}
+function renderHeroEvidence(s, pref) {
+  const el = document.getElementById("hero-evidence");
+  if (!el) return;
+  const ph = (s && s.pin_health) || {};
+  const meta = pinHealthMeta(ph.state || "unknown");
+  const marks = rescueMarks(s);
+  const bits = ["链路 " + meta.label];
+  if (pref) {
+    bits.push(verifyEvidenceText(pref));
+    if (marks && marks.toTag === pref.tag) bits.push("已由救援换入");
+    if (marks && marks.fromTag === pref.tag) bits.push("已被救援替换");
+  } else bits.push("无可用节点");
+  if (s && s.preferred_tag && ph.state === "dead") bits.push("当前 pin 已失联，等待恢复或手动切换");
+  el.textContent = bits.join(" · ");
+  el.title = bits.join(" · ");
+}
+function sortVal(e) {
+  if (sortKey === "country") return (e.country || "") + (e.tag || "");
+  if (sortKey === "tag") return e.tag || "";
+  if (sortKey === "server") return e.server || "";
+  if (sortKey === "hand") return e.latency_ms == null ? 1e9 : e.latency_ms;
+  if (sortKey === "alive") return -(e.alive_seconds || 0);
+  return e.real_latency_ms == null ? 1e9 : e.real_latency_ms;
+}
+function filteredEndpoints(s) {
+  const q = nodeQuery();
+  const arr = s.endpoints.filter(e => (!activeCountry || e.country_short === activeCountry) &&
+    (!q || (e.tag || "").toLowerCase().includes(q) || (e.country_short || "").toLowerCase().includes(q) ||
+      (e.country || "").toLowerCase().includes(q) || (e.server || "").toLowerCase().includes(q)));
+  arr.sort((a, b) => { const x = sortVal(a), y = sortVal(b); return (x > y ? 1 : x < y ? -1 : 0) * sortDir; });
+  return arr;
+}
+function debouncedRefresh() {
+  if (searchTimer) clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => { searchTimer = null; renderFiltered(); }, 300);
+}
+function clearFilter() {
+  activeCountry = "";
+  const el = document.getElementById("node-search");
+  if (el) el.value = "";
+  const sc = document.getElementById("scope");
+  if (sc) sc.value = "";
+  renderFiltered();
+}
+async function refresh() {
+  try {
+    const s = await api("/api/status");
+    lastStatus = s;
+    renderAll(s);
+    lastOkAt = Date.now();
+  } catch (e) {
+    if (isAbort(e)) return;
+    if (/401|unauthorized/.test(e.message || "")) { backToLogin("登录已失效，请重新输入 token"); return; }
+    document.getElementById("hero-sub").textContent = "状态拉取失败：" + e.message;
+    toast("状态拉取失败: " + e.message, true);
+  }
+}
+function renderFiltered() {
+  if (!lastStatus) { refresh(); return; }
+  renderAll(lastStatus);
+}
+function renderAll(s) {
+  try {
+    const focusEl = document.activeElement;
+    let focusBack = null;
+    const focusSearch = () => { if (document.getElementById("node-search")) document.getElementById("node-search").focus(); };
+    if (focusEl && focusEl.getAttribute) {
+      if (focusEl.id === "scope") focusBack = () => document.getElementById("scope").focus();
+      else if (focusEl.getAttribute("data-empty-action")) { const a = focusEl.getAttribute("data-empty-action"); focusBack = () => { const el = document.querySelector("[data-empty-action='" + a + "']"); if (el) el.focus(); else focusSearch(); }; }
+      else if (focusEl.getAttribute("data-probe")) { const t = focusEl.getAttribute("data-probe"); focusBack = () => { const b = document.querySelector("[data-probe='" + t + "']"); if (b && !b.disabled) b.focus(); else focusSearch(); }; }
+      else if (focusEl.getAttribute("data-switch")) { const t = focusEl.getAttribute("data-switch"); focusBack = () => { const b = document.querySelector("[data-switch='" + t + "']"); if (b && !b.disabled) b.focus(); else focusSearch(); }; }
+    }
+    if (pendingTag && s.preferred_tag === pendingTag && !(s.probe && s.probe.state === "running")) pendingTag = null;
+    const eps = filteredEndpoints(s);
+    const pref = preferredEp(s);
+    document.getElementById("hero-kicker").innerHTML =
+      (pref ? esc(pref.country_short) + "<br>" + (pref.real_latency_ms != null ? pref.real_latency_ms + "ms" : fmtMs(pref.latency_ms) + "·未真测") : "—<br>无节点");
+    document.getElementById("hero-sub").textContent =
+      pref ? ("出口 " + pref.server + ":" + pref.server_port + " · 存活 " + (pref.alive_seconds || 0) + "s") : "暂无可用节点";
+    renderHeroEvidence(s, pref);
+    renderVerify(s.verify, pref);
+    maybeAutoVerify(s);
+    renderStatusbar(s, pref);
+    renderTraffic(s);
+    renderRoutes(s);
+    renderSub(s);
+    document.getElementById("stat-nodes").textContent = s.endpoints.length;
+    const measured = s.endpoints.filter(e => e.real_latency_ms != null).map(e => e.real_latency_ms);
+    document.getElementById("stat-best").textContent = measured.length ? Math.min.apply(null, measured) + "ms" : "—";
+    document.getElementById("stat-uptime").textContent = fmtDur(s.uptime_seconds || 0);
+    document.getElementById("stat-refresh").textContent = s.refresh_ok + "/" + s.refresh_fail;
+    const errChip = document.getElementById("stat-err");
+    if (errChip) {
+      if (s.last_error) { errChip.hidden = false; errChip.textContent = String(s.last_error).slice(0, 18); errChip.title = String(s.last_error); }
+      else errChip.hidden = true;
+    }
+    const byCountry = {};
+    s.endpoints.forEach(e => { byCountry[e.country_short] = (byCountry[e.country_short] || 0) + 1; });
+    const scopeSel = document.getElementById("scope");
+    if (scopeSel) {
+      const codes = {};
+      (s.countries || []).forEach(c => { codes[c.code] = c.name; });
+      s.endpoints.forEach(e => { if (e.country_short && !codes[e.country_short]) codes[e.country_short] = e.country || e.country_short; });
+      const sig = JSON.stringify([codes, byCountry]);
+      if (sig !== scopeSig) {
+        scopeSig = sig;
+        scopeSel.innerHTML = '<option value="">全部国家 ' + s.endpoints.length + "</option>" +
+          Object.keys(codes).sort().map(code => '<option value="' + esc(code) + '"' + (activeCountry === code ? " selected" : "") + ">" + esc(code) + " " + (byCountry[code] || 0) + "</option>").join("");
+      } else if (scopeSel.value !== activeCountry) {
+        scopeSel.value = activeCountry;
+      }
+    }
+    const probingTag = (s.probe && s.probe.state === "running") ? s.probe.tag : null;
+    const marks = rescueMarks(s);
+    const pinDead = !!(s.pin_health && s.pin_health.state === "dead");
+    const rows = eps.map(e => {
+      const t = safeTag(e.tag);
+      const isPinned = e.tag === s.preferred_tag, isPending = e.tag === pendingTag;
+      const pinned = isPinned ? '<span class="badge">生效中</span>' : "";
+      const pending = isPending ? '<span class="badge probing">切换中</span>' : "";
+      const probing = (!isPending && e.tag === probingTag) ? '<span class="badge probing">测速中</span>' : "";
+      const unmeasured = e.real_latency_ms == null;
+      const unm = (!isPinned && !isPending && unmeasured) ? '<span class="badge unmeasured">未测通</span>' : "";
+      const deadPin = (isPinned && pinDead) ? '<span class="badge errbadge">已失联</span>' : "";
+      const deadNode = (!isPinned && e.verify_fresh && e.alive === false) ? '<span class="badge errbadge">失联</span>' : "";
+      const rescued = (marks && marks.toTag === e.tag) ? '<span class="badge rescued">已救回</span>' : "";
+      const replaced = (marks && marks.fromTag === e.tag) ? '<span class="badge replaced">已被替换</span>' : "";
+      const why = switchBlockReason(s, e.tag);
+      const disSw = why ? " aria-disabled='true' title='" + esc(why) + "'" : "";
+      const disPb = (e.tag === probingTag) ? " aria-disabled='true' title='测速中，请稍候'" : "";
+      const ev = (isPinned || rescued) ? verifyEvidenceText(e) : "";
+      const evHtml = ev ? "<span class='ev'>" + esc(ev) + "</span>" : "";
+      return "<tr class='" + (isPinned ? "pinned" : "") + (isPending ? " pending" : "") + "'><td class='hl'><span class='ip'>" + esc(e.server || e.tag) + "</span>" + pinned + pending + probing + unm + deadPin + deadNode + rescued + replaced + evHtml + "</td><td><span class='cc'>" + esc(e.country_short) + "</span>" + esc(e.country) + "</td><td class='hl'>" + fmtMs(e.latency_ms) +
+      "</td><td class='hl'>" + latBar(e.real_latency_ms) + "</td><td>" + (e.alive_seconds || 0) + "s</td>" +
+      "<td class='op'><button class='opbtn' data-probe='" + t + "' aria-label='单测 " + esc(e.server || e.tag) + "'" + disPb + ">测速</button><button class='opbtn' data-switch='" + t + "' aria-label='切换到 " + esc(e.server || e.tag) + "'" + disSw + ">切换</button></td></tr>";
+    }).join("");
+    document.getElementById("bench-body").innerHTML = rows ||
+      '<tr><td colspan="6"><div class="empty">无匹配节点，换个关键词或 <a class="linklike" role="button" tabindex="0" data-empty-action="clearFilter" onclick="clearFilter()" onkeydown="emptyActionKey(event)">清除筛选</a></div></td></tr>';
+    document.getElementById("node-count").textContent = eps.length + " / " + s.endpoints.length;
+    const loadNote = document.getElementById("load-note");
+    if (loadNote) loadNote.hidden = true;
+    const emptyNote = document.getElementById("empty-note");
+    if (emptyNote) {
+      const filtering = activeCountry || nodeQuery();
+      if (s.endpoints.length === 0) {
+        emptyNote.hidden = false;
+        emptyNote.innerHTML = "暂无可用节点" + (s.last_error ? "（快照拉取失败：" + esc(String(s.last_error).slice(0, 120)) + "）" : "") + ' · <a class="linklike" role="button" tabindex="0" data-empty-action="refreshNow" onclick="refreshNow()" onkeydown="emptyActionKey(event)">重试刷新</a>';
+      } else if (!filtering && s.endpoints.every(e => e.real_latency_ms == null)) {
+        emptyNote.hidden = false;
+        emptyNote.innerHTML = s.endpoints.length + ' 个节点均未真测，请先全量真测再切换 · <a class="linklike" role="button" tabindex="0" data-empty-action="fullProbeNow" onclick="fullProbeNow()" onkeydown="emptyActionKey(event)">开始全量真测</a>';
+      } else {
+        emptyNote.hidden = true;
+      }
+    }
+    if (focusBack) focusBack();
+    syncSortHeaders();
+    renderProbeProgress(s.full_probe);
+    document.getElementById("history-line").textContent =
+      "刷新成功/失败：" + s.refresh_ok + "/" + s.refresh_fail + " · 运行：" + fmtDur(s.uptime_seconds || 0) + " · 错误：" + (s.last_error || "—");
+    const hist = (s.refresh_history || []).slice().reverse().slice(0, 20);
+    document.getElementById("history-list").innerHTML = hist.length ?
+      hist.map(h => "<li><b>" + esc(h.event) + "</b> " + esc(h.detail || "") + " · " + esc(h.ts || "") + "</li>").join("") :
+      '<li style="color:#8b91a5">暂无事件</li>';
+    const cpu = s.cpu || {}, mem = s.mem || s.memory || {};
+    const cpuPct = cpu.pct, memPct = mem.pct;
+    const footCpu = document.getElementById("foot-cpu"), footMem = document.getElementById("foot-mem");
+    if (footCpu) {
+      footCpu.textContent = "CPU " + (cpu.model || "—") + " · " + (cpuPct == null ? "—" : cpuPct + "%");
+      footCpu.className = "num " + (cpuPct == null || cpuPct < 50 ? "l-good" : (cpuPct < 80 ? "l-mid" : "l-bad"));
+    }
+    if (footMem) {
+      footMem.textContent = "MEM " + (memPct == null ? "—" : memPct + "%");
+      footMem.className = "num " + (memPct == null || memPct < 70 ? "l-good" : (memPct < 88 ? "l-mid" : "l-bad"));
+    }
+  } catch (e) {
+    if (isAbort(e)) return;
+    document.getElementById("hero-sub").textContent = "状态拉取失败：" + e.message;
+    toast("状态拉取失败: " + e.message, true);
+  }
+}
+function renderStatusbar(s, pref) {
+  const exitIp = (s.verify && s.verify.exit_ip) ||
+    ((s.verify && s.verify.state === "running") ? "验证中…" : "未验证");
+  document.getElementById("sb-exit").textContent = exitIp;
+  const pinEp = (s.endpoints || []).find(x => x.tag === s.preferred_tag) || {};
+  const pinIp = pinEp.server || s.preferred_tag;
+  const nodeEl = document.getElementById("sb-node");
+  nodeEl.textContent = s.preferred_tag ? (pinIp + " · 已 pin") : (pref ? ((pref.server || pref.tag) + " · 自动") : "—");
+  const backupIp = s.backup_tag ? ipOf(s.backup_tag) : null;
+  nodeEl.title = s.preferred_tag
+    ? ((s.auto_pinned ? "自动优选：全量实测最低" : "已 pin：手动锁定该出口") +
+       (backupIp ? " · 备选 " + backupIp : ""))
+    : "自动：由 urltest 优选";
+  const ph = s.pin_health || {};
+  const dot = document.getElementById("sb-dot");
+  if (dot) {
+    const age = lastOkAt ? Math.round((Date.now() - lastOkAt) / 1000) : 1e9;
+    const verified = !!(s.verify && s.verify.exit_ip);
+    const dead = ph.state === "dead";
+    dot.className = "dot " + ((dead || age > 45) ? "err" : ((!verified || age > 30) ? "stale" : ""));
+    dot.title = "上次更新" + (age > 1e8 ? "—" : age + "s前") + " · 自动刷新每15s" +
+      (ph.state ? " · 链路 " + pinHealthMeta(ph.state).label : "");
+    const dtxt = document.getElementById("sb-dot-txt");
+    if (dtxt) dtxt.textContent = dead ? "链路已死" : (age > 45 ? "刷新失败" : ((!verified || age > 30) ? "未验证或数据较旧" : "正常"));
+  }
+  renderHealth(s, pref);
+}
+function renderTraffic(s) {
+  const t = s.traffic || {};
+  document.getElementById("stat-down").textContent = fmtGB(t.bytes_down);
+  document.getElementById("stat-up").textContent = fmtGB(t.bytes_up);
+  const now = Date.now();
+  if (lastBytes && now > lastBytes.at) {
+    const dt = (now - lastBytes.at) / 1000;
+    const dn = Math.max(0, (t.bytes_down - lastBytes.dn) * 8 / dt / 1e6);
+    const up = Math.max(0, (t.bytes_up - lastBytes.up) * 8 / dt / 1e6);
+    document.getElementById("rate-dn").textContent = dn.toFixed(2);
+    document.getElementById("rate-up").textContent = up.toFixed(2);
+    const alt = document.getElementById("spark-alt");
+    if (alt) alt.textContent = "下行最新 " + dn.toFixed(2) + " Mb/s，上行 " + up.toFixed(2) + " Mb/s";
+    rateHist.dn.push(dn); rateHist.up.push(up);
+    if (rateHist.dn.length > 60) { rateHist.dn.shift(); rateHist.up.shift(); }
+    document.getElementById("rate-card").hidden = false;
+    drawSpark();
+  }
+  lastBytes = {at: now, dn: t.bytes_down || 0, up: t.bytes_up || 0};
+}
+function drawSpark() {
+  const c = document.getElementById("spark");
+  if (!c || !rateHist.dn.length) return;
+  const x = c.getContext("2d"), W = c.width, H = c.height;
+  x.clearRect(0, 0, W, H);
+  const dark = document.documentElement.dataset.theme !== "light";
+  const line = (arr, col, max) => {
+    x.strokeStyle = col; x.lineWidth = 2; x.beginPath();
+    arr.forEach((v, i) => { const px = i / Math.max(1, arr.length - 1) * W, py = H - 4 - Math.min(1, v / max) * (H - 10); i ? x.lineTo(px, py) : x.moveTo(px, py); });
+    x.stroke();
+  };
+  line(rateHist.dn, dark ? "#6ee7b7" : "#047857", Math.max(2, ...rateHist.dn));
+  line(rateHist.up, dark ? "#7dd3fc" : "#0284c7", Math.max(1, ...rateHist.up));
+}
+function renderRoutes(s) {
+  const strip = document.getElementById("route-strip");
+  if (!strip) return;
+  strip.hidden = false;
+  document.getElementById("route-direct").textContent = location.hostname + " 本机";
+  const exitIp = (s.verify && s.verify.exit_ip) || ((s.verify && s.verify.state === "running") ? "验证中…" : "未验证");
+  document.getElementById("route-chain").textContent = exitIp;
+  const resi = s.resi || {};
+  const wrap = document.getElementById("route-resi-wrap");
+  if (wrap) wrap.hidden = !resi.enabled;
+  if (resi.enabled) {
+    const rotate = resi.mode === "rotate";
+    const kind = document.getElementById("route-resi-kind");
+    if (kind) kind.textContent = rotate ? "节点轮换" : "住宅出口";
+    const cell = document.getElementById("route-resi");
+    if (cell) cell.textContent = rotate
+      ? ((resi.pool || 0) + " / " + (resi.inbounds || resi.nodes || 0) + " 可用")
+      : (resi.exit_ip || "未探测");
+  }
+  renderResi(s);
+}
+function renderResi(s) {
+  const card = document.getElementById("resi-card");
+  if (!card) return;
+  const r = s.resi || {};
+  if (!r.enabled) { card.hidden = true; return; }
+  card.hidden = false;
+  const rotate = r.mode === "rotate";
+  const mode = rotate
+    ? ("节点池 " + (r.pool || 0) + "/" + (r.inbounds || 0) + " 可用 · 每连接轮换" +
+       (r.down ? (" · " + r.down + " 个临时剔除") : "") +
+       (r.reserved ? (" · " + r.reserved + " 个留给 chain") : ""))
+    : (r.mode === "sticky" ? ("粘性 · ttl " + r.sticky_ttl + "s") : "旋转");
+  const where = rotate ? ("入口 :" + r.port + r.path) : ("网关 " + r.host + ":" + r.port);
+  const state = r.state === "up" ? "正常" : (r.state === "down" ? "不可用" : "未探测");
+  const el = document.getElementById("resi-line");
+  if (el) el.textContent = where + " · " + mode + " · " + state +
+    (r.exit_ip ? (" · 出口 " + r.exit_ip + (r.ms ? (" / " + r.ms + "ms") : "")) : "") +
+    (r.error ? (" · " + r.error) : "");
+  const p = r.last_probe || {};
+  const ips = p.ips || [];
+  const box = document.getElementById("resi-ips");
+  if (!box) return;
+  if (p.state === "running") { box.textContent = "探测中…"; return; }
+  if (!ips.length) { box.textContent = p.error ? ("探测失败：" + p.error) : "尚无探测结果"; return; }
+  let verdict = "";
+  if (p.rotating === true) verdict = " · 轮换正常";
+  else if (p.rotating === false) verdict = " · 未轮换（旋转模式请确认客户端已关闭 multiplex/mux）";
+  box.textContent = ips.join(" → ") + " · 不同 IP " + p.distinct + " 个" + verdict;
+}
+async function resiProbe() {
+  const btn = document.getElementById("btn-resi-probe");
+  if (btn && btn.disabled) return;
+  if (btn) { btn.disabled = true; btn.classList.add("busy"); }
+  try {
+    await api("/api/resi_probe", "POST", {count: 3});
+    if (lastStatus) renderAll(lastStatus);
+    refresh();
+  } catch (e) {
+    if (!isAbort(e)) toast("探测失败: " + e.message, true);
+  } finally {
+    if (btn) { btn.disabled = false; btn.classList.remove("busy"); }
+  }
+}
+function renderSub(s) {
+  const sec = document.getElementById("sec-sub");
+  if (!sec) return;
+  const nav = document.getElementById("nav-sub");
+  if (!s.vless) { sec.hidden = true; if (nav) nav.style.display = "none"; return; }
+  sec.hidden = false;
+  if (nav) nav.style.display = "";
+  const host = location.hostname, uuid = s.vless.uuid;
+  const mk = (path, label) => "vless://" + uuid + "@" + host + ":443?security=tls&sni=" + host + "&type=ws&path=" + path + "#" + label;
+  sec.dataset.direct = mk(s.vless.direct_path, "direct");
+  sec.dataset.chain = mk(s.vless.chain_path, "vpngate");
+  document.getElementById("sub-direct").textContent = sec.dataset.direct;
+  document.getElementById("sub-chain").textContent = sec.dataset.chain;
+  const resi = s.resi || {};
+  const resiRow = document.getElementById("sub-resi-row");
+  if (resiRow) {
+    resiRow.hidden = !(resi.enabled && resi.path);
+    if (!resiRow.hidden) {
+      sec.dataset.resi = mk(resi.path, "resi");
+      document.getElementById("sub-resi").textContent = sec.dataset.resi;
+    }
+  }
+  const hostNote = document.getElementById("sub-host");
+  if (hostNote) hostNote.textContent = "当前 host=" + host + " · 换域名访问会改变链接";
+}
+async function copySub(which, btn) {
+  const sec = document.getElementById("sec-sub");
+  const text = which === "direct" ? sec.dataset.direct : (which === "chain" ? sec.dataset.chain : sec.dataset.resi);
+  if (!text) return;
+  let ok = false;
+  try {
+    await navigator.clipboard.writeText(text);
+    ok = true;
+  } catch (e) {
+    const ta = document.createElement("textarea");
+    ta.value = text; document.body.appendChild(ta); ta.select();
+    try { ok = document.execCommand("copy"); } catch (_e) {}
+    ta.remove();
+  }
+  if (!ok) { toast("复制失败，请手动复制", true); return; }
+  if (btn) {
+    const old = btn.textContent;
+    btn.textContent = "已复制 ✓";
+    setTimeout(() => { btn.textContent = old; }, 1500);
+  }
+}
+async function copyAll(btn) {
+  const sec = document.getElementById("sec-sub");
+  const text = [sec.dataset.direct, sec.dataset.chain, sec.dataset.resi].filter(Boolean).join(String.fromCharCode(10));
+  if (!text) return;
+  let ok = false;
+  try {
+    await navigator.clipboard.writeText(text);
+    ok = true;
+  } catch (e) {
+    const ta = document.createElement("textarea");
+    ta.value = text; document.body.appendChild(ta); ta.select();
+    try { ok = document.execCommand("copy"); } catch (_e) {}
+    ta.remove();
+  }
+  if (!ok) { toast("复制失败，请手动复制", true); return; }
+  if (btn) {
+    const old = btn.textContent;
+    btn.textContent = "已复制 ✓";
+    setTimeout(() => { btn.textContent = old; }, 1500);
+  }
+}
+async function refreshLogs(btn) {
+  if (btn) { btn.disabled = true; }
+  try {
+    const r = await api("/api/logs?lines=100");
+    lastLogLines = r.lines || [];
+    renderLogs();
+  } catch (e) { if (!isAbort(e)) toast("日志拉取失败: " + e.message, true); }
+  if (btn) { btn.disabled = false; }
+}
+function setVal(id, v) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  if (el.type === "checkbox") el.checked = !!v;
+  else el.value = v;
+}
+function getVal(id) {
+  const el = document.getElementById(id);
+  if (!el) return null;
+  if (el.type === "checkbox") return el.checked;
+  const n = parseInt(el.value, 10);
+  return isNaN(n) ? el.value : n;
+}
+async function loadSettings() {
+  try {
+    const r = await api("/api/settings");
+    const v = r.values || {};
+    setVal("set-refresh", v.refresh_seconds);
+    setVal("set-timeout", v.dial_timeout);
+    setVal("set-topk", v.real_topk);
+    setVal("set-limit", v.limit);
+    setVal("set-dialw", v.dial_workers);
+    setVal("set-fpw", v.full_probe_workers);
+    setVal("set-probew", v.probe_workers);
+    setVal("set-repin", v.auto_repin);
+    setVal("set-rescue", v.auto_rescue);
+    setVal("set-resittl", v.resi_session_ttl);
+  } catch (e) { if (!isAbort(e)) toast("设置拉取失败: " + e.message, true); }
+}
+async function saveSettings() {
+  const btn = document.getElementById("btn-settings-save");
+  const note = document.getElementById("settings-result");
+  const payload = {
+    refresh_seconds: getVal("set-refresh"),
+    dial_timeout: getVal("set-timeout"),
+    real_topk: getVal("set-topk"),
+    limit: getVal("set-limit"),
+    dial_workers: getVal("set-dialw"),
+    full_probe_workers: getVal("set-fpw"),
+    probe_workers: getVal("set-probew"),
+    auto_repin: getVal("set-repin"),
+    auto_rescue: getVal("set-rescue"),
+    resi_session_ttl: getVal("set-resittl")
+  };
+  if (btn) { btn.disabled = true; }
+  try {
+    await api("/api/settings", "POST", payload);
+    if (note) note.textContent = "已保存 · 下轮生效";
+    loadSettings();
+  } catch (e) {
+    if (!isAbort(e)) {
+      if (note) note.textContent = "";
+      toast("保存失败: " + e.message, true);
+    }
+  }
+  if (btn) { btn.disabled = false; }
+}
+function logLevel(line) {
+  if (/error|fail|refus|denied|exception/i.test(line)) return "err";
+  if (/warn|timeout|retry|invalid/i.test(line)) return "warn";
+  if (/verify|switch|refresh-ok|restarted|started|exit=/i.test(line)) return "ok";
+  return "info";
+}
+function renderLogs() {
+  const box = document.getElementById("logbox");
+  if (!box) return;
+  const lv = (document.getElementById("loglevel") || {}).value || "";
+  const q = ((document.getElementById("log-search") || {}).value || "").trim().toLowerCase();
+  const rows = lastLogLines.filter(l => (!lv || logLevel(l) === lv) && (!q || l.toLowerCase().includes(q)));
+  box.innerHTML = rows.length ? rows.map(l => '<div><span class="' + logLevel(l) + '">' + esc(l.slice(0, 300)) + "</span></div>").join("")
+    : '<div style="color:#8b91a5">暂无日志</div>';
+  const auto = document.getElementById("log-auto");
+  if (!auto || auto.checked) box.scrollTop = box.scrollHeight;
+}
+function toggleTheme() {
+  const cur = document.documentElement.dataset.theme === "light" ? "dark" : "light";
+  document.documentElement.dataset.theme = cur;
+  try { localStorage.setItem("theme", cur); } catch (e) {}
+  syncThemeLabel();
+}
+function syncThemeLabel() {
+  const light = document.documentElement.dataset.theme === "light";
+  document.querySelectorAll("#btn-theme,#btn-theme-gate").forEach((b) => { b.textContent = light ? "切换到深色" : "切换到浅色"; });
+}
+function toggleToken() {
+  const input = document.getElementById("login-token");
+  const btn = document.getElementById("btn-show-token");
+  if (!input || !btn) return;
+  const show = input.type !== "text";
+  input.type = show ? "text" : "password";
+  btn.textContent = show ? "隐藏" : "显示";
+  btn.setAttribute("aria-pressed", show ? "true" : "false");
+}
+function skeletonRows() {
+  let s = "";
+  for (let i = 0; i < 5; i++) s += "<tr class='skel' aria-hidden='true'><td><div class='sk' style='width:60%'></div></td><td><div class='sk' style='width:40%'></div></td><td><div class='sk' style='width:50%'></div></td><td><div class='sk' style='width:70%'></div></td><td><div class='sk' style='width:30%'></div></td><td><div class='sk' style='width:70%'></div></td></tr>";
+  document.getElementById("bench-body").innerHTML = s;
+  const note = document.getElementById("load-note");
+  if (note) note.hidden = false;
+}
+function verifyStale(v, preferredTag) {
+  if (!v || v.state !== "done" || !v.exit_ip) return false;
+  if (v.via_tag && preferredTag && v.via_tag !== preferredTag) return true;
+  try {
+    if (v.checked_at) {
+      const age = Date.now() - Date.parse(v.checked_at);
+      if (age > 10*60*1000) return true;
+    }
+  } catch(e) {}
+  return false;
+}
+function maybeAutoVerify(s) {
+  if (!s || !s.preferred_tag) return;
+  const v = s.verify;
+  const needs = (!v || v.state === "idle" || verifyStale(v, s.preferred_tag));
+  if (!needs || autoVerifiedFor === s.preferred_tag) return;
+  if (document.querySelector(".btn.busy")) return;
+  if (s.probe && s.probe.state === "running") return;
+  autoVerifiedFor = s.preferred_tag;
+  verifyExit();
+}
+function renderVerify(v, pref) {
+  const el = document.getElementById("verify-result");
+  el.className = "";
+  const preferredTag = lastStatus ? lastStatus.preferred_tag : null;
+  const ph = lastStatus ? lastStatus.pin_health : null;
+  const healthNote = ph && (ph.state === "dead" || ph.state === "degraded")
+    ? (" · 链路" + pinHealthMeta(ph.state).label + (ph.error ? "：" + ph.error : ""))
+    : "";
+  if (verifyStale(v, preferredTag)) {
+    el.textContent = "验证已过期或已切换，出口待重新验证";
+    return;
+  }
+  if (!v || v.state === "idle") {
+    el.textContent = pref ? "尚未验证当前出口，点击「验证出口 IP」真实走一次 VPN 链路。" : "";
+    return;
+  }
+  if (v.state === "running") {
+    el.textContent = "正在验证出口…";
+    return;
+  }
+  if (v.exit_ip) {
+    el.className = "verify-ok";
+    el.textContent = "当前出口 IP：" + v.exit_ip + "（" + v.ms + "ms）" + healthNote;
+  } else {
+    el.className = "verify-err";
+    el.textContent = "验证失败" + (v.error ? "：" + v.error : "：后端未返回出口 IP") + healthNote;
+  }
+}
+function renderProbeProgress(fp) {
+  const box = document.getElementById("probe-progress");
+  if (!fp || fp.state === "idle" || !fp.total) { box.classList.remove("show"); return; }
+  box.classList.add("show");
+  const pct = fp.total ? Math.round(fp.done / fp.total * 100) : 0;
+  const fill = document.getElementById("probe-fill");
+  fill.style.width = pct + "%";
+  fill.setAttribute("aria-valuenow", String(pct));
+  const stName = fp.state === "done" ? "已完成" : "进行中";
+  let eta = "";
+  if (fp.state !== "done" && fp.done > 0 && fullT0) {
+    const left = Math.max(0, Math.round((Date.now() - fullT0) / fp.done * (fp.total - fp.done) / 1000));
+    eta = " · 预计还需" + (left >= 60 ? Math.floor(left / 60) + "分" + (left % 60) + "秒" : left + "秒");
+  }
+  document.getElementById("probe-txt").textContent = "全量真测" + stName + " " + fp.done + "/" + fp.total + "（" + pct + "%）" + eta;
+}
+var undoFrom = null, undoTimer = null, undoActive = false;
+function ipOf(tag) {
+  if (tag == null || tag === "auto") return "自动";
+  const ep = (lastStatus && lastStatus.endpoints || []).find(x => x.tag === tag);
+  return (ep && ep.server) || tag;
+}
+function focusCurrentSwitch() {
+  const tag = lastStatus ? lastStatus.preferred_tag : null;
+  const b = tag ? document.querySelector("[data-switch='" + safeTag(tag) + "']") : null;
+  if (b && !b.disabled) b.focus();
+  else { const ns = document.getElementById("node-search"); if (ns) ns.focus(); }
+}
+function clearUndo() {
+  undoActive = false;
+  undoFrom = null;
+  if (undoTimer) { clearTimeout(undoTimer); undoTimer = null; }
+  const box = document.getElementById("switch-undo");
+  if (box) box.hidden = true;
+}
+function showUndo(fromTag, toTag) {
+  if (fromTag === toTag) return;
+  undoActive = true;
+  undoFrom = fromTag == null ? null : fromTag;
+  document.getElementById("undo-from").textContent = ipOf(fromTag);
+  document.getElementById("undo-to").textContent = ipOf(toTag);
+  document.getElementById("switch-undo").hidden = false;
+  const link = document.getElementById("undo-link");
+  if (link) link.focus();
+  if (undoTimer) clearTimeout(undoTimer);
+  undoTimer = setTimeout(() => { clearUndo(); focusCurrentSwitch(); }, 15000);
+}
+function onUndo() {
+  if (!undoActive) return;
+  const back = undoFrom == null ? "auto" : undoFrom;
+  clearUndo();
+  switchTag(back);
+}
+async function switchTag(tag) {
+  if (pendingTag) { toast("正在切换中，请稍候", true); return; }
+  const fromTag = lastStatus ? lastStatus.preferred_tag : null;
+  const why = switchBlockReason(lastStatus, tag);
+  if (why) { toast(why, true); return; }
+  pendingTag = tag;
+  if (pendingTimer) clearTimeout(pendingTimer);
+  pendingTimer = setTimeout(() => { pendingTag = null; pendingTimer = null; renderFiltered(); }, 20000);
+  renderFiltered();
+  try {
+    const r = await api("/api/switch", "POST", {"tag": tag});
+    const newTag = (r && r.preferred_tag) || (tag === "auto" ? null : tag);
+    pendingTag = null;
+    if (pendingTimer) { clearTimeout(pendingTimer); pendingTimer = null; }
+    if (lastStatus) {
+      lastStatus.preferred_tag = newTag;
+      lastStatus.auto_pinned = !newTag;
+      lastStatus.backup_tag = null;
+      lastStatus.verify = {state: "running", exit_ip: null, ms: null, via_tag: newTag, error: null, checked_at: null};
+      if (lastStatus.pin_health) lastStatus.pin_health.state = newTag ? "ok" : "unpinned";
+    }
+    autoVerifiedFor = newTag || "auto";
+    if (lastStatus) renderAll(lastStatus);
+    renderFiltered();
+    await verifyExit();
+    showUndo(fromTag, newTag);
+  } catch (e) {
+    pendingTag = null;
+    if (pendingTimer) { clearTimeout(pendingTimer); pendingTimer = null; }
+    if (!isAbort(e)) {
+      const ep = endpointOf(lastStatus, tag);
+      const extra = ep && ep.verify_error ? "（节点验证错误：" + ep.verify_error + "）" : "";
+      toast("切换失败: " + e.message + extra, true);
+    }
+    refresh();
+  }
+}
+async function probeOne(tag) {
+  const my = ++probeSeq;
+  if (probeCtl) probeCtl.abort();
+  probeCtl = new AbortController();
+  const sig = probeCtl.signal;
+  const probeT0 = Date.now();
+  const btn = document.querySelector("[data-probe='" + safeTag(tag) + "']");
+  if (btn) btn.textContent = "测速中…";
+  try {
+    await api("/api/probe", "POST", {"tag": tag}, sig);
+    refresh();
+    for (let i = 0; i < 60; i++) {
+      if (my !== probeSeq) break;
+      await new Promise(r => setTimeout(r, 3000));
+      if (my !== probeSeq) break;
+      const s = await api("/api/status", "GET", null, sig);
+      lastStatus = s;
+      renderAll(s);
+      if (s.probe && s.probe.state === "done" && s.probe.tag === tag) {
+        if (s.probe.ms == null) toast("单测 " + tag + " 未打通", true);
+        break;
+      }
+      renderProbeWait(tag, probeT0);
+      if (i === 59) toast("单测超时，任务仍在后台运行，请稍后查看", true);
+    }
+  } catch (e) {
+    if (isAbort(e)) { restoreProbeBtn(tag); refresh(); return; }
+    if (/409/.test(e.message || "")) { const t = runningTagOf(e.message); toast("已有单测进行中，稍后再试" + (t ? "（" + t + "）" : ""), true); refresh(); return; }
+    toast("单测失败: " + e.message, true);
+  }
+  restoreProbeBtn(tag);
+  refresh();
+}
+function renderProbeWait(tag, t0) {
+  const b = document.querySelector("[data-probe='" + safeTag(tag) + "']");
+  if (!b) return;
+  b.textContent = "测速中…（已等待" + Math.round((Date.now() - t0) / 1000) + "s）";
+}
+function restoreProbeBtn(tag) {
+  // renderAll owns button state; this only resets transient text.
+  const b = document.querySelector("[data-probe='" + safeTag(tag) + "']");
+  if (b) b.textContent = "测速";
+}
+async function refreshNow() {
+  const btn = document.getElementById("btn-refresh");
+  if (btn && btn.disabled) return;
+  setBusy("btn-refresh", true, "刷新中…");
+  const benchTable = document.querySelector("table.bench");
+  const thin = document.getElementById("thinbar");
+  if (lastStatus) {
+    if (benchTable) benchTable.classList.add("loading");
+    if (thin) thin.classList.add("show");
+  } else skeletonRows();
+  try {
+    const r = await api("/api/refresh", "POST", {});
+    if (r && r.accepted) {
+      for (let i = 0; i < 200; i++) {
+        await new Promise(rr => setTimeout(rr, 3000));
+        const s = await api("/api/status");
+        lastStatus = s;
+        renderAll(s);
+        const j = s.refresh_job;
+        if (j && j.state === "done") {
+          if (j.ok === false) toast("刷新完成但有失败" + (j.error ? ": " + j.error : ""), true);
+          break;
+        }
+        if (i === 199) toast("刷新仍在后台运行，请稍后查看", true);
+      }
+    } else if (r && !r.ok) toast("刷新完成但有失败", true);
+    refreshLogs(null);
+  } catch (e) {
+    if (isAbort(e)) return;
+    toast(/409/.test(e.message || "") ? "已有刷新进行中，稍后再试" : ("刷新失败: " + e.message), true);
+  }
+  if (benchTable) benchTable.classList.remove("loading");
+  if (thin) thin.classList.remove("show");
+  setBusy("btn-refresh", false);
+  refresh();
+}
+async function fullProbeNow() {
+  const my = ++fullSeq;
+  if (fullCtl) fullCtl.abort();
+  fullCtl = new AbortController();
+  const sig = fullCtl.signal;
+  setBusy("btn-fullprobe", true, "真测中…");
+  const cancelBtn = document.getElementById("btn-fullprobe-cancel");
+  try {
+    await api("/api/full_probe", "POST", {}, sig);
+  } catch (e) {
+    setBusy("btn-fullprobe", false);
+    if (cancelBtn) cancelBtn.style.display = "none";
+    if (isAbort(e)) return;
+    toast(/409/.test(e.message || "") ? "已有全量任务进行中，稍后再试" : ("全量真测失败: " + e.message), true);
+    return;
+  }
+  fullT0 = Date.now();
+  if (cancelBtn) cancelBtn.style.display = "";
+  try {
+    for (let i = 0; i < 200; i++) {
+      if (my !== fullSeq) break;
+      await new Promise(r => setTimeout(r, 3000));
+      if (my !== fullSeq) break;
+      const s = await api("/api/status", "GET", null, sig);
+      lastStatus = s;
+      renderAll(s);
+      if (s.full_probe && s.full_probe.state === "done") break;
+      if (i === 199) toast("全量真测超时，请重试", true);
+    }
+  } catch (e) { if (!isAbort(e)) toast("全量真测失败: " + e.message, true); }
+  setBusy("btn-fullprobe", false);
+  if (cancelBtn) cancelBtn.style.display = "none";
+  refresh();
+}
+function cancelFullProbe() {
+  fullSeq++;
+  if (fullCtl) { fullCtl.abort(); fullCtl = null; }
+  setBusy("btn-fullprobe", false);
+  const cancelBtn = document.getElementById("btn-fullprobe-cancel");
+  if (cancelBtn) cancelBtn.style.display = "none";
+  refresh();
+}
+async function verifyExit() {
+  const my = ++verifySeq;
+  if (verifyCtl) verifyCtl.abort();
+  verifyCtl = new AbortController();
+  const sig = verifyCtl.signal;
+  setBusy("btn-verify", true, "验证中…");
+  document.getElementById("verify-result").textContent = "正在验证新出口…";
+  const verifyT0 = Date.now();
+  let postRetried = false, chainRetried = false;
+  const requestVerify = async () => {
+    try {
+      await api("/api/verify", "POST", {}, sig);
+    } catch (e) {
+      if (isAbort(e) || postRetried || !/^(HTTP )?(409|5[0-9][0-9])\b/.test(e.message || "")) throw e;
+      postRetried = true;
+      await new Promise(r => setTimeout(r, 1500));
+      await api("/api/verify", "POST", {}, sig);
+    }
+  };
+  try {
+    await requestVerify();
+    for (let i = 0; i < 60; i++) {
+      if (my !== verifySeq) break;
+      await new Promise(r => setTimeout(r, i === 0 ? 800 : 2000));
+      if (my !== verifySeq) break;
+      const s = await api("/api/status", "GET", null, sig);
+      lastStatus = s;
+      const vp = preferredEp(s);
+      renderVerify(s.verify, vp);
+      if (s.verify && s.verify.state === "done") {
+        if (!s.verify.exit_ip) {
+          const msg = s.verify.error || "后端未返回出口 IP";
+          const el = document.getElementById("verify-result");
+          el.textContent = "验证失败：" + msg;
+          el.className = "verify-err";
+          toast("验证失败: " + msg, true);
+          break;
+        }
+        if (s.verify.via_tag && s.preferred_tag && s.verify.via_tag !== s.preferred_tag) {
+          if (!chainRetried) {
+            chainRetried = true;
+            try {
+              await api("/api/verify", "POST", {}, sig);
+              continue;
+            } catch (e) {
+              if (isAbort(e)) throw e;
+              toast("验证结果来自旧链路，重试失败: " + e.message, true);
+              break;
+            }
+          }
+          toast("验证结果来自旧链路（" + s.verify.via_tag + "），未确认当前 pin", true);
+          break;
+        }
+        break;
+      }
+      if (s.verify && s.verify.state !== "done") {
+        const vr = document.getElementById("verify-result");
+        vr.textContent = "正在验证出口…（已等待 " + Math.round((Date.now() - verifyT0) / 1000) + "s）";
+      }
+      if (i === 59) toast("验证超时，任务仍在后台运行，请稍后查看", true);
+    }
+  } catch (e) {
+    if (isAbort(e)) { setBusy("btn-verify", false); refresh(); return; }
+    if (/409/.test(e.message || "")) {
+      const t = runningTagOf(e.message);
+      toast("已有验证进行中，稍后再试" + (t ? "（" + t + "）" : ""), true);
+      setBusy("btn-verify", false);
+      refresh();
+      return;
+    }
+    const el = document.getElementById("verify-result");
+    el.textContent = "验证失败：" + e.message;
+    el.className = "verify-err";
+    toast("验证失败: " + e.message, true);
+  }
+  setBusy("btn-verify", false);
+  refresh();
+}
+silentLogin();
+syncThemeLabel();
+document.getElementById("sortsel").addEventListener("change", (ev) => { sortKey = ev.target.value; sortDir = 1; renderFiltered(); });
+document.getElementById("scope").addEventListener("change", (ev) => { activeCountry = ev.target.value; renderFiltered(); });
+function sortBy(k) {
+  if (sortKey === k) sortDir *= -1;
+  else { sortKey = k; sortDir = 1; }
+  const sel = document.getElementById("sortsel");
+  if (sel) sel.value = k;
+  renderFiltered();
+}
+document.querySelectorAll(".thsort").forEach((b) => {
+  b.onclick = () => sortBy(b.getAttribute("data-k"));
+});
+function syncSortHeaders() {
+  document.querySelectorAll(".thsort").forEach((b) => {
+    const k = b.getAttribute("data-k");
+    const label = b.getAttribute("data-label") || "";
+    const th = b.closest ? b.closest("th") : null;
+    if (k === sortKey) {
+      if (th) th.setAttribute("aria-sort", sortDir === 1 ? "ascending" : "descending");
+      b.textContent = label + (sortDir === 1 ? " ▲" : " ▼");
+    } else {
+      if (th) th.removeAttribute("aria-sort");
+      b.textContent = label;
+    }
+  });
+}
+document.getElementById("loglevel").addEventListener("change", renderLogs);
+const spySecs = ["sec-overview", "sec-nodes", "sec-logs", "sec-sub", "sec-hist", "sec-settings"];
+window.addEventListener("scroll", () => {
+  let cur = spySecs[0];
+  spySecs.forEach((id) => { const el = document.getElementById(id); if (el && el.getBoundingClientRect().top < 170) cur = id; });
+  document.querySelectorAll("#topnav .links a").forEach((a) => a.classList.toggle("on", a.getAttribute("href") === "#" + cur));
+}, {passive: true});
+document.getElementById("bench-body").onclick = (ev) => {
+  const link = ev.target && ev.target.closest ? ev.target.closest("[data-probe],[data-switch]") : null;
+  if (!link) return;
+  if (link.getAttribute("aria-disabled") === "true") {
+    if (link.getAttribute("data-switch")) toast(link.getAttribute("title") || "先测速再切换：该节点还未测通", true);
+    else if (link.getAttribute("data-probe")) toast("该节点测速中，请稍候", true);
+    return;
+  }
+  const p = link.getAttribute("data-probe");
+  const sw = link.getAttribute("data-switch");
+  if (p) probeOne(p);
+  else if (sw) switchTag(sw);
+};
+document.getElementById("bench-body").onkeydown = (ev) => {
+  const link = ev.target && ev.target.closest ? ev.target.closest("[data-probe],[data-switch]") : null;
+  if (!link) return;
+  if (link.getAttribute("aria-disabled") === "true") {
+    if (link.getAttribute("data-switch")) toast(link.getAttribute("title") || "先测速再切换：该节点还未测通", true);
+    else if (link.getAttribute("data-probe")) toast("该节点测速中，请稍候", true);
+    if (ev.key === " " || ev.key === "Enter") ev.preventDefault();
+    return;
+  }
+  if (ev.key === " ") {
+    ev.preventDefault();
+    link.click();
+    return;
+  }
+  if (ev.key !== "Enter") return;
+  ev.preventDefault();
+  const p = link.getAttribute("data-probe");
+  const sw = link.getAttribute("data-switch");
+  if (p) probeOne(p);
+  else if (sw) switchTag(sw);
+};
+setInterval(() => {
+  if (document.getElementById("console").style.display === "none") return;
+  if (document.hidden) return;
+  if (document.querySelector(".btn.busy")) return;
+  refresh();
+  const auto = document.getElementById("log-auto");
+  const lv = document.getElementById("loglevel");
+  const qs = document.getElementById("log-search");
+  if (auto && auto.checked && lv && !lv.value && qs && !qs.value.trim()) refreshLogs(null);
+}, 15000);
+</script>
+</body></html>

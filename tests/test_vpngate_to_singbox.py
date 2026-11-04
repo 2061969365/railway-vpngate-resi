@@ -3,14 +3,17 @@ import base64
 import socket
 import ssl
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from vpngate_to_singbox import (
+    EXIT_IP_TARGETS,
     _fetch_exit_ip,
     _parse_exit_ip,
     build_singbox_config,
+    measure_mixed_exit_ip,
     endpoint_remotes,
     nodes_to_endpoints,
     ovpn_to_endpoint,
@@ -998,6 +1001,231 @@ class ExitIpFallbackTests(unittest.TestCase):
 
         self.assertIsNone(got)
         self.assertGreater(fetch.call_count, 1)
+
+
+def _test_tls_context() -> ssl.SSLContext:
+    context = ssl.create_default_context(cafile=TLS_CERT)
+    context.check_hostname = False
+    return context
+
+
+class FakeConnectProxy:
+    """HTTP CONNECT proxy that then terminates TLS like an echo service."""
+
+    def __init__(self, body: bytes = b"203.0.113.7\n",
+                 bodies: dict[str, bytes] | None = None,
+                 statuses: list[int] | None = None,
+                 hang: bool = False) -> None:
+        self.body = body
+        self.bodies = bodies or {}
+        self.statuses = list(statuses or [])
+        self.hang = hang
+        self.connects: list[str] = []
+        self.requests: list[dict] = []
+        self._tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        self._tls_context.load_cert_chain(TLS_CERT, TLS_KEY)
+        self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._listener.bind(("127.0.0.1", 0))
+        self._listener.listen(8)
+        self._listener.settimeout(5)
+        self.port = self._listener.getsockname()[1]
+        self._stop = threading.Event()
+
+    def start(self) -> None:
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        try:
+            self._listener.close()
+        except OSError:
+            pass
+
+    @staticmethod
+    def _read_head(conn: socket.socket) -> bytes:
+        head = b""
+        while b"\r\n\r\n" not in head:
+            chunk = conn.recv(4096)
+            if not chunk:
+                raise OSError("eof")
+            head += chunk
+            if len(head) > 16384:
+                raise OSError("head too large")
+        return head
+
+    @staticmethod
+    def _parse_head(head: bytes) -> tuple[list[str], dict[str, str]]:
+        lines = head.split(b"\r\n")
+        start = lines[0].decode("ascii", errors="replace").split(" ")
+        headers = {}
+        for line in lines[1:]:
+            name, sep, value = line.partition(b":")
+            if sep:
+                key = name.decode("ascii", errors="replace").strip().lower()
+                headers[key] = value.decode("ascii", errors="replace").strip()
+        return start, headers
+
+    def _record(self, head: bytes) -> tuple[list[str], dict[str, str]]:
+        start, headers = self._parse_head(head)
+        authority = start[1] if len(start) > 1 else ""
+        self.connects.append(authority)
+        self.requests.append(
+            {"method": start[0], "authority": authority, "headers": headers})
+        return start, headers
+
+    def _serve(self) -> None:
+        while not self._stop.is_set():
+            try:
+                conn, _ = self._listener.accept()
+            except OSError:
+                return
+            target = self._hold if self.hang else self._handle
+            threading.Thread(target=target, args=(conn,), daemon=True).start()
+
+    def _hold(self, conn: socket.socket) -> None:
+        try:
+            conn.settimeout(5)
+            self._record(self._read_head(conn))
+            while not self._stop.is_set():
+                if not conn.recv(4096):
+                    break
+        except OSError:
+            pass
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    def _handle(self, conn: socket.socket) -> None:
+        try:
+            conn.settimeout(5)
+            _start, headers = self._record(self._read_head(conn))
+            status = self.statuses.pop(0) if self.statuses else 200
+            if status != 200:
+                conn.sendall(
+                    f"HTTP/1.1 {status} Denied\r\nContent-Length: 0\r\n"
+                    f"Connection: close\r\n\r\n".encode())
+                return
+            conn.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            try:
+                conn = self._tls_context.wrap_socket(conn, server_side=True)
+            except OSError:
+                return
+            _get_start, get_headers = self._parse_head(self._read_head(conn))
+            body = self.bodies.get(get_headers.get("host", ""), self.body)
+            conn.sendall(
+                f"HTTP/1.1 200 OK\r\nContent-Length: {len(body)}\r\n"
+                f"Connection: close\r\n\r\n".encode() + body)
+        except OSError:
+            pass
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+
+class MixedExitIpTests(unittest.TestCase):
+    """measure_mixed_exit_ip: CONNECT + TLS exit verification, no subprocess."""
+
+    def _patch_tls(self):
+        return mock.patch("vpngate_to_singbox._exit_ip_tls_context",
+                          side_effect=_test_tls_context)
+
+    def test_basic_auth_and_exit_ip(self) -> None:
+        server = FakeConnectProxy()
+        server.start()
+        try:
+            with self._patch_tls():
+                ip, ms = measure_mixed_exit_ip(
+                    "127.0.0.1", server.port, "u", "p", timeout=5)
+        finally:
+            server.stop()
+
+        self.assertEqual("203.0.113.7", ip)
+        self.assertIsNotNone(ms)
+        self.assertGreaterEqual(ms, 1)
+        request = server.requests[0]
+        expected_auth = "Basic " + base64.b64encode(b"u:p").decode("ascii")
+        self.assertEqual("CONNECT", request["method"])
+        self.assertEqual(expected_auth,
+                         request["headers"]["proxy-authorization"])
+        host, port, _path = EXIT_IP_TARGETS[0]
+        self.assertEqual(f"{host}:{port}", request["authority"])
+
+    def test_targets_tried_in_order_and_trace_ip_parsed(self) -> None:
+        last_host = EXIT_IP_TARGETS[-1][0]
+        trace = b"fl=abc\nh=cloudflare.com\nip=203.0.113.9\nts=1\n"
+        server = FakeConnectProxy(body=b"<html>blocked</html>",
+                                  bodies={last_host: trace})
+        server.start()
+        try:
+            with self._patch_tls():
+                ip, _ms = measure_mixed_exit_ip(
+                    "127.0.0.1", server.port, "u", "p", timeout=5)
+        finally:
+            server.stop()
+
+        self.assertEqual("203.0.113.9", ip)
+        expected = [f"{host}:{port}" for host, port, _path in EXIT_IP_TARGETS]
+        self.assertEqual(expected, server.connects)
+
+    def test_non_200_connect_falls_through_to_the_next_target(self) -> None:
+        server = FakeConnectProxy(statuses=[407], body=b"198.51.100.4\n")
+        server.start()
+        try:
+            with self._patch_tls():
+                ip, _ms = measure_mixed_exit_ip(
+                    "127.0.0.1", server.port, "u", "p", timeout=5)
+        finally:
+            server.stop()
+
+        self.assertEqual("198.51.100.4", ip)
+        self.assertEqual(2, len(server.connects))
+
+    def test_all_non_200_connects_return_none(self) -> None:
+        server = FakeConnectProxy(statuses=[403] * len(EXIT_IP_TARGETS))
+        server.start()
+        try:
+            with self._patch_tls():
+                got = measure_mixed_exit_ip(
+                    "127.0.0.1", server.port, "u", "p", timeout=5)
+        finally:
+            server.stop()
+
+        self.assertEqual((None, None), got)
+        self.assertEqual(len(EXIT_IP_TARGETS), len(server.connects))
+
+    def test_no_exit_ip_in_bodies_returns_none(self) -> None:
+        server = FakeConnectProxy(body=b"<html>no ip here</html>")
+        server.start()
+        try:
+            with self._patch_tls():
+                got = measure_mixed_exit_ip(
+                    "127.0.0.1", server.port, "u", "p", timeout=5)
+        finally:
+            server.stop()
+
+        self.assertEqual((None, None), got)
+        self.assertEqual(len(EXIT_IP_TARGETS), len(server.connects))
+
+    def test_one_timeout_budget_is_shared_by_all_targets(self) -> None:
+        server = FakeConnectProxy(hang=True)
+        server.start()
+        started = time.monotonic()
+        try:
+            with self._patch_tls():
+                got = measure_mixed_exit_ip(
+                    "127.0.0.1", server.port, "u", "p", timeout=0.5)
+        finally:
+            server.stop()
+        elapsed = time.monotonic() - started
+
+        self.assertEqual((None, None), got)
+        self.assertLess(elapsed, 2.0)
+        self.assertEqual(1, len(server.connects))
 
 
 class MultiRemoteProbeTests(unittest.TestCase):

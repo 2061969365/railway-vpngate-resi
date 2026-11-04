@@ -917,9 +917,10 @@ class RotateManagerTests(unittest.TestCase):
             manager._nodes = [node]
             manager.preferred_tag = "vpngate-a"
             manager.status["preferred_tag"] = "vpngate-a"
+            manager.want_singbox = True
             with mock.patch.object(manager, "verify_fn") as verify_fn, \
-                    mock.patch("railway_manager.measure_resi_rotate",
-                               return_value={"ips": ["1.2.3.4"], "first_ms": 130}) as probe:
+                    mock.patch.object(manager, "_served_exit_probe",
+                                      return_value=("1.2.3.4", 130, True)) as probe:
                 manager._run_verify(node, manager._verify_generation)
             status = manager.status["verify"]
         finally:
@@ -1104,6 +1105,9 @@ class RotateManagerTests(unittest.TestCase):
                     mock.patch.object(RailwayManager, "_serving_ok", return_value=True), \
                     mock.patch.object(RailwayManager, "_clash_api_ready", return_value=True), \
                     mock.patch.object(RailwayManager, "_clash_select", return_value=True) as select, \
+                    mock.patch.object(RailwayManager, "_mixed_listening", return_value=True), \
+                    mock.patch.object(RailwayManager, "_served_exit_probe",
+                                      return_value=("1.2.3.4", 30, True)),\
                     mock.patch.object(RailwayManager, "_apply_config") as apply_cfg, \
                     mock.patch.object(RailwayManager, "_invalidate_verify"):
                 states = [manager.check_pinned_health() for _ in range(2)]
@@ -1127,6 +1131,9 @@ class RotateManagerTests(unittest.TestCase):
             ]
             with mock.patch.object(RailwayManager, "_clash_api_ready", return_value=True), \
                     mock.patch.object(RailwayManager, "_clash_select", return_value=True), \
+                    mock.patch.object(RailwayManager, "_mixed_listening", return_value=True), \
+                    mock.patch.object(RailwayManager, "_served_exit_probe",
+                                      return_value=("1.2.3.4", 30, True)),\
                     mock.patch.object(RailwayManager, "_apply_config") as apply_cfg:
                 ok, effective = manager.switch("vpngate-b")
             pinned = manager.preferred_tag
@@ -1153,6 +1160,9 @@ class RotateManagerTests(unittest.TestCase):
                     mock.patch.object(RailwayManager, "_chain_probe_ok", return_value=False), \
                     mock.patch.object(RailwayManager, "_serving_ok", return_value=True), \
                     mock.patch.object(RailwayManager, "_clash_api_ready", return_value=False), \
+                    mock.patch.object(RailwayManager, "_mixed_listening", return_value=True), \
+                    mock.patch.object(RailwayManager, "_served_exit_probe",
+                                      return_value=("1.2.3.4", 30, True)),\
                     mock.patch.object(RailwayManager, "_apply_config", return_value=True) as apply_cfg, \
                     mock.patch.object(RailwayManager, "_invalidate_verify"):
                 states = [manager.check_pinned_health() for _ in range(2)]
