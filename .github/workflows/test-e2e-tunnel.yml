@@ -1,0 +1,44 @@
+name: E2E image + temporary Cloudflare tunnel
+
+# Manual only: this starts a real VPNGate session and creates a throwaway
+# trycloudflare.com hostname.  It pulls the already-published GHCR artifact,
+# then verifies the complete public path:
+#   VPNGate -> sing-box -> vpngate-edge -> Cloudflare quick tunnel -> VLESS client
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "GHCR image tag (sha-<sha> or latest)"
+        required: true
+        default: latest
+
+concurrency:
+  group: e2e-tunnel-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      # actions/checkout v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      # docker/login-action v3
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Pull published image
+        run: docker pull "ghcr.io/${{ github.repository }}:${{ inputs.tag }}"
+      - name: Run real VPNGate + quick-tunnel E2E
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}:${{ inputs.tag }}
+        run: python3 scripts/e2e_tunnel_image.py "$IMAGE"
