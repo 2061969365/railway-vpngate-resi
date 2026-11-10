@@ -6,7 +6,8 @@ name: Chain acceptance (rotate cold start + self-heal)
 # It guards: (1) the cold start must not pick the pin by dialing, and
 # (2) with a live pool member the chain must heal after its pin is
 # killed - it must carry traffic again, move onto a node that carries
-# traffic, and must NOT rewrite the config or restart sing-box.
+# traffic, and must NOT restart sing-box (the on_demand flags are reconciled
+# on disk without a restart; a config-file hash change alone is not a restart).
 #
 # The detail of what is measured, and why:
 #
@@ -1055,8 +1056,9 @@ jobs:
           gate = bool(pool_live) or (rescued and not blind)
           hard = []
           soft = []
-          if md51 != md50:
-              hard.append("the repin rewrote the config")
+          # A hot switch reconciles the on_demand flags in the config file
+          # without restarting sing-box; md5_changed is informational.  The
+          # hard invariant is that the serving process was not restarted.
           if pid1 != pid0:
               hard.append("the repin restarted sing-box")
           if int(s["chain_switch"]["switches"]) <= int(sw0):
@@ -1158,6 +1160,7 @@ jobs:
                       continue
                   print("     %-12s latency_ms=%-7s direct=%-18s fresh=%s" % (
                       tag, (s.get("latency") or {}).get(tag), res.get("direct"), res.get("fresh")))
+          counters = {}
           for s in states:
               for tag, book in (s.get("counters") or {}).items():
                   counters[tag] = book
