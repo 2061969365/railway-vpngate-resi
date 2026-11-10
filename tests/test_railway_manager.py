@@ -1433,7 +1433,10 @@ class SwitchTests(unittest.TestCase):
         return response
 
     def test_switch_by_country_picks_lowest_latency(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        # manager.stop() closes the listener but background health/probe
+        # threads may still persist state while this block exits; a late
+        # write must not turn cleanup into a flaky ENOTEMPTY failure.
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir)
             port = manager.start()
             try:
@@ -1676,9 +1679,13 @@ class PinnedHealthTests(unittest.TestCase):
 
                     failing = lambda host, port, timeout=5: 0
                     with mock.patch.object(manager, "dial_fn",
-                                           return_value=None),                          mock.patch.object(manager, "_chain_probe_ok",
-                                           return_value=None),                          mock.patch.object(manager, "_served_exit_probe",
-                                           return_value=("9.9.9.9", 20, True)):
+                                           return_value=None), \
+                         mock.patch.object(manager, "_chain_probe_ok",
+                                           return_value=None), \
+                         mock.patch.object(manager, "_served_exit_probe",
+                                           return_value=("9.9.9.9", 20, True)), \
+                         mock.patch.object(manager, "_verify_served",
+                                           return_value=(True, "9.9.9.9", 20, True)):
                         states = [manager.check_pinned_health(probe_fn=failing)
                                   for _ in range(3)]
 
