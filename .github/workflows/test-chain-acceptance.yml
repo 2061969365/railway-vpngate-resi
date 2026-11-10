@@ -1330,9 +1330,11 @@ jobs:
           # The pin decision window: the full probe finished -> the pin is set.
           # Everything the full probe itself dialed started before the probe
           # finished, so it is outside the window; only a dial that happens
-          # *while the pin is decided* can be a verify-by-dial.
+          # *while the pin is decided* can be a verify-by-dial.  End at the
+          # pin: a health/full probe that starts after the pin is a legitimate
+          # post-pin check and must not be counted as verify-by-dial.
           start = (done_t - 1.0) if done_t is not None else (pin_t - 15.0)
-          end = pin_t + 30.0
+          end = pin_t
           inside = [e for e in events if start <= e["t"] <= end]
           print("pin decision window: %.3f .. %.3f" % (start, end))
           print("throwaway clients inside the pin window: %d" % len(inside))
