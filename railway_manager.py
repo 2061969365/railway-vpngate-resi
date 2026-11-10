@@ -4017,6 +4017,13 @@ class RailwayManager:
             elif start_preferred is not None and current != start_preferred:
                 self._record_history("auto-pin-skipped", f"switched mid-run to {current}")
                 return
+        if self.resi_rotate and current is None:
+            # Rotate cold start: adopt the best dial-verified node without an
+            # exit probe even when sing-box is already live.  A verify-by-dial
+            # would open a second VPNGate session and duplicate-cn would kick
+            # the session the rotation is about to serve.
+            self._auto_pin_unserved(measured, current)
+            return
         if not self.want_singbox:
             self._auto_pin_unserved(measured, current)
             return
@@ -4105,9 +4112,9 @@ class RailwayManager:
         self._record_history("auto-pin-skipped", "no exit ip")
 
     def _auto_pin_unserved(self, measured: list[dict], current: str | None) -> None:
-        """Legacy no-sing-box path: verify with `verify_fn`, which is safe
-        because nothing is serving. Kept for start_singbox=False callers and
-        cold-start tests."""
+        """Pin without an exit probe: nothing is serving yet, or rotate cold
+        start where a throwaway client would kick the serving session.
+        Kept for start_singbox=False callers and rotate cold starts."""
         if current is not None:
             self._record_history("auto-pin-skipped", "pin exists")
             return

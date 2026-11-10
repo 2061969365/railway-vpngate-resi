@@ -5014,6 +5014,48 @@ class AutoPinTests(unittest.TestCase):
         self.assertIsNone(backup, "rotate mode reserves exactly one node")
         self.assertIn("auto-pin-unverified", events)
 
+    def test_rotate_cold_start_with_live_singbox_never_dials_to_verify(self) -> None:
+        """The same invariant must hold when sing-box is already live.
+
+        On a fast boot the full probe can finish after sing-box started; the
+        old code then took the served-exit-verify path and opened a second
+        VPNGate session.  Rotate cold start must still adopt unverified."""
+        verify_calls: list[str] = []
+
+        def _verify(ep):
+            verify_calls.append(ep["server"])
+            return ("9.9.9.9", 11)
+
+        manager = self._manager(resi_rotate=True, vless_uuid="u-u-i-d",
+                                start_singbox=True)
+        try:
+            self._seed_nodes(manager, ("203.0.113.11", 100),
+                             ("203.0.113.12", 200))
+            manager._nodes[0]["real_latency_ms"] = 10
+            manager._nodes[1]["real_latency_ms"] = 20
+            manager.verify_fn = _verify
+            with mock.patch.object(RailwayManager, "_check_config",
+                                   return_value=True), \
+                 mock.patch.object(RailwayManager, "_restart_singbox"), \
+                 mock.patch.object(RailwayManager, "_verifier_configured",
+                                   return_value=True), \
+                 mock.patch.object(manager, "_mixed_listening",
+                                   return_value=True), \
+                 mock.patch.object(manager, "_verify_served") as served_verify:
+                manager._auto_pin_best(manager._nodes, None)
+            events = [e["event"] for e in manager.status["refresh_history"]]
+            pinned = manager.preferred_tag
+        finally:
+            manager.stop()
+
+        self.assertEqual([], verify_calls,
+                         "rotate cold start must not dial a node to verify it")
+        self.assertFalse(served_verify.called,
+                         "rotate cold start must not verify through the served chain")
+        self.assertEqual("vpngate-0", pinned)
+        self.assertIn("auto-pin-unverified", events)
+        self.assertNotIn("auto-pin", events)
+
     def test_a_repeated_full_probe_does_not_restart_singbox(self) -> None:
         """The full probe re-publishes the same config: the file is identical
         and sing-box is NOT restarted the second time (no flap, no dropped
