@@ -2539,6 +2539,19 @@ class RailwayManager:
         return bool((proof and now - proof <= CHAIN_ALIVE_WINDOW)
                     or (answered and now - answered <= CHAIN_ALIVE_WINDOW))
 
+    def _rescue_cooldown_active(self, now: float) -> bool:
+        """Whether a previous failed rescue still owns the cooldown window.
+
+        ``_chain_rescue_at`` starts at 0.0; treating that as a real attempt
+        would suppress the first rescue for up to 30s on a freshly booted
+        host, where ``time.monotonic()`` itself is still below the cooldown.
+        """
+        if self._chain_rescue_attempts <= 0:
+            return False
+        return now - self._chain_rescue_at < min(
+            CHAIN_RESCUE_COOLDOWN_MAX,
+            CHAIN_RESCUE_COOLDOWN * (2 ** max(0, self._chain_rescue_attempts - 1)))
+
     def _rescue_chain(self, reason: str, round_id: int) -> str:
         with self._pin_switch_lock:
             return self._rescue_chain_impl(reason, round_id)
@@ -2559,9 +2572,7 @@ class RailwayManager:
             if not self.auto_rescue:
                 self._record_history("chain-rescue-skipped", f"{reason}: auto_rescue off")
                 return "pinned"
-            if now - self._chain_rescue_at < min(
-                    CHAIN_RESCUE_COOLDOWN_MAX,
-                    CHAIN_RESCUE_COOLDOWN * (2 ** max(0, self._chain_rescue_attempts - 1))):
+            if self._rescue_cooldown_active(now):
                 return "pinned"
             if self._rescue_round != round_id:
                 self._record_history("chain-rescue-skipped", f"{reason}: manual switch won the race")

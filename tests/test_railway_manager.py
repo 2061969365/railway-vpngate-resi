@@ -1571,6 +1571,21 @@ class PinnedHealthTests(unittest.TestCase):
         header = "#HostName,IP,Score,Ping,Speed,CountryLong,CountryShort,NumVpnSessions,OpenVPN_ConfigData_Base64"
         return f"{header}\nvpn-jp,203.0.113.11,100,20,5000,Japan,JP,1,{config}\n"
 
+    def test_first_rescue_ignores_the_zero_cooldown_sentinel(self) -> None:
+        """A fresh host can have monotonic < CHAIN_RESCUE_COOLDOWN; the 0.0
+        sentinel must not suppress the very first rescue."""
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            manager = self._manager(tmpdir)
+            try:
+                manager._chain_rescue_attempts = 0
+                manager._chain_rescue_at = 0.0
+                self.assertFalse(manager._rescue_cooldown_active(now=1.0))
+                manager._chain_rescue_attempts = 1
+                self.assertTrue(manager._rescue_cooldown_active(now=1.0))
+                self.assertFalse(manager._rescue_cooldown_active(now=31.0))
+            finally:
+                manager.stop()
+
     def test_three_consecutive_failures_unpins_to_auto(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir)
