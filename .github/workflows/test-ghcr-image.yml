@@ -1,0 +1,56 @@
+name: Test GHCR image
+
+# Consume the artifact that Publish image actually pushed, instead of
+# re-building it: the image is the deployment unit.
+on:
+  workflow_run:
+    workflows: ["Publish image to GHCR"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag (sha-<sha> or latest)"
+        required: true
+        default: latest
+
+concurrency:
+  group: ghcr-image-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  image-smoke:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Resolve image tag
+        id: image
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            echo "tag=sha-${{ github.event.workflow_run.head_sha }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Check out smoke script
+        # actions/checkout v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Log in to GHCR
+        # docker/login-action v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Pull published image
+        run: docker pull "ghcr.io/${{ github.repository }}:${{ steps.image.outputs.tag }}"
+      - name: Run image smoke test
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}:${{ steps.image.outputs.tag }}
+          ADMIN_TOKEN: image-smoke-token-0123456789abcdef
+        run: bash scripts/smoke_ghcr_image.sh "$IMAGE"
