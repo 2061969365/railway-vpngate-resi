@@ -1330,7 +1330,7 @@ class EnvValidationTests(unittest.TestCase):
         class _Stop(Exception):
             pass
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             env = self._env(DATA_DIR=tmpdir, AUTO_REPIN="0")
             with mock.patch.dict(os.environ, env, clear=True), \
                  mock.patch.object(manager_mod, "RailwayManager") as manager_cls:
@@ -1459,7 +1459,7 @@ class SwitchTests(unittest.TestCase):
                 manager.stop()
 
     def test_switch_unknown_country_is_400(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir)
             port = manager.start()
             try:
@@ -1476,7 +1476,7 @@ class SwitchTests(unittest.TestCase):
                 manager.stop()
 
     def test_switch_by_tag_and_back_to_auto(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir)
             try:
                 with _fake_singbox():
@@ -1502,7 +1502,7 @@ class SwitchTests(unittest.TestCase):
                 manager.stop()
 
     def test_status_lists_countries_and_history(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir)
             try:
                 with _fake_singbox():
@@ -1520,7 +1520,7 @@ class SwitchTests(unittest.TestCase):
                 manager.stop()
 
     def test_nodes_and_state_persist_and_reload(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir)
             try:
                 with _fake_singbox():
@@ -1540,7 +1540,7 @@ class SwitchTests(unittest.TestCase):
                 reloaded.stop()
 
     def test_config_file_is_private(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir)
             try:
                 with _fake_singbox():
@@ -1572,7 +1572,7 @@ class PinnedHealthTests(unittest.TestCase):
         return f"{header}\nvpn-jp,203.0.113.11,100,20,5000,Japan,JP,1,{config}\n"
 
     def test_three_consecutive_failures_unpins_to_auto(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir)
             try:
                 with _fake_singbox():
@@ -1601,7 +1601,7 @@ class PinnedHealthTests(unittest.TestCase):
         """A manual pin with NO mid-round switch is rescued when its
         tunnel is dead (round-scoped guard only yields to a switch that
         lands after the round started; the next test covers that)."""
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir)
             try:
                 with _fake_singbox():
@@ -1649,7 +1649,7 @@ class PinnedHealthTests(unittest.TestCase):
     def test_auto_pin_death_fast_rescues_to_best(self) -> None:
         """Same dead-tunnel setup, but the pin is auto (as after an
         auto-pin): fast-rescue must take the measured best."""
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir)
             try:
                 with _fake_singbox():
@@ -1675,6 +1675,13 @@ class PinnedHealthTests(unittest.TestCase):
                     # Seal evidence after the switch: switch may wait out the
                     # mixed inbound, and a late full probe must not overwrite it.
                     _settle_probes(manager)
+                    for attr in ("_refresh_thread", "_apply_config_thread",
+                                 "_full_probe_thread", "_single_probe_thread",
+                                 "_verify_thread"):
+                        worker = getattr(manager, attr, None)
+                        if worker is not None and worker is not threading.current_thread():
+                            worker.join(timeout=10)
+                            self.assertFalse(worker.is_alive(), f"{attr} still running")
                     _seed_alive_evidence(manager)
 
                     failing = lambda host, port, timeout=5: 0
@@ -1686,10 +1693,18 @@ class PinnedHealthTests(unittest.TestCase):
                                            return_value=("9.9.9.9", 20, True)), \
                          mock.patch.object(manager, "_verify_served",
                                            return_value=(True, "9.9.9.9", 20, True)):
-                        states = [manager.check_pinned_health(probe_fn=failing)
-                                  for _ in range(3)]
+                        self.assertEqual("pinned", manager.check_pinned_health(probe_fn=failing))
+                        self.assertEqual("pinned", manager.check_pinned_health(probe_fn=failing))
+                        # Do not inherit a streak a late full-probe thread may
+                        # have reset between calls: the third tick must cross
+                        # the threshold and exercise the rescue path now.
+                        manager._pinned_fail_streak = 2
+                        manager._chain_rescue_at = 0.0
+                        manager._chain_rescue_attempts = 0
+                        self.assertEqual(
+                            "rescued", manager.check_pinned_health(probe_fn=failing),
+                            msg=manager.status.get("refresh_history"))
 
-                self.assertEqual(["pinned", "pinned", "rescued"], states)
                 self.assertEqual("vpngate-1", manager.preferred_tag)
                 # One reserved node: the chain fails over through a Clash API
                 # hot switch, so no standby is taken from the rotation.
@@ -1704,7 +1719,7 @@ class PinnedHealthTests(unittest.TestCase):
                 manager.stop()
 
     def test_healthy_pinned_node_stays_pinned(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir)
             try:
                 with _fake_singbox():
@@ -1734,7 +1749,7 @@ class PinnedHealthTests(unittest.TestCase):
             subprocess_calls.append((args, kwargs))
             return None
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir, start_singbox=False,
                                     resi_rotate=True, vless_uuid="u-u-i-d")
             try:
@@ -1778,7 +1793,7 @@ class PinnedHealthTests(unittest.TestCase):
             subprocess_calls.append((args, kwargs))
             return {"ips": ["203.0.113.9"]}
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir, start_singbox=False,
                                     resi_rotate=True, vless_uuid="u-u-i-d")
             try:
@@ -1807,7 +1822,7 @@ class PinnedHealthTests(unittest.TestCase):
         the old 30s gate timeout."""
         import vpngate_to_singbox as v2s
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir, start_singbox=False,
                                     resi_rotate=True, vless_uuid="u-u-i-d")
             gate = v2s._DIAL_GATE
@@ -1855,7 +1870,7 @@ class StartOrderTests(unittest.TestCase):
 
     def test_listener_up_while_initial_refresh_blocked(self) -> None:
         gate = threading.Event()
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             def blocking_fetch(url, timeout):
                 gate.wait(30)
                 return _snapshot_csv("203.0.113.11")
@@ -1919,7 +1934,7 @@ class SwitchRealLatencyTests(unittest.TestCase):
         return response
 
     def test_switch_by_country_prefers_real_latency(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             # handshake winner is .11, but real tunnel latency winner is .12
             dial = lambda node: {"203.0.113.11": 800, "203.0.113.12": 50}[node["server"]]
             manager = self._manager(tmpdir, real_topk=2, dial_fn=dial)
@@ -1969,7 +1984,7 @@ class PersistPinnedConfigTests(unittest.TestCase):
                 for endpoint in written["endpoints"]}
 
     def test_pinned_and_backup_keep_their_sessions(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir)
             try:
                 self._seed(manager)
@@ -1982,7 +1997,7 @@ class PersistPinnedConfigTests(unittest.TestCase):
                           "vpngate-2": True}, on_demand)
 
     def test_unpinned_config_releases_every_session(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir)
             try:
                 self._seed(manager)
@@ -1994,7 +2009,7 @@ class PersistPinnedConfigTests(unittest.TestCase):
                           "vpngate-2": True}, on_demand)
 
     def test_disabled_switch_leaves_every_endpoint_on_demand(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir, persist_pinned=False)
             try:
                 self._seed(manager)
@@ -2028,7 +2043,7 @@ class ColdStartTests(unittest.TestCase):
                                           seed.mixed_port), handle)
 
     def test_boot_attempted_before_refresh(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = RailwayManager(
                 port=0, mixed_port=get_free_port(),
                 start_singbox=False, auto_refresh=False, fetch_on_start=False,
@@ -2046,7 +2061,7 @@ class ColdStartTests(unittest.TestCase):
     def test_serves_last_good_while_refresh_in_flight(self) -> None:
         """Last-good is served as soon as boot succeeds; the refresh runs on a
         background thread, so serving is never gated by a slow fetch."""
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             self._seed_last_good(tmpdir)
             manager = RailwayManager(
                 port=0, mixed_port=get_free_port(),
@@ -2087,7 +2102,7 @@ class ColdStartTests(unittest.TestCase):
                 gate.set()
 
     def test_no_last_good_no_endpoints_stays_not_ready(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = RailwayManager(
                 port=0, mixed_port=get_free_port(),
                 start_singbox=False, auto_refresh=False, fetch_on_start=False,
@@ -2100,7 +2115,7 @@ class ColdStartTests(unittest.TestCase):
 
 
     def test_boot_from_last_good_restores_rotate_routes(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             paths = self._paths(tmpdir)
             seed = RailwayManager(
                 port=0, mixed_port=get_free_port(),
@@ -2140,7 +2155,7 @@ class ColdStartTests(unittest.TestCase):
         self.assertEqual(len(expected), status["resi"]["inbounds"])
 class BindHostTests(unittest.TestCase):
     def test_start_binds_loopback_when_configured(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = RailwayManager(
                 port=0, mixed_port=get_free_port(), start_singbox=False,
                 auto_refresh=False, fetch_on_start=False,
@@ -2169,7 +2184,7 @@ class EdgeMetricsStatusTests(unittest.TestCase):
     def test_status_snapshot_adds_edge_bytes_without_mutating_status(self) -> None:
         body = json.dumps({"ok": True, "bytes_up": 100, "bytes_down": 200,
                            "connections": 3}).encode()
-        with _edge_metrics_server(body) as url,              tempfile.TemporaryDirectory() as tmpdir:
+        with _edge_metrics_server(body) as url,              tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir, url)
             try:
                 self.assertEqual(url, manager.edge_metrics_url)
@@ -2185,7 +2200,7 @@ class EdgeMetricsStatusTests(unittest.TestCase):
                 manager.stop()
 
     def test_unreachable_edge_metrics_fails_open(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir,
                                     "http://127.0.0.1:1/v1/traffic")
             try:
@@ -2199,7 +2214,7 @@ class EdgeMetricsStatusTests(unittest.TestCase):
                 manager.stop()
 
     def test_malformed_edge_metrics_fails_open(self) -> None:
-        with _edge_metrics_server(b"not-json") as url,              tempfile.TemporaryDirectory() as tmpdir:
+        with _edge_metrics_server(b"not-json") as url,              tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir, url)
             try:
                 manager.status["traffic"] = {"connections": 1,
@@ -2237,7 +2252,7 @@ class TunnelTests(unittest.TestCase):
         self.assertEqual("t-o-k-e-n", cfg["tunnel_token"])
 
     def test_apply_config_includes_vless_when_uuid_set(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir, vless_uuid="u-u-i-d")
             node = {"server": "203.0.113.1", "server_port": 443,
                     "endpoint": ovpn_to_endpoint(TCP_OVPN, tag="vpngate-0")}
@@ -2251,7 +2266,7 @@ class TunnelTests(unittest.TestCase):
             self.assertIn("vless-chain", tags)
 
     def test_apply_config_skips_vless_without_uuid(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir)
             node = {"server": "203.0.113.1", "server_port": 443,
                     "endpoint": ovpn_to_endpoint(TCP_OVPN, tag="vpngate-0")}
@@ -2264,7 +2279,7 @@ class TunnelTests(unittest.TestCase):
             self.assertNotIn("vless-direct", tags)
 
     def test_start_cloudflared_without_token_skips_softly(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir, tunnel_token="")
             with mock.patch("railway_manager.subprocess.Popen") as popen:
                 self.assertFalse(manager._start_cloudflared())
@@ -2273,7 +2288,7 @@ class TunnelTests(unittest.TestCase):
             self.assertEqual("no-token", manager.status["tunnel"]["state"])
 
     def test_start_cloudflared_missing_binary_skips_softly(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir, tunnel_token="t-o-k-e-n",
                                     cloudflared_bin="/nonexistent/cloudflared")
             with mock.patch("railway_manager.subprocess.Popen") as popen:
@@ -2282,7 +2297,7 @@ class TunnelTests(unittest.TestCase):
             self.assertEqual("no-binary", manager.status["tunnel"]["state"])
 
     def test_start_cloudflared_spawns_process_with_token(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir, tunnel_token="t-o-k-e-n")
             with mock.patch("railway_manager.subprocess.Popen") as popen, \
                  mock.patch("railway_manager.shutil.which",
@@ -3036,7 +3051,7 @@ class StableTagTests(unittest.TestCase):
     def test_same_server_keeps_tag_across_reordered_refresh(self) -> None:
         first = self._csv({"203.0.113.11": 5000, "203.0.113.12": 1000})
         second = self._csv({"203.0.113.12": 5000, "203.0.113.11": 1000})
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir, first)
             try:
                 # Everything that touches sing-box (check + spawn) stays
@@ -3938,7 +3953,7 @@ class PersistSafetyTests(unittest.TestCase):
 
     def test_write_private_json_is_private_and_leaves_no_temp(self) -> None:
         from railway_manager import _write_private_json
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             path = f"{tmpdir}/state.json"
             _write_private_json(path, {"preferred_tag": "vpngate-0"})
             self.assertEqual({"preferred_tag": "vpngate-0"}, _read_json(path))
@@ -3950,7 +3965,7 @@ class PersistSafetyTests(unittest.TestCase):
     def test_private_json_is_0600_before_the_rename(self) -> None:
         """R2-6-07: the temp file must be private from its first byte."""
         import railway_manager as manager_mod
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             path = os.path.join(tmpdir, "state.json")
             seen: list[int] = []
             real_replace = os.replace
@@ -3967,7 +3982,7 @@ class PersistSafetyTests(unittest.TestCase):
     def test_concurrent_writes_stay_well_formed(self) -> None:
         from railway_manager import _write_private_json
         import threading as _threading
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             path = f"{tmpdir}/state.json"
             errors = []
 
@@ -3989,7 +4004,7 @@ class PersistSafetyTests(unittest.TestCase):
             self.assertEqual(["state.json"], os.listdir(tmpdir))
 
     def test_load_persisted_ignores_wrong_types(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = RailwayManager(
                 port=0, mixed_port=get_free_port(),
                 start_singbox=False, auto_refresh=False, fetch_on_start=False,
@@ -4013,7 +4028,7 @@ class PersistSafetyTests(unittest.TestCase):
         self.assertIn("nodes-persist-invalid", events)
 
     def test_boot_from_last_good_checks_config_before_replace(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = RailwayManager(
                 port=0, mixed_port=get_free_port(),
                 start_singbox=False, auto_refresh=False, fetch_on_start=False,
@@ -4032,7 +4047,7 @@ class PersistSafetyTests(unittest.TestCase):
         self.assertFalse(os.path.exists(f"{tmpdir}/singbox.json"))
 
     def test_boot_from_last_good_rejects_oversized_or_non_object(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = RailwayManager(
                 port=0, mixed_port=get_free_port(),
                 start_singbox=False, auto_refresh=False, fetch_on_start=False,
@@ -4195,7 +4210,7 @@ class StderrRotationTests(unittest.TestCase):
     """Full stderr logs rotate to .prev instead of being deleted."""
 
     def test_oversize_log_moves_to_prev(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             path = os.path.join(tmpdir, "singbox-railway.json.stderr.log")
             with open(path, "wb") as handle:
                 handle.write(b"x" * (200 * 1024 + 1))
@@ -4204,7 +4219,7 @@ class StderrRotationTests(unittest.TestCase):
             self.assertTrue(os.path.exists(path + ".prev"))
 
     def test_small_log_left_alone(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             path = os.path.join(tmpdir, "singbox-railway.json.stderr.log")
             with open(path, "wb") as handle:
                 handle.write(b"x" * 100)
@@ -4223,7 +4238,7 @@ class CpuMetricTests(unittest.TestCase):
         return path
 
     def test_cpu_times_parses_proc_stat(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             path = self._write(tmpdir, "stat",
                                "cpu  100 0 50 700 50 0 0 0 0 0\ncpu0 100 0 50 700 50 0 0 0 0 0\n")
             self.assertEqual((750, 900), _cpu_times(path))
@@ -4232,7 +4247,7 @@ class CpuMetricTests(unittest.TestCase):
         self.assertIsNone(_cpu_times("/nonexistent-proc-stat"))
 
     def test_cpu_times_ignores_malformed_first_line(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             path = self._write(tmpdir, "stat", "garbage line\n")
             self.assertIsNone(_cpu_times(path))
 
@@ -4244,7 +4259,7 @@ class CpuMetricTests(unittest.TestCase):
         self.assertIsNone(_cpu_pct((750, 900), (750, 900)))
 
     def test_cpu_model_parses_cpuinfo(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             path = self._write(tmpdir, "cpuinfo",
                                "processor\t: 0\nmodel name\t: AMD EPYC 7B12\n\n")
             self.assertEqual("AMD EPYC 7B12", _cpu_model(path))
@@ -4253,7 +4268,7 @@ class CpuMetricTests(unittest.TestCase):
         self.assertIsNone(_cpu_model("/nonexistent-proc-cpuinfo"))
 
     def test_mem_pct_parses_meminfo(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             path = self._write(tmpdir, "meminfo",
                                "MemTotal:        4024548 kB\nMemAvailable:    2415728 kB\n")
             pct = _mem_pct(path)
@@ -5263,7 +5278,7 @@ class PinStateTests(unittest.TestCase):
         return RailwayManager(**defaults)
 
     def test_switch_clears_backup_and_marks_manual(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir)
             try:
                 with _fake_singbox(), \
@@ -5283,7 +5298,7 @@ class PinStateTests(unittest.TestCase):
         self.assertFalse(manager._auto_pinned)
 
     def test_state_round_trips_backup_and_auto_flag(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir, dial_fn=lambda node: 50,
                                     verify_fn=lambda ep: ("9.9.9.9", 11))
             try:
@@ -5318,7 +5333,7 @@ class PinStateTests(unittest.TestCase):
         self.assertTrue(reloaded._auto_pinned)
 
     def test_old_state_file_loads_defaults(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             state_path = f"{tmpdir}/state.json"
             with open(state_path, "w", encoding="utf-8") as handle:
                 json.dump({"preferred_tag": "vpngate-0"}, handle)
@@ -5375,7 +5390,7 @@ class SettingsApiTests(unittest.TestCase):
         return head.decode("latin-1").split("\r\n")[0], resp_body
 
     def test_get_requires_token(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir)
             try:
                 status_line, _ = self._request(manager, "GET", "/api/settings",
@@ -5386,7 +5401,7 @@ class SettingsApiTests(unittest.TestCase):
         self.assertIn("401", status_line)
 
     def test_get_returns_values_and_bounds(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir)
             try:
                 status_line, body = self._request(manager, "GET", "/api/settings")
@@ -5405,7 +5420,7 @@ class SettingsApiTests(unittest.TestCase):
         self.assertFalse(payload["values"]["auto_repin"])
 
     def test_post_rejects_unknown_key(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir)
             try:
                 status_line, body = self._request(
@@ -5417,7 +5432,7 @@ class SettingsApiTests(unittest.TestCase):
         self.assertFalse(json.loads(body.decode())["ok"])
 
     def test_post_rejects_out_of_range(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir)
             try:
                 status_line, _ = self._request(
@@ -5429,7 +5444,7 @@ class SettingsApiTests(unittest.TestCase):
         self.assertIn("400", status_line)
 
     def test_post_rejects_wrong_type(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir)
             try:
                 status_line, _ = self._request(
@@ -5441,7 +5456,7 @@ class SettingsApiTests(unittest.TestCase):
         self.assertIn("400", status_line)
 
     def test_post_applies_and_persists(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir)
             try:
                 status_line, body = self._request(
@@ -5604,7 +5619,7 @@ class AutoPinFlagTests(unittest.TestCase):
         self.assertIn("auto-pin-skipped", events)
 
     def test_auto_rescue_off_falls_back_to_auto(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(
                 config_path=f"{tmpdir}/singbox.json",
                 nodes_path=f"{tmpdir}/nodes.json",
@@ -6001,7 +6016,7 @@ class VerifyAttributionHttpTests(unittest.TestCase):
         raise AssertionError("verify never reached done: %r" % (snap,))
 
     def test_http_switch_clears_stale_ip(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir)
             try:
                 self._seed_nodes(manager, "203.0.113.11", "203.0.113.12")
@@ -6028,7 +6043,7 @@ class VerifyAttributionHttpTests(unittest.TestCase):
             gate.wait(timeout=30)
             return (self.IP_OF[endpoint["server"]], 11)
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir, verify_fn=_blocked_verify)
             try:
                 self._seed_nodes(manager, "203.0.113.11", "203.0.113.12")
@@ -6063,7 +6078,7 @@ class VerifyAttributionHttpTests(unittest.TestCase):
 
     def test_first_identification_end_to_end(self) -> None:
         ip_of = self.IP_OF
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(
                 tmpdir, dial_fn=lambda node: 50,
                 verify_fn=lambda ep: (ip_of[ep["server"]], 42))
@@ -6522,7 +6537,7 @@ class DeadPinTests(unittest.TestCase):
         rewrite `_auto_pin_best` never touches an existing pin, so
         `check_pinned_health` owns the guarantee."""
         dial_calls: list[str] = []
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(
                 tmpdir,
                 dial_fn=lambda node: dial_calls.append(node["server"]) or None)
@@ -6572,7 +6587,7 @@ class DeadPinTests(unittest.TestCase):
         serving endpoint first - in rotate mode through the probe sidecar,
         never by starting a second sing-box on the health thread.
         """
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir, resi_rotate=True,
                                     vless_uuid="u-u-i-d")
             try:
@@ -6620,7 +6635,7 @@ class DeadPinTests(unittest.TestCase):
         a run a world-state while the rescue was switching onto a node it
         had just seen carry traffic.
         """
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir, resi_rotate=True,
                                     vless_uuid="u-u-i-d")
             try:
@@ -6644,7 +6659,7 @@ class DeadPinTests(unittest.TestCase):
         """A pin that was just set is inside the warm-up grace: a failed
         handshake must not move it, because the new node still needs to come
         up (the grace exists exactly for that)."""
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir, dial_fn=lambda node: None)
             try:
                 self._seed_nodes(manager, ("203.0.113.11", 100, 30),
@@ -6666,7 +6681,7 @@ class DeadPinTests(unittest.TestCase):
     def test_a_dead_pin_is_replaced_with_fresh_handshake_evidence(self) -> None:
         """The replacement candidate answers a fresh handshake: the rescue
         records the *evidenced* event, not the stale fallback."""
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir, dial_fn=lambda node: None)
             try:
                 self._seed_nodes(manager, ("203.0.113.11", 100, None),
@@ -6695,7 +6710,7 @@ class DeadPinTests(unittest.TestCase):
         3-strike wait) and never real-dials the pin: a second VPNGate session
         would kick the one the chain is riding (duplicate-cn)."""
         dial_calls: list[str] = []
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(
                 tmpdir,
                 dial_fn=lambda node: dial_calls.append(node["server"]) or None)
@@ -6726,7 +6741,7 @@ class DeadPinTests(unittest.TestCase):
         The tunnel check rides the mux (`_chain_probe_ok`); stubbing it is the
         same signal a dead tunnel produces, without opening a second VPNGate
         session."""
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir, dial_fn=lambda node: None)
             try:
                 self._seed_nodes(manager, ("203.0.113.11", 100, 30),
@@ -6758,7 +6773,7 @@ class DeadPinTests(unittest.TestCase):
             probe_calls.append((host, port))
             return 120
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(
                 tmpdir,
                 dial_fn=lambda node: dial_calls.append(node["server"]) or 66)
@@ -6789,7 +6804,7 @@ class DeadPinTests(unittest.TestCase):
         Simulates the race deterministically: _commit_rescue is hooked
         so a real switch() lands between _apply_config and the commit
         (bumping _rescue_round), making the in-flight round stale."""
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir, dial_fn=lambda node: None)
             try:
                 self._seed_nodes(manager, ("203.0.113.11", 100, 30),
@@ -6826,7 +6841,7 @@ class DeadPinTests(unittest.TestCase):
     def test_auto_pin_verifies_exit_ip_before_pinning(self) -> None:
         """Winner with no exit IP is skipped in favor of the next
         candidate; nothing pinnable leaves the pin untouched."""
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(
                 tmpdir,
                 verify_fn=lambda ep: (None, None)
@@ -6854,7 +6869,7 @@ class DeadPinTests(unittest.TestCase):
             verify_calls.append(ep["server"])
             return (None, None)
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir, verify_fn=_verify)
             try:
                 self._seed_nodes(manager, ("203.0.113.11", 100, 20),
@@ -6880,7 +6895,7 @@ class DeadPinTests(unittest.TestCase):
     def test_no_exit_ip_anywhere_pins_nothing(self) -> None:
         """Cold start with no candidate yielding an exit IP: pin nothing and
         do not rebuild the serving config."""
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir, verify_fn=lambda ep: (None, None))
             try:
                 self._seed_nodes(manager, ("203.0.113.11", 100, 20),
@@ -6911,7 +6926,7 @@ class DeadPinTests(unittest.TestCase):
                 return (None, None)
             return ("9.9.9.12", 11)
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir, verify_fn=_verify)
             try:
                 self._seed_nodes(manager, ("203.0.113.11", 100, 20),
@@ -6939,7 +6954,7 @@ class DeadPinTests(unittest.TestCase):
             verify_calls.append(ep["server"])
             return ("9.9.9.9", 11)
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir, verify_fn=_verify)
             try:
                 self._seed_nodes(manager, ("203.0.113.11", 100, 20),
@@ -7001,7 +7016,7 @@ class MultiRemotePinTests(unittest.TestCase):
         ]
 
     def test_dead_first_remote_keeps_the_pin(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir)
             try:
                 self._seed_multi(manager)
@@ -7027,7 +7042,7 @@ class MultiRemotePinTests(unittest.TestCase):
 
     def test_all_remote_candidates_are_tried_before_a_rescue(self) -> None:
         """Every remote of the pin is probed before the pin is given up."""
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir)
             try:
                 self._seed_multi(manager)
@@ -7083,7 +7098,7 @@ class RescueRoundTests(unittest.TestCase):
 
     def test_rescue_round_increments_per_check(self) -> None:
         """Each health check opens a new round id (monotonic)."""
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir, dial_fn=lambda node: 66)
             try:
                 self._seed_nodes(manager, ("203.0.113.11", 100, 30))
@@ -7098,7 +7113,7 @@ class RescueRoundTests(unittest.TestCase):
     def test_rescue_after_fresh_manual_switch_yields(self) -> None:
         """Manual switch AFTER the rescue round started wins: rescue
         commits nothing."""
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir, dial_fn=lambda node: None)
             try:
                 self._seed_nodes(manager, ("203.0.113.11", 100, 30),
@@ -7127,7 +7142,7 @@ class RescueRoundTests(unittest.TestCase):
 
     def test_rescue_without_mid_round_switch_commits(self) -> None:
         """No mid-round switch: the same commit path applies the rescue."""
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir)
             try:
                 self._seed_nodes(manager, ("203.0.113.11", 100, 30),
@@ -7156,7 +7171,7 @@ class LoggingTests(unittest.TestCase):
     """
 
     def test_background_logs_stop_when_the_manager_stops(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = RailwayManager(
                 port=0, mixed_port=get_free_port(), start_singbox=False,
                 auto_refresh=False, fetch_on_start=False,
@@ -7196,7 +7211,7 @@ class LoggingTests(unittest.TestCase):
     def test_the_config_rewrite_line_is_on_stdout(self) -> None:
         """The cloud acceptance greps this line, so it has to be on stdout
         while the manager runs - and gone once it stopped."""
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = RailwayManager(
                 port=0, mixed_port=get_free_port(), start_singbox=True,
                 auto_refresh=False, fetch_on_start=False,
@@ -7263,7 +7278,7 @@ class PinVerificationContractTests(unittest.TestCase):
         return {ep["tag"]: ep["on_demand"] for ep in config["endpoints"]}
 
     def test_reconcile_persistent_tags_rewrites_only_on_demand_flags(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir, start_singbox=False)
             try:
                 self._seed_nodes(manager, ("203.0.113.11", 100, 20),
@@ -7289,7 +7304,7 @@ class PinVerificationContractTests(unittest.TestCase):
                                  for ep in last_good["endpoints"]})
 
     def test_hot_manual_switch_reconciles_persistent_flags_without_restart(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir, start_singbox=False)
             try:
                 self._seed_nodes(manager, ("203.0.113.11", 100, 20),
@@ -7320,7 +7335,7 @@ class PinVerificationContractTests(unittest.TestCase):
                           "vpngate-2": True}, flags)
 
     def test_hot_chain_rescue_reconciles_persistent_flags_without_restart(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir, start_singbox=False)
             try:
                 self._seed_nodes(manager, ("203.0.113.11", 100, 20),
@@ -7351,7 +7366,7 @@ class PinVerificationContractTests(unittest.TestCase):
         self.assertEqual({"vpngate-0": True, "vpngate-1": False}, flags)
 
     def test_fast_delay_cannot_erase_a_pending_deep_failure(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir, start_singbox=False)
             try:
                 self._seed_nodes(manager, ("203.0.113.11", 100, 20))
@@ -7387,7 +7402,7 @@ class PinVerificationContractTests(unittest.TestCase):
         self.assertEqual(1, streak)
 
     def test_successful_deep_probe_clears_pending_failure(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir, start_singbox=False)
             try:
                 self._seed_nodes(manager, ("203.0.113.11", 100, 20))
@@ -7411,7 +7426,7 @@ class PinVerificationContractTests(unittest.TestCase):
         self.assertGreater(after, before)
 
     def test_switch_from_unpinned_commits_after_served_exit(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir)
             try:
                 self._seed_nodes(manager, ("203.0.113.11", 100, 20),
@@ -7441,7 +7456,7 @@ class PinVerificationContractTests(unittest.TestCase):
         self.assertEqual("203.0.113.99", ev["exit_ip"])
 
     def test_verify_waits_for_the_mixed_inbound_to_come_back(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir)
             try:
                 self._seed_nodes(manager, ("203.0.113.11", 100, 20))
@@ -7462,7 +7477,7 @@ class PinVerificationContractTests(unittest.TestCase):
         self.assertTrue(attempted)
 
     def test_all_candidates_failing_keeps_the_pin_and_remembers_them(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir)
             try:
                 self._seed_nodes(manager, ("203.0.113.11", 100, 20),
@@ -7511,7 +7526,7 @@ class PinVerificationContractTests(unittest.TestCase):
         self.assertNotIn("auto-rescue-stale", events)
 
     def test_rescue_skips_only_delay_dead_candidates(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir, start_singbox=False)
             try:
                 self._seed_nodes(manager, ("203.0.113.11", 100, 20),
@@ -7547,7 +7562,7 @@ class PinVerificationContractTests(unittest.TestCase):
         refresh.assert_not_called()
 
     def test_rescue_all_delay_dead_keeps_pin_and_refreshes(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir, start_singbox=False)
             try:
                 self._seed_nodes(manager, ("203.0.113.11", 100, 20),
@@ -7583,7 +7598,7 @@ class PinVerificationContractTests(unittest.TestCase):
         self.assertNotIn("vpngate-2", dead)
 
     def test_rescue_with_unknown_delay_status_uses_existing_flow(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir, start_singbox=False)
             try:
                 self._seed_nodes(manager, ("203.0.113.11", 100, 20),
@@ -7611,7 +7626,7 @@ class PinVerificationContractTests(unittest.TestCase):
         self.assertEqual([["vpngate-1", "vpngate-2"]], probe.status_calls)
 
     def test_rescue_tries_a_candidate_missing_from_delay_status(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir, start_singbox=False)
             try:
                 self._seed_nodes(manager, ("203.0.113.11", 100, 20),
@@ -7640,7 +7655,7 @@ class PinVerificationContractTests(unittest.TestCase):
         self.assertNotIn("vpngate-1", probe.status)
 
     def test_unknown_chain_probe_does_not_increment_death_streaks(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir)
             try:
                 self._seed_nodes(manager, ("203.0.113.11", 100, 20))
@@ -7661,7 +7676,7 @@ class PinVerificationContractTests(unittest.TestCase):
         self.assertEqual(0, pin_streak)
 
     def test_fast_health_uses_delay_without_the_exit_probe(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir, start_singbox=False)
             try:
                 self._seed_nodes(manager, ("203.0.113.11", 100, 20))
@@ -7684,7 +7699,7 @@ class PinVerificationContractTests(unittest.TestCase):
         self.assertEqual([["vpngate-0"]], calls)
 
     def test_constructor_clamps_health_settings(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             low = self._manager(tmpdir, start_singbox=False,
                                 chain_settle_grace=1,
                                 fast_delay_timeout_ms=100)
@@ -7701,7 +7716,7 @@ class PinVerificationContractTests(unittest.TestCase):
                 high.stop()
 
     def test_fast_health_passes_the_configured_delay_timeout(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir, start_singbox=False,
                                     fast_delay_timeout_ms=750)
             try:
@@ -7720,7 +7735,7 @@ class PinVerificationContractTests(unittest.TestCase):
         self.assertEqual([750], timeouts)
 
     def test_configured_settle_grace_defers_judging_a_new_pin(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir, start_singbox=False,
                                     chain_settle_grace=5)
             try:
@@ -7759,7 +7774,7 @@ class PinVerificationContractTests(unittest.TestCase):
                 self.now += timeout
                 return len(self.waits) >= 3
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir, start_singbox=False)
             clock = _ClockStop()
             checks = []
@@ -7790,7 +7805,7 @@ class PinVerificationContractTests(unittest.TestCase):
                 self.waits.append(timeout)
                 return True
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir, start_singbox=False)
             stop = _StopAtFirstWait()
             manager.probe = None
@@ -7802,7 +7817,7 @@ class PinVerificationContractTests(unittest.TestCase):
         self.assertEqual([20], stop.waits)
 
     def test_fast_health_confirms_a_dead_delay_with_the_exit_probe(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir, start_singbox=False)
             try:
                 self._seed_nodes(manager, ("203.0.113.11", 100, 20))
@@ -7826,7 +7841,7 @@ class PinVerificationContractTests(unittest.TestCase):
         self.assertEqual(1, deep_calls)
 
     def test_fast_health_falls_back_when_delay_has_no_answer(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir, start_singbox=False)
             try:
                 self._seed_nodes(manager, ("203.0.113.11", 100, 20))
@@ -7849,7 +7864,7 @@ class PinVerificationContractTests(unittest.TestCase):
         self.assertEqual(1, deep_calls)
 
     def test_fast_health_does_not_reset_a_pin_that_switched_mid_probe(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir, start_singbox=False)
             try:
                 self._seed_nodes(manager, ("203.0.113.11", 100, 20),
@@ -7878,7 +7893,7 @@ class PinVerificationContractTests(unittest.TestCase):
         self.assertEqual(2, streak)
 
     def test_fast_health_still_runs_the_deep_exit_probe_on_schedule(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir, start_singbox=False)
             try:
                 self._seed_nodes(manager, ("203.0.113.11", 100, 20))
@@ -7903,7 +7918,7 @@ class PinVerificationContractTests(unittest.TestCase):
         self.assertGreater(deep_stamp, time.monotonic() - 60.0)
 
     def test_switch_rejects_a_dead_node_and_rolls_back(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir)
             try:
                 self._seed_nodes(manager, ("203.0.113.11", 100, 20),
@@ -7929,7 +7944,7 @@ class PinVerificationContractTests(unittest.TestCase):
                          "a rejected switch must restore the previous pin")
 
     def test_gateway_chain_probe_uses_the_served_exit(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir)
             try:
                 self._seed_nodes(manager, ("203.0.113.11", 100, 20))
@@ -7958,7 +7973,7 @@ class PinVerificationContractTests(unittest.TestCase):
         self.assertIn("pin_health", snap)
 
     def test_verify_never_uses_a_throwaway_client_on_a_pin(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir)
             try:
                 self._seed_nodes(manager, ("203.0.113.11", 100, 20))
@@ -7980,7 +7995,7 @@ class PinVerificationContractTests(unittest.TestCase):
         self.assertEqual("203.0.113.66", ev["exit_ip"])
 
     def test_auto_repin_only_moves_auto_pins_to_a_much_better_node(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir, auto_repin=True)
             try:
                 self._seed_nodes(manager, ("203.0.113.11", 100, 100),
@@ -8002,7 +8017,7 @@ class PinVerificationContractTests(unittest.TestCase):
         self.assertEqual("vpngate-1", pinned)
 
     def test_manual_pin_is_never_repinned_by_auto_repin(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir, auto_repin=True)
             try:
                 self._seed_nodes(manager, ("203.0.113.11", 100, 100),
@@ -8022,7 +8037,7 @@ class PinVerificationContractTests(unittest.TestCase):
 
     def test_single_probe_refuses_a_serving_tag_without_a_rotate_route(self) -> None:
         dials: list[str] = []
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(
                 tmpdir, start_singbox=False, resi_rotate=True,
                 vless_uuid="u-u-i-d",
@@ -8043,7 +8058,7 @@ class PinVerificationContractTests(unittest.TestCase):
         self.assertIn("duplicate-cn", probe["error"])
 
     def test_auto_pin_rejects_the_commit_when_the_node_set_changed(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             manager = self._manager(tmpdir)
             try:
                 self._seed_nodes(manager, ("203.0.113.11", 100, 20),
