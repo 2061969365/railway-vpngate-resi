@@ -1,8 +1,11 @@
 """Tests for minimal VPNGate .ovpn -> sing-box openvpn-client converter."""
 import base64
 import json
+import os
 import socket
 import ssl
+import stat
+import tempfile
 import threading
 import time
 import unittest
@@ -11,15 +14,34 @@ from unittest import mock
 
 from vpngate_to_singbox import (
     EXIT_IP_TARGETS,
+    MAX_BLOCK_BYTES,
+    MAX_CONFIG_BYTES,
+    MAX_CONFIG_LINE_BYTES,
+    MAX_SNAPSHOT_BYTES,
+    MAX_SNAPSHOT_ROWS,
+    _all_tcp_remotes,
+    _check_snapshot_limits,
+    _endpoint_remotes_allowed,
     _fetch_exit_ip,
+    _iter_tcp_candidates,
+    _local_service_ports,
     _parse_exit_ip,
+    _recv_exact,
+    _resolve_with_timeout,
+    _server_fields,
+    _socks5_get_text,
+    _validate_remote,
     build_singbox_config,
+    main,
+    measure_exit_ip,
     measure_mixed_exit_ip,
+    measure_real_latency,
     endpoint_remotes,
     nodes_to_endpoints,
     ovpn_to_endpoint,
     probe_endpoint_latency,
     probe_tcp_latency,
+    render_resi_username,
     snapshot_to_endpoints,
     snapshot_to_nodes,
 )
@@ -182,12 +204,44 @@ class ProbeTcpLatencyTests(unittest.TestCase):
         worker = threading.Thread(target=_accept, daemon=True)
         worker.start()
         try:
-            latency = probe_tcp_latency("127.0.0.1", port, timeout=5)
+            with mock.patch.dict(os.environ, {"ALLOW_PRIVATE_REMOTES": "1"}):
+                latency = probe_tcp_latency("127.0.0.1", port, timeout=5)
         finally:
             stop.set()
             listener.close()
 
         self.assertGreater(latency, 0)
+
+    def test_manager_supplied_loopback_port_needs_no_environment(self) -> None:
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+        stop = threading.Event()
+
+        def _accept() -> None:
+            listener.settimeout(5)
+            try:
+                conn, _ = listener.accept()
+                conn.close()
+            except OSError:
+                pass
+
+        threading.Thread(target=_accept, daemon=True).start()
+        try:
+            with mock.patch.dict(os.environ, {}, clear=True):
+                self.assertEqual(0, probe_tcp_latency("127.0.0.1", port,
+                                                      timeout=2))
+                latency = probe_tcp_latency(
+                    "127.0.0.1", port, timeout=5,
+                    allow_loopback_ports={port})
+        finally:
+            stop.set()
+            listener.close()
+
+        self.assertGreater(latency, 0)
+        self.assertIn(port, _local_service_ports({port}))
 
 
 class SnapshotToNodesTests(unittest.TestCase):
@@ -727,6 +781,13 @@ Q1JZUFRfS0VZ
             {"type": "tls_auth", "key": "VE9LRU4=", "direction": "client"},
             ep["tls"]["control_wrap"],
         )
+
+    def test_crlf_config_parses(self) -> None:
+        endpoint = ovpn_to_endpoint(
+            TCP_OVPN.replace("\n", "\r\n"), tag="crlf")
+
+        self.assertEqual("203.0.113.1", endpoint["server"])
+        self.assertEqual(443, endpoint["server_port"])
 
     def test_tls_auth_direction_zero_maps_to_server(self) -> None:
         ovpn = self.TLS_AUTH_OVPN.replace("key-direction 1", "key-direction 0")
@@ -1397,6 +1458,564 @@ class MultiRemoteProbeTests(unittest.TestCase):
 
         self.assertEqual([], snapshot_to_nodes(csv_text,
                                                probe_fn=lambda host, port: 0))
+
+
+class BlockParserHardeningTests(unittest.TestCase):
+    """P1-3: the inline-block parser must be linear and bounded."""
+
+    def _cfg(self, extra: str = "") -> str:
+        return ("client\nproto tcp-client\nremote 203.0.113.1 443 tcp\n"
+                + extra)
+
+    def test_repeated_unterminated_ca_is_linear_and_raises(self) -> None:
+        text = self._cfg("<ca>\n" * 1000)
+        started = time.monotonic()
+        with self.assertRaises(ValueError):
+            ovpn_to_endpoint(text, tag="x")
+        self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_sixty_four_kib_blank_lines_parse_quickly(self) -> None:
+        text = ("\n" * (64 * 1024)
+                + "client\nproto tcp-client\nremote 203.0.113.1 443 tcp\n"
+                + "<ca>\nQ0E=\n</ca>\n")
+        started = time.monotonic()
+        endpoint = ovpn_to_endpoint(text, tag="blank-lines")
+        elapsed = time.monotonic() - started
+
+        self.assertEqual("203.0.113.1", endpoint["server"])
+        # Deliberately loose: the bug was ~110 seconds, not a few ms.
+        self.assertLess(elapsed, 1.0)
+
+    def test_overlong_config_line_is_rejected_and_counted(self) -> None:
+        import vpngate_to_singbox as mod
+
+        before = mod._OVERSIZED_CONFIG_LINE_COUNT
+        text = "client\n" + "A" * (MAX_CONFIG_LINE_BYTES + 1) + "\n"
+        with self.assertRaises(ValueError):
+            ovpn_to_endpoint(text, tag="x")
+        self.assertEqual(before + 1, mod._OVERSIZED_CONFIG_LINE_COUNT)
+
+    def test_unterminated_block_raises(self) -> None:
+        text = TCP_OVPN.replace("</ca>\n", "")
+        with self.assertRaises(ValueError):
+            ovpn_to_endpoint(text, tag="x")
+
+    def test_oversized_block_is_rejected(self) -> None:
+        text = self._cfg("<ca>\n" + "A" * (MAX_BLOCK_BYTES + 1) + "\n</ca>\n")
+        with self.assertRaises(ValueError):
+            ovpn_to_endpoint(text, tag="x")
+
+    def test_oversized_config_is_rejected(self) -> None:
+        text = TCP_OVPN + "A" * MAX_CONFIG_BYTES
+        with self.assertRaises(ValueError):
+            ovpn_to_endpoint(text, tag="x")
+
+    def test_non_pem_block_content_is_rejected(self) -> None:
+        text = self._cfg("<ca>\n<script>alert(1)</script>\n</ca>\n")
+        with self.assertRaises(ValueError):
+            ovpn_to_endpoint(text, tag="x")
+
+    def test_single_line_block_still_parses(self) -> None:
+        text = self._cfg("<ca>Q0E=</ca>\n")
+        endpoint = ovpn_to_endpoint(text, tag="x")
+        self.assertEqual("Q0E=", endpoint["tls"]["certificate"])
+
+
+class RemoteLimitTests(unittest.TestCase):
+    """P1-4 / R3-07: bounded, deduped and correctly merged remotes."""
+
+    @staticmethod
+    def _cfg(remotes: list[tuple[str, int]], proto: str = "tcp-client") -> str:
+        lines = ["client", f"proto {proto}"]
+        lines.extend(f"remote {host} {port} tcp" for host, port in remotes)
+        lines.extend(["<ca>", "Q0E=", "</ca>"])
+        return "\n".join(lines) + "\n"
+
+    def test_more_than_eight_remotes_raises(self) -> None:
+        remotes = [(f"203.0.113.{i + 1}", 443) for i in range(9)]
+        with self.assertRaises(ValueError):
+            _all_tcp_remotes(self._cfg(remotes))
+
+    def test_duplicate_remotes_are_deduped_in_order(self) -> None:
+        remotes = [("203.0.113.1", 443), ("203.0.113.2", 1194),
+                   ("203.0.113.1", 443)]
+        self.assertEqual(
+            [("203.0.113.1", 443), ("203.0.113.2", 1194)],
+            _all_tcp_remotes(self._cfg(remotes)))
+
+    def test_inherited_global_tcp_remote_is_not_dropped(self) -> None:
+        text = ("client\nproto tcp-client\n"
+                "remote 203.0.113.1 443\n"
+                "remote 203.0.113.2 443 tcp\n"
+                "<ca>\nQ0E=\n</ca>\n")
+        self.assertEqual(
+            [("203.0.113.1", 443), ("203.0.113.2", 443)],
+            _all_tcp_remotes(text))
+
+    def test_explicit_udp_remote_is_excluded(self) -> None:
+        text = ("client\nproto tcp-client\n"
+                "remote 203.0.113.1 443\n"
+                "remote 203.0.113.2 1194 udp\n"
+                "remote 203.0.113.3 443 tcp\n"
+                "<ca>\nQ0E=\n</ca>\n")
+        self.assertEqual(
+            [("203.0.113.1", 443), ("203.0.113.3", 443)],
+            _all_tcp_remotes(text))
+
+    def test_server_fields_rejects_more_than_eight(self) -> None:
+        with self.assertRaises(ValueError):
+            _server_fields([(f"203.0.113.{i + 1}", 443) for i in range(9)])
+
+    def test_probe_endpoint_latency_has_a_total_budget(self) -> None:
+        endpoint = {"servers": [
+            {"server": f"203.0.113.{i + 1}", "server_port": 443}
+            for i in range(20)
+        ]}
+        calls: list[str] = []
+
+        def slow_probe(host: str, port: int) -> int:
+            calls.append(host)
+            time.sleep(0.2)
+            return 0
+
+        started = time.monotonic()
+        result = probe_endpoint_latency(endpoint, timeout=0.3, probe_fn=slow_probe)
+        elapsed = time.monotonic() - started
+
+        self.assertEqual(0, result)
+        self.assertLess(len(calls), 20)
+        self.assertLess(elapsed, 1.5)
+
+
+class PrivateRemoteTests(unittest.TestCase):
+    """P1-6: private/loopback/metadata remotes are rejected by default."""
+
+    @staticmethod
+    def _cfg(host: str, port: int = 443) -> str:
+        return TCP_OVPN.replace("remote 203.0.113.1 443 tcp",
+                                f"remote {host} {port} tcp")
+
+    def test_forbidden_literals_are_rejected(self) -> None:
+        for host in ("127.0.0.1", "169.254.169.254", "10.1.2.3",
+                     "192.168.1.5", "0.0.0.0", "[::1]"):
+            with self.subTest(host=host):
+                with self.assertRaises(ValueError):
+                    ovpn_to_endpoint(self._cfg(host), tag="x")
+
+    def test_out_of_range_port_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            ovpn_to_endpoint(self._cfg("203.0.113.1", 70000), tag="x")
+
+    def test_allow_private_remotes_opt_in(self) -> None:
+        with mock.patch.dict(os.environ, {"ALLOW_PRIVATE_REMOTES": "1"}):
+            endpoint = ovpn_to_endpoint(self._cfg("127.0.0.1", 22), tag="x")
+        self.assertEqual("127.0.0.1", endpoint["server"])
+        self.assertEqual(22, endpoint["server_port"])
+
+    def test_domain_is_rejected_without_dns(self) -> None:
+        with mock.patch("vpngate_to_singbox.socket.getaddrinfo") as resolver:
+            with self.assertRaises(ValueError):
+                _validate_remote("evil.example", 443)
+        resolver.assert_not_called()
+
+    def test_domain_config_is_rejected_at_parse_time(self) -> None:
+        with self.assertRaises(ValueError):
+            ovpn_to_endpoint(self._cfg("evil.example"), tag="x")
+
+    def test_six_to_four_and_teredo_are_rejected(self) -> None:
+        for host in (
+            "2002:a9fe:a9fe::1",  # 6to4 embedding 169.254.169.254
+            "2002:7f00:1::",      # 6to4 embedding 127.0.0.1
+            "2001:0000:4136:e378:8000:63bf:3fff:fdd2",  # Teredo
+            "2001::1",
+            "2001:db8::1",
+            "64:ff9b::a9fe:a9fe",  # NAT64 embedding 169.254.169.254
+            "192.88.99.1",         # 6to4 relay anycast
+        ):
+            with self.subTest(host=host):
+                with self.assertRaises(ValueError):
+                    _validate_remote(host, 443)
+                with self.assertRaises(ValueError):
+                    ovpn_to_endpoint(self._cfg(host), tag="x")
+
+    def test_public_literal_is_pinned_and_allowed(self) -> None:
+        self.assertEqual(("8.8.8.8", 443), _validate_remote("8.8.8.8", 443))
+        self.assertEqual(("203.0.113.1", 443),
+                         _validate_remote("203.0.113.1", 443))
+
+
+class _TrickleSocks5Server:
+    """SOCKS5 handshake that then sends its CONNECT reply one byte at a time."""
+
+    def __init__(self, interval: float = 0.3) -> None:
+        self.interval = interval
+        self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._listener.bind(("127.0.0.1", 0))
+        self._listener.listen(4)
+        self._listener.settimeout(5)
+        self.port = self._listener.getsockname()[1]
+        self._stop = threading.Event()
+
+    def start(self) -> None:
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        try:
+            self._listener.close()
+        except OSError:
+            pass
+
+    def _serve(self) -> None:
+        try:
+            conn, _ = self._listener.accept()
+        except OSError:
+            return
+        try:
+            conn.settimeout(5)
+            head = conn.recv(2)
+            if len(head) < 2:
+                return
+            conn.recv(head[1])
+            conn.sendall(b"\x05\x00")
+            conn.recv(16)
+            for byte in b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00":
+                if self._stop.is_set():
+                    break
+                conn.sendall(bytes([byte]))
+                time.sleep(self.interval)
+        except OSError:
+            pass
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+
+class ResolverTimeoutTests(unittest.TestCase):
+    """R2-5-06: getaddrinfo has no timeout of its own."""
+
+    def test_slow_lookup_is_abandoned_at_the_timeout(self) -> None:
+        def slow(*_args, **_kwargs):
+            time.sleep(1.0)
+            return []
+
+        started = time.monotonic()
+        with mock.patch("vpngate_to_singbox.socket.getaddrinfo", side_effect=slow):
+            with self.assertRaises(TimeoutError):
+                _resolve_with_timeout("slow.example", timeout=0.15)
+        self.assertLess(time.monotonic() - started, 0.8)
+
+    def test_deadline_shrinks_the_lookup_budget(self) -> None:
+        def slow(*_args, **_kwargs):
+            time.sleep(1.0)
+            return []
+
+        started = time.monotonic()
+        with mock.patch("vpngate_to_singbox.socket.getaddrinfo", side_effect=slow):
+            with self.assertRaises(TimeoutError):
+                _resolve_with_timeout(
+                    "slow.example", timeout=3.0,
+                    deadline=time.monotonic() + 0.1)
+        self.assertLess(time.monotonic() - started, 0.8)
+
+    def test_literal_host_needs_no_lookup(self) -> None:
+        with mock.patch("vpngate_to_singbox.socket.getaddrinfo") as resolver:
+            self.assertEqual(["8.8.8.8"], _resolve_with_timeout("8.8.8.8"))
+        resolver.assert_not_called()
+
+
+class EndpointPinTests(unittest.TestCase):
+    def test_domain_endpoint_is_denied_at_every_layer(self) -> None:
+        endpoint = {"server": "evil.example", "server_port": 443}
+        self.assertFalse(_endpoint_remotes_allowed(endpoint))
+        self.assertFalse(_endpoint_remotes_allowed(
+            endpoint, deadline=time.monotonic() + 1))
+
+    def test_expired_deadline_denies_before_validation(self) -> None:
+        endpoint = {"server": "8.8.8.8", "server_port": 443}
+        self.assertFalse(_endpoint_remotes_allowed(
+            endpoint, deadline=time.monotonic() - 1))
+
+
+class DeadlineTests(unittest.TestCase):
+    """P1-5: one absolute deadline per read, not one per recv()."""
+
+    def test_recv_exact_deadline_bounds_a_trickle(self) -> None:
+        client, server = socket.socketpair()
+        stop = threading.Event()
+
+        def drip() -> None:
+            for _ in range(10):
+                if stop.is_set():
+                    break
+                try:
+                    server.send(b"x")
+                except OSError:
+                    break
+                time.sleep(0.3)
+
+        threading.Thread(target=drip, daemon=True).start()
+        started = time.monotonic()
+        try:
+            with self.assertRaises(OSError):
+                _recv_exact(client, 10, deadline=time.monotonic() + 0.5)
+        finally:
+            stop.set()
+            client.close()
+            server.close()
+        self.assertLess(time.monotonic() - started, 1.5)
+
+    def test_socks5_get_text_returns_none_on_a_slow_drip(self) -> None:
+        server = _TrickleSocks5Server()
+        server.start()
+        started = time.monotonic()
+        try:
+            got = _socks5_get_text("127.0.0.1", server.port, timeout=0.5)
+        finally:
+            server.stop()
+        self.assertIsNone(got)
+        self.assertLess(time.monotonic() - started, 1.5)
+
+
+class MeasureGateTests(unittest.TestCase):
+    def test_measure_returns_none_when_the_gate_times_out(self) -> None:
+        endpoint = ovpn_to_endpoint(TCP_OVPN, tag="gate-timeout")
+        gate = mock.Mock()
+        gate.acquire.return_value = False
+        with mock.patch("vpngate_to_singbox._DIAL_GATE", gate), \
+             mock.patch("vpngate_to_singbox.subprocess.Popen") as popen:
+            self.assertIsNone(measure_real_latency(endpoint, timeout=5))
+            self.assertEqual((None, None), measure_exit_ip(endpoint, timeout=5))
+        popen.assert_not_called()
+        gate.release.assert_not_called()
+
+    def test_expired_deadline_returns_before_acquiring_the_gate(self) -> None:
+        import vpngate_to_singbox as mod
+
+        endpoint = ovpn_to_endpoint(TCP_OVPN, tag="deadline-expired")
+        gate = mock.Mock()
+        with mock.patch.object(mod, "_DIAL_GATE", gate):
+            self.assertIsNone(mod.measure_real_latency(
+                endpoint, deadline=time.monotonic() - 1))
+            self.assertEqual((None, None), mod.measure_exit_ip(
+                endpoint, deadline=time.monotonic() - 1))
+            self.assertIsNone(mod.measure_resi_rotate(
+                "uuid", 40000, "/ws-resi",
+                deadline=time.monotonic() - 1))
+        gate.acquire.assert_not_called()
+
+    def test_resi_rotate_gate_uses_the_remaining_deadline(self) -> None:
+        import vpngate_to_singbox as mod
+
+        gate = mock.Mock()
+        gate.acquire.return_value = False
+        tmpdir = mock.Mock()
+        with mock.patch.object(mod, "_DIAL_GATE", gate), \
+             mock.patch.object(mod.tempfile, "TemporaryDirectory",
+                               return_value=tmpdir), \
+             mock.patch.object(mod, "_free_port", return_value=40123):
+            deadline = time.monotonic() + 4.0
+            self.assertIsNone(mod.measure_resi_rotate(
+                "uuid", 40000, "/ws-resi", timeout=20, deadline=deadline))
+        timeout = gate.acquire.call_args.kwargs["timeout"]
+        self.assertGreater(timeout, 3.0)
+        self.assertLessEqual(timeout, 4.0)
+        tmpdir.cleanup.assert_called_once()
+
+    def test_temporary_directory_failure_releases_the_gate(self) -> None:
+        import vpngate_to_singbox as mod
+
+        endpoint = ovpn_to_endpoint(TCP_OVPN, tag="tmp-failure")
+        before = mod._DIAL_GATE._value
+        with mock.patch.object(mod.tempfile, "TemporaryDirectory",
+                               side_effect=OSError("no tmp")):
+            with self.assertRaises(OSError):
+                mod.measure_real_latency(endpoint, timeout=1)
+            with self.assertRaises(OSError):
+                mod.measure_exit_ip(endpoint, timeout=1)
+        self.assertEqual(before, mod._DIAL_GATE._value)
+
+
+class TemplateErrorTests(unittest.TestCase):
+    def test_attribute_error_becomes_value_error(self) -> None:
+        with self.assertRaises(ValueError):
+            render_resi_username("u", "{session}{user.name}", 60, "s")
+
+    def test_allowed_placeholders_render(self) -> None:
+        self.assertEqual("u-s-60",
+                         render_resi_username("u", "{user}-{session}-{ttl}",
+                                              60, "s"))
+
+    def test_non_string_inputs_do_not_leak_attribute_error(self) -> None:
+        self.assertEqual("123", render_resi_username(123, None, 0))
+        self.assertEqual("u", render_resi_username("u", 123, 60))
+        self.assertEqual("u-s-60",
+                         render_resi_username("u", "{user}-{session}-{ttl}",
+                                              "60", "s"))
+
+    def test_invalid_ttl_becomes_value_error(self) -> None:
+        with self.assertRaises(ValueError):
+            render_resi_username("u", "{session}", "not-a-number")
+        with self.assertRaises(ValueError):
+            render_resi_username("u", "{session}", True)
+
+    def test_unstringable_template_becomes_value_error(self) -> None:
+        class Bad:
+            def __str__(self):
+                raise RuntimeError("nope")
+
+        with self.assertRaises(ValueError):
+            render_resi_username("u", Bad(), 60)
+
+
+class TagUniquenessTests(unittest.TestCase):
+    @staticmethod
+    def _node(tag: str, host: str) -> dict:
+        return {"endpoint": ovpn_to_endpoint(
+            TCP_OVPN.replace("203.0.113.1", host), tag=tag)}
+
+    def test_duplicate_tags_are_renamed(self) -> None:
+        nodes = [self._node("x", "203.0.113.1"),
+                 self._node("x", "203.0.113.2")]
+        endpoints = nodes_to_endpoints(nodes)
+        tags = [ep["tag"] for ep in endpoints]
+        self.assertEqual(len(tags), len(set(tags)))
+        self.assertEqual("x", tags[0])
+
+    def test_explicit_tags_are_reserved_before_untagged_allocation(self) -> None:
+        nodes = [self._node("", "203.0.113.1"),
+                 self._node("vpngate-0", "203.0.113.2")]
+        tags = [ep["tag"] for ep in nodes_to_endpoints(nodes)]
+
+        # The untagged first node must not steal the later stable tag.
+        self.assertEqual(["vpngate-1", "vpngate-0"], tags)
+
+    def test_reserved_tags_are_renamed(self) -> None:
+        nodes = [self._node("auto", "203.0.113.1"),
+                 self._node("direct", "203.0.113.2"),
+                 self._node("vless-chain", "203.0.113.3"),
+                 self._node("proxy", "203.0.113.4")]
+        tags = [ep["tag"] for ep in nodes_to_endpoints(nodes)]
+        self.assertEqual(len(tags), len(set(tags)))
+        for tag in tags:
+            self.assertNotIn(tag, {"auto", "direct", "proxy"})
+            self.assertFalse(tag.startswith("vless-"))
+
+    def test_reserved_prefix_falls_back(self) -> None:
+        node = self._node("", "203.0.113.1")
+        tags = [ep["tag"] for ep in nodes_to_endpoints([node],
+                                                       tag_prefix="vless")]
+        self.assertEqual(["vpngate-0"], tags)
+
+
+class SnapshotLimitTests(unittest.TestCase):
+    def test_oversized_snapshot_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            snapshot_to_nodes("x" * (MAX_SNAPSHOT_BYTES + 1), probe=False)
+
+    def test_too_many_rows_are_rejected_before_splitlines(self) -> None:
+        with self.assertRaises(ValueError):
+            snapshot_to_nodes("x\n" * 5001, probe=False)
+
+    def test_limit_is_an_output_cap_not_a_parse_window(self) -> None:
+        rows = [
+            _snapshot_row(f"vpn-{i}", f"203.0.113.{100 + i}", 1000 + i,
+                          _b64(TCP_OVPN.replace("203.0.113.1",
+                                                f"203.0.113.{100 + i}")))
+            for i in range(10)
+        ]
+        csv_text = CSV_HEADER + "\n" + "\n".join(rows) + "\n"
+
+        with mock.patch("vpngate_to_singbox.ovpn_to_endpoint",
+                        wraps=ovpn_to_endpoint) as parser:
+            nodes = snapshot_to_nodes(csv_text, limit=2, probe=False)
+
+        self.assertEqual(2, len(nodes))
+        # Every row is decoded; limit only trims the ranked output.
+        self.assertEqual(10, parser.call_count)
+        self.assertEqual(["203.0.113.109", "203.0.113.108"],
+                         [n["server"] for n in nodes])
+
+    def test_limit_two_returns_speed_top_two(self) -> None:
+        speeds = [1, 2, 900, 800]
+        rows = [
+            _snapshot_row(f"vpn-{i}", f"203.0.113.{100 + i}", speed,
+                          _b64(TCP_OVPN.replace("203.0.113.1",
+                                                f"203.0.113.{100 + i}")))
+            for i, speed in enumerate(speeds)
+        ]
+        csv_text = CSV_HEADER + "\n" + "\n".join(rows) + "\n"
+
+        nodes = snapshot_to_nodes(csv_text, limit=2, probe=False)
+
+        self.assertEqual([900, 800], [n["speed"] for n in nodes])
+
+    def test_probe_searches_the_full_ranked_pool(self) -> None:
+        rows = [
+            _snapshot_row(f"vpn-{i}", f"203.0.113.{100 + i}", 1000 - i,
+                          _b64(TCP_OVPN.replace("203.0.113.1",
+                                                f"203.0.113.{100 + i}")))
+            for i in range(20)
+        ]
+        csv_text = CSV_HEADER + "\n" + "\n".join(rows) + "\n"
+
+        def probe(host: str, port: int) -> int:
+            return 0 if int(host.rsplit(".", 1)[1]) < 108 else 55
+
+        nodes = snapshot_to_nodes(
+            csv_text, limit=1, probe=True, probe_pool=0, probe_fn=probe)
+
+        self.assertEqual(1, len(nodes))
+        self.assertGreaterEqual(int(nodes[0]["server"].rsplit(".", 1)[1]), 108)
+
+    def test_eight_mib_snapshot_is_rejected_quickly(self) -> None:
+        # 4999 non-empty rows just under the 8 MiB byte cap: line count passes,
+        # so this exercises the full split/CSV path rather than the byte gate.
+        csv_text = ("x" * 1600 + "\n") * 4999
+        self.assertLessEqual(len(csv_text.encode("utf-8")), MAX_SNAPSHOT_BYTES)
+        started = time.monotonic()
+        with self.assertRaises(ValueError):
+            snapshot_to_nodes(csv_text, probe=False)
+        self.assertLess(time.monotonic() - started, 5.0)
+
+    def test_splitlines_separators_cannot_bypass_the_row_cap(self) -> None:
+        for separator in ("\n", "\r", "\r\n", "\v", "\f", "\x1c", "\x1d",
+                          "\x1e", "\x85", "\u2028", "\u2029"):
+            with self.subTest(separator=repr(separator)):
+                with self.assertRaises(ValueError):
+                    _check_snapshot_limits("x" + separator * (MAX_SNAPSHOT_ROWS + 1))
+        _check_snapshot_limits("x\u2028" * MAX_SNAPSHOT_ROWS)
+
+    def test_failed_rows_consume_the_row_budget(self) -> None:
+        domain_config = TCP_OVPN.replace(
+            "remote 203.0.113.1 443 tcp", "remote evil.example 443 tcp")
+        good = TCP_OVPN.replace("203.0.113.1", "203.0.113.200")
+        rows = [
+            _snapshot_row("vpn-bad1", "203.0.113.201", 100, _b64(domain_config)),
+            _snapshot_row("vpn-bad2", "203.0.113.202", 100, _b64(domain_config)),
+            _snapshot_row("vpn-good", "203.0.113.200", 900, _b64(good)),
+        ]
+        csv_text = CSV_HEADER + "\n" + "\n".join(rows) + "\n"
+
+        # Two failed rows consume limit=2, so the good third row is never seen.
+        with self.assertRaises(ValueError):
+            list(_iter_tcp_candidates(csv_text, limit=2))
+        self.assertEqual(1, len(list(_iter_tcp_candidates(csv_text, limit=3))))
+
+
+class CliOutputTests(unittest.TestCase):
+    def test_cli_output_is_owner_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = os.path.join(tmpdir, "out.json")
+            rc = main(["--input", str(FIXTURE_DIR / "vpngate_tcp_sample.ovpn"),
+                       "--output", output])
+            self.assertEqual(0, rc)
+            self.assertTrue(os.path.exists(output))
+            if os.name != "nt":
+                self.assertEqual(0o600, stat.S_IMODE(os.stat(output).st_mode))
 
 
 if __name__ == "__main__":

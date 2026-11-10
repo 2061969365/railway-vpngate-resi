@@ -22,6 +22,9 @@ const (
 	DefaultTimeoutMS = 8000
 	// DefaultConcurrency bounds the fan-out of Clash delay probes.
 	DefaultConcurrency = 8
+	// MaxConcurrency is the hard cap for PROBE_CONCURRENCY. A typo such as
+	// 1000000000 would otherwise make make(chan struct{}, n) allocate ~1GB.
+	MaxConcurrency = 64
 )
 
 // Config is the complete sidecar configuration.
@@ -57,8 +60,18 @@ func FromGetter(getenv func(string) string) Config {
 	cfg.ClashURL = strings.TrimRight(cfg.ClashURL, "/")
 
 	cfg.DefaultTimeoutMS = positiveInt(getenv("PROBE_DEFAULT_TIMEOUT_MS"), DefaultTimeoutMS)
-	cfg.Concurrency = positiveInt(getenv("PROBE_CONCURRENCY"), DefaultConcurrency)
+	cfg.Concurrency = clampInt(positiveInt(getenv("PROBE_CONCURRENCY"), DefaultConcurrency), 1, MaxConcurrency)
 	return cfg
+}
+
+func clampInt(value, minimum, maximum int) int {
+	if value < minimum {
+		return minimum
+	}
+	if value > maximum {
+		return maximum
+	}
+	return value
 }
 
 func positiveInt(raw string, fallback int) int {

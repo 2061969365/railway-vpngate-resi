@@ -175,17 +175,20 @@ func startAdmin(t *testing.T) (*httptest.Server, *[]adminRecord, *sync.Mutex) {
 
 func testConfig(admin, node, chain, uuid string) Config {
 	return Config{
-		Listen:        "127.0.0.1:0",
-		AdminURL:      admin,
-		NodeAddr:      node,
-		ChainAddr:     chain,
-		MetricsListen: "127.0.0.1:0",
-		VLESSUUID:     uuid,
-		DirectPath:    DefaultDirectPath,
-		ChainPath:     DefaultChainPath,
-		ResiPath:      DefaultResiPath,
-		IdleTimeout:   5 * time.Second,
-		DialTimeout:   2 * time.Second,
+		Listen:            "127.0.0.1:13000",
+		AdminURL:          admin,
+		NodeAddr:          node,
+		ChainAddr:         chain,
+		MetricsListen:     "127.0.0.1:39002",
+		VLESSUUID:         uuid,
+		DirectPath:        DefaultDirectPath,
+		ChainPath:         DefaultChainPath,
+		ResiPath:          DefaultResiPath,
+		IdleTimeout:       5 * time.Second,
+		DialTimeout:       2 * time.Second,
+		ReadHeaderTimeout: 10 * time.Second,
+		MaxTunnels:        DefaultMaxTunnels,
+		MaxHeaderBytes:    DefaultMaxHeaderBytes,
 	}
 }
 
@@ -239,6 +242,23 @@ func finishTunnel(t *testing.T, conn net.Conn) []byte {
 	}
 	_ = conn.Close()
 	return data
+}
+
+func readUntil(t *testing.T, conn net.Conn, needle string) string {
+	t.Helper()
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	var builder strings.Builder
+	buffer := make([]byte, 4096)
+	for !strings.Contains(builder.String(), needle) {
+		read, err := conn.Read(buffer)
+		if read > 0 {
+			builder.Write(buffer[:read])
+		}
+		if err != nil {
+			break
+		}
+	}
+	return builder.String()
 }
 
 func waitFor(t *testing.T, description string, condition func() bool) {
@@ -455,16 +475,12 @@ func TestResiIsRawToAdminAndNotCounted(t *testing.T) {
 		t.Fatalf("dial edge: %v", err)
 	}
 	defer conn.Close()
-	request := "GET /ws-resi?x=1 HTTP/1.1\r\nHost: edge.test\r\nConnection: close\r\n\r\n"
+	request := "GET /ws-resi?x=1 HTTP/1.1\r\nHost: edge.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"
 	if _, err := io.WriteString(conn, request); err != nil {
 		t.Fatalf("write resi: %v", err)
 	}
-	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	response, err := io.ReadAll(conn)
-	if err != nil {
-		t.Fatalf("read resi: %v", err)
-	}
-	if !strings.Contains(string(response), "admin:GET:/ws-resi?x=1:") {
+	response := readUntil(t, conn, "admin:GET:/ws-resi?x=1:")
+	if !strings.Contains(response, "admin:GET:/ws-resi?x=1:") {
 		t.Fatalf("resi response = %q", response)
 	}
 	mutex.Lock()
@@ -571,13 +587,10 @@ func TestRawDialFailureIs502(t *testing.T) {
 	admin, _, _ := startAdmin(t)
 	proxy, server := newTestProxy(t, testConfig(admin.URL, deadAddress, chain.addr(), "uuid"))
 
-	response, err := http.Get(server.URL + "/ws-node")
-	if err != nil {
-		t.Fatalf("GET node: %v", err)
-	}
-	response.Body.Close()
-	if response.StatusCode != http.StatusBadGateway {
-		t.Fatalf("status = %d, want 502", response.StatusCode)
+	conn := openTunnel(t, server, "/ws-node", "")
+	response := string(finishTunnel(t, conn))
+	if !strings.Contains(response, "502 Bad Gateway") {
+		t.Fatalf("response = %q, want 502", response)
 	}
 	snapshot := proxy.Metrics().Snapshot()
 	if snapshot.Connections != 0 || snapshot.BytesUp != 0 || snapshot.BytesDown != 0 || snapshot.Active != 0 {
@@ -705,4 +718,297 @@ func TestCopyBufferPoolProvidesFullBuffers(t *testing.T) {
 		t.Fatalf("pooled buffer len = %d, want %d", len(buffer), copyBufferSize)
 	}
 	copyBufferPool.Put(buffer)
+}
+
+func TestTunnelLimitRejectsWith503(t *testing.T) {
+	node := startEcho(t)
+	chain := startEcho(t)
+	admin, _, _ := startAdmin(t)
+	cfg := testConfig(admin.URL, node.addr(), chain.addr(), "uuid")
+	cfg.MaxTunnels = 1
+	proxy, server := newTestProxy(t, cfg)
+
+	first := openTunnel(t, server, "/ws-node", "")
+	waitFor(t, "first tunnel active", func() bool {
+		return proxy.Metrics().Snapshot().Tunnels == 1
+	})
+
+	conn, err := net.DialTimeout("tcp", serverHost(t, server), 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial edge: %v", err)
+	}
+	if _, err := io.WriteString(conn, "GET /ws-node HTTP/1.1\r\nHost: edge.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"); err != nil {
+		t.Fatalf("write second tunnel: %v", err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	response, err := io.ReadAll(conn)
+	_ = conn.Close()
+	if err != nil {
+		t.Fatalf("read 503 response: %v", err)
+	}
+	if !strings.Contains(string(response), "503 Service Unavailable") {
+		t.Fatalf("response = %q, want 503", response)
+	}
+	if !strings.Contains(string(response), "Connection: close") {
+		t.Fatalf("response = %q, want Connection: close", response)
+	}
+	snapshot := proxy.Metrics().Snapshot()
+	if snapshot.Rejected < 1 || snapshot.MaxTunnels != 1 {
+		t.Fatalf("metrics after rejection = %+v", snapshot)
+	}
+
+	_ = first.Close()
+	waitFor(t, "tunnel slot released", func() bool {
+		return proxy.Metrics().Snapshot().Tunnels == 0
+	})
+
+	third := openTunnel(t, server, "/ws-node", "AFTER-REJECT")
+	thirdData := finishTunnel(t, third)
+	if !strings.Contains(string(thirdData), "AFTER-REJECT") {
+		t.Fatalf("third tunnel did not pass after the slot was released: %q", thirdData)
+	}
+}
+
+func TestCloseTunnelsClosesActiveTunnel(t *testing.T) {
+	node := startSink(t)
+	chain := startEcho(t)
+	admin, _, _ := startAdmin(t)
+	proxy, server := newTestProxy(t, testConfig(admin.URL, node.addr(), chain.addr(), "uuid"))
+
+	conn := openTunnel(t, server, "/ws-node", "")
+	waitFor(t, "tunnel tracked", func() bool {
+		proxy.tunnelsMu.Lock()
+		defer proxy.tunnelsMu.Unlock()
+		return len(proxy.tunnels) == 1
+	})
+	if closed := proxy.CloseTunnels(); closed != 1 {
+		t.Fatalf("CloseTunnels() = %d, want 1", closed)
+	}
+	waitFor(t, "tunnel released", func() bool {
+		return proxy.Metrics().Snapshot().Tunnels == 0
+	})
+	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := conn.Read(make([]byte, 1)); err == nil {
+		t.Fatal("CloseTunnels left the client connection open")
+	}
+}
+
+func TestNewRejectsRemoteAdminUnlessAllowed(t *testing.T) {
+	cfg := testConfig("http://203.0.113.5:3001", "127.0.0.1:1", "127.0.0.1:2", "uuid")
+	if _, err := New(cfg, log.New(io.Discard, "", 0)); err == nil {
+		t.Fatal("New accepted a remote EDGE_ADMIN without the escape")
+	}
+	cfg.AllowRemoteAdmin = true
+	if _, err := New(cfg, log.New(io.Discard, "", 0)); err != nil {
+		t.Fatalf("EDGE_ADMIN_ALLOW_REMOTE escape was ignored: %v", err)
+	}
+}
+
+func TestNewAcceptsLocalhostAdmin(t *testing.T) {
+	if _, err := New(testConfig("http://localhost:3001", "127.0.0.1:1", "127.0.0.1:2", "uuid"),
+		log.New(io.Discard, "", 0)); err != nil {
+		t.Fatalf("New(localhost admin) = %v", err)
+	}
+}
+
+func TestNewRejectsHTTPSAdmin(t *testing.T) {
+	_, err := New(testConfig("https://user:secret@127.0.0.1:3001", "127.0.0.1:1", "127.0.0.1:2", "uuid"), log.New(io.Discard, "", 0))
+	if err == nil {
+		t.Fatal("New accepted an https EDGE_ADMIN although the raw tunnel is plaintext")
+	}
+	if !strings.Contains(err.Error(), "http") {
+		t.Fatalf("error = %q, want a hint that http is required", err)
+	}
+	if strings.Contains(err.Error(), "secret") {
+		t.Fatalf("error leaked the admin password: %q", err)
+	}
+}
+
+func TestRawPathRequiresWebSocketUpgrade(t *testing.T) {
+	node := startEcho(t)
+	chain := startEcho(t)
+	admin, _, _ := startAdmin(t)
+	proxy, server := newTestProxy(t, testConfig(admin.URL, node.addr(), chain.addr(), "uuid"))
+
+	requests := []string{
+		"GET /ws-node HTTP/1.1\r\nHost: edge.test\r\nConnection: close\r\n\r\n",
+		"GET /ws-node HTTP/1.1\r\nHost: edge.test\r\nConnection: Upgrade\r\n\r\n",
+		"GET /ws-node HTTP/1.1\r\nHost: edge.test\r\nUpgrade: websocket\r\n\r\n",
+	}
+	for _, request := range requests {
+		conn, err := net.DialTimeout("tcp", serverHost(t, server), 2*time.Second)
+		if err != nil {
+			t.Fatalf("dial edge: %v", err)
+		}
+		if _, err := io.WriteString(conn, request); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		response, _ := io.ReadAll(conn)
+		_ = conn.Close()
+		if !strings.Contains(string(response), "400 Bad Request") {
+			t.Fatalf("request %q -> %q, want 400", request, response)
+		}
+	}
+	if snapshot := proxy.Metrics().Snapshot(); snapshot.Tunnels != 0 || snapshot.Connections != 0 {
+		t.Fatalf("rejected requests must not open a tunnel: %+v", snapshot)
+	}
+}
+
+func TestRawReplayStripsHopByHopHeaders(t *testing.T) {
+	node := startEcho(t)
+	chain := startEcho(t)
+	admin, _, _ := startAdmin(t)
+	_, server := newTestProxy(t, testConfig(admin.URL, node.addr(), chain.addr(), "uuid"))
+
+	conn, err := net.DialTimeout("tcp", serverHost(t, server), 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial edge: %v", err)
+	}
+	request := "GET /ws-node HTTP/1.1\r\nHost: edge.test\r\n" +
+		"Connection: Upgrade\r\nUpgrade: websocket\r\n" +
+		"Proxy-Connection: keep-alive\r\nKeep-Alive: timeout=9\r\n" +
+		"TE: trailers\r\nTrailer: X-Checksum\r\nX-Keep: yes\r\n\r\nRAW"
+	if _, err := io.WriteString(conn, request); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	waitFor(t, "replayed request", func() bool {
+		return strings.Contains(string(node.bytesReceived()), "RAW")
+	})
+	_ = conn.Close()
+	received := string(node.bytesReceived())
+	for _, banned := range []string{"Proxy-Connection", "Keep-Alive", "TE:", "Trailer:"} {
+		if strings.Contains(received, banned) {
+			t.Fatalf("hop-by-hop header %q reached the backend:\n%s", banned, received)
+		}
+	}
+	if !strings.Contains(received, "Upgrade: websocket") || !strings.Contains(received, "X-Keep: yes") {
+		t.Fatalf("upgrade/end-to-end headers were lost:\n%s", received)
+	}
+}
+
+func startRealEdge(t *testing.T, cfg Config) (*Proxy, string) {
+	t.Helper()
+	admin, _, _ := startAdmin(t)
+	cfg.AdminURL = admin.URL
+	proxy, err := New(cfg, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	server := &http.Server{
+		Handler:           proxy,
+		ReadHeaderTimeout: cfg.ReadHeaderTimeout,
+		MaxHeaderBytes:    cfg.MaxHeaderBytes,
+	}
+	go func() { _ = server.Serve(proxy.WrapListener(listener)) }()
+	t.Cleanup(func() { _ = server.Close() })
+	return proxy, listener.Addr().String()
+}
+
+func TestMaxConnsRejectsExtraAndHealthzRecovers(t *testing.T) {
+	cfg := testConfig("http://127.0.0.1:1", "127.0.0.1:1", "127.0.0.1:2", "uuid")
+	cfg.MaxConns = 4
+	proxy, address := startRealEdge(t, cfg)
+
+	conns := make([]net.Conn, 0, cfg.MaxConns)
+	for index := 0; index < cfg.MaxConns; index++ {
+		conn, err := net.DialTimeout("tcp", address, 2*time.Second)
+		if err != nil {
+			t.Fatalf("dial idle conn %d: %v", index, err)
+		}
+		conns = append(conns, conn)
+	}
+	waitFor(t, "max conns active", func() bool {
+		return proxy.Metrics().Snapshot().ActiveConns == int64(cfg.MaxConns)
+	})
+
+	extra, err := net.DialTimeout("tcp", address, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial extra: %v", err)
+	}
+	_ = extra.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buffer := make([]byte, 1)
+	if _, err := extra.Read(buffer); err == nil {
+		t.Fatal("over-limit connection was not closed")
+	}
+	_ = extra.Close()
+	if snapshot := proxy.Metrics().Snapshot(); snapshot.ConnRejected < 1 {
+		t.Fatalf("conn rejected metric = %+v", snapshot)
+	}
+
+	for _, conn := range conns {
+		_ = conn.Close()
+	}
+	waitFor(t, "conn slots released", func() bool {
+		return proxy.Metrics().Snapshot().ActiveConns == 0
+	})
+	response, err := http.Get("http://" + address + "/healthz")
+	if err != nil {
+		t.Fatalf("healthz: %v", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("healthz status = %d", response.StatusCode)
+	}
+}
+
+func TestServerReadHeaderTimeoutClosesSlowHeaders(t *testing.T) {
+	cfg := testConfig("http://127.0.0.1:1", "127.0.0.1:1", "127.0.0.1:2", "uuid")
+	cfg.ReadHeaderTimeout = 200 * time.Millisecond
+	cfg.MaxHeaderBytes = 8 << 10
+	_, address := startRealEdge(t, cfg)
+
+	conn, err := net.DialTimeout("tcp", address, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	if _, err := io.WriteString(conn, "GET /healthz HTTP/1.1\r\nHost: edge.test\r\n"); err != nil {
+		t.Fatalf("write partial headers: %v", err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	start := time.Now()
+	response, _ := io.ReadAll(conn)
+	elapsed := time.Since(start)
+	if elapsed > 1500*time.Millisecond {
+		t.Fatalf("slow headers were not bounded: %s", elapsed)
+	}
+	if len(response) > 0 && !strings.Contains(string(response), "408") &&
+		!strings.Contains(string(response), "400") {
+		t.Fatalf("unexpected slow-header response = %q", response)
+	}
+}
+
+func TestServerMaxHeaderBytesRejectsOversizedHeaders(t *testing.T) {
+	cfg := testConfig("http://127.0.0.1:1", "127.0.0.1:1", "127.0.0.1:2", "uuid")
+	cfg.ReadHeaderTimeout = 2 * time.Second
+	cfg.MaxHeaderBytes = 8 << 10
+	_, address := startRealEdge(t, cfg)
+
+	conn, err := net.DialTimeout("tcp", address, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	request := "GET /healthz HTTP/1.1\r\nHost: edge.test\r\nX-Big: " +
+		strings.Repeat("a", 16<<10) + "\r\n\r\n"
+	if _, err := io.WriteString(conn, request); err != nil {
+		t.Fatalf("write oversized headers: %v", err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	response, _ := io.ReadAll(conn)
+	if !strings.Contains(string(response), "431") && !strings.Contains(string(response), "400") {
+		t.Fatalf("oversized header response = %q", response)
+	}
+}
+
+func TestRedactedAdminURL(t *testing.T) {
+	got := RedactedAdminURL("http://user:secret@127.0.0.1:3001")
+	if strings.Contains(got, "secret") || !strings.Contains(got, "127.0.0.1:3001") {
+		t.Fatalf("RedactedAdminURL = %q", got)
+	}
 }

@@ -1,0 +1,1408 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title id="pageTitle">三体 · 地球往事 深度解读站</title>
+<meta name="description" content="三体第一部《三体》深度解读 - 红岸基地、智子锁死、三体游戏、古筝行动与叶文洁的疯狂年代">
+<style>
+:root{
+  --bg:#0a0508;
+  --line:rgba(255,255,255,0.08);
+  --red:#ff5a5f;
+  --cold:#7eb8da;
+  --gold:#e8d5a3;
+  --text:#f2eaec;
+  --muted:#b3a3ab;
+  --dim:#9a8d96;
+  --radius:18px;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html{scroll-behavior:smooth}
+.visually-hidden{position:absolute!important;width:1px!important;height:1px!important;padding:0!important;margin:-1px!important;overflow:hidden!important;clip:rect(0 0 0 0)!important;white-space:nowrap!important;border:0!important}
+.skip-link{position:absolute;left:-9999px;top:8px;z-index:100;padding:8px 14px;background:var(--red);color:#fff;border-radius:999px;font-size:12px}
+.skip-link:focus{left:12px}
+a:focus-visible,button:focus-visible{outline:2px solid var(--red);outline-offset:2px}
+a:focus:not(:focus-visible),button:focus:not(:focus-visible){outline:none}
+body{
+  background:var(--bg);
+  color:var(--text);
+  font-family:"Noto Sans SC",system-ui,sans-serif;
+  overflow-x:hidden;
+  line-height:1.7;
+}
+a{color:inherit;text-decoration:none}
+/* stars bg */
+.stars{
+  position:fixed;inset:0;z-index:-3;
+  background:
+    radial-gradient(1px 1px at 12% 22%, #fff 100%, transparent),
+    radial-gradient(1px 1px at 34% 8%, #fff 100%, transparent),
+    radial-gradient(1.2px 1.2px at 56% 32%, #fff 100%, transparent),
+    radial-gradient(1px 1px at 78% 14%, #fff 100%, transparent),
+    radial-gradient(1px 1px at 88% 52%, #fff 100%, transparent),
+    radial-gradient(1px 1px at 18% 82%, #fff 100%, transparent),
+    radial-gradient(1px 1px at 62% 88%, #fff 100%, transparent),
+    radial-gradient(800px 800px at 50% -10%, rgba(255,90,95,0.10), transparent 70%),
+    radial-gradient(600px 600px at 92% 30%, rgba(126,184,218,0.07), transparent 60%),
+    linear-gradient(180deg, #0a0508 0%, #100810 50%, #0a0508 100%);
+  opacity:0.9;
+}
+.stars::after{
+  content:"";position:absolute;inset:0;
+  background:repeating-linear-gradient(0deg, transparent 0 2px, rgba(255,255,255,0.014) 2px 3px);
+  opacity:0.3;
+}
+/* nav */
+nav{
+  position:fixed;top:0;left:0;right:0;z-index:50;
+  display:flex;align-items:center;justify-content:space-between;
+  padding:14px 40px;
+  background:rgba(10,5,8,0.72);backdrop-filter:blur(16px) saturate(1.2);
+  border-bottom:1px solid var(--line);
+}
+.nav-left{display:flex;align-items:center;gap:14px}
+.logo{
+  width:36px;height:36px;border:1px solid rgba(255,90,95,0.35);border-radius:10px;
+  display:grid;place-items:center;
+  background:radial-gradient(circle at 30% 30%, #3a1420, #120a10);
+  font-family:"Noto Serif SC",serif;font-weight:900;font-size:15px;color:var(--red);
+}
+.nav-title{font-family:"Noto Serif SC",serif;font-weight:700;letter-spacing:0.08em;font-size:14px}
+.nav-title span{color:var(--red);font-weight:400;margin-left:6px;font-size:11px;letter-spacing:0.18em;opacity:0.9}
+.nav-links{display:flex;gap:24px;font-size:12.5px;letter-spacing:0.08em;color:var(--muted)}
+.nav-links a{position:relative;padding:4px 0;transition:color .2s}
+.nav-links a:hover{color:var(--text)}
+.nav-links a::after{content:"";position:absolute;left:0;bottom:-6px;width:0;height:1px;background:var(--red);transition:width .25s}
+.nav-links a:hover::after{width:100%}
+.nav-cta{
+  font-size:12px;letter-spacing:0.14em;padding:8px 16px;border:1px solid rgba(255,90,95,0.4);
+  border-radius:999px;color:var(--red);background:rgba(255,90,95,0.08);
+}
+.hamburger{display:none;width:36px;height:36px;border:1px solid var(--line);border-radius:10px;place-items:center;background:rgba(255,255,255,0.04);cursor:pointer;color:var(--muted)}
+.hamburger span,.hamburger span::before,.hamburger span::after{content:"";display:block;width:16px;height:1.5px;background:currentColor;border-radius:2px;transition:.2s}
+.hamburger span::before{transform:translateY(-5px)} .hamburger span::after{transform:translateY(3.5px)}
+#navToggle:checked + nav .hamburger span{background:transparent}
+#navToggle:checked + nav .hamburger span::before{transform:rotate(45deg)} #navToggle:checked + nav .hamburger span::after{transform:rotate(-45deg) translate(1px,-1px)}
+.mobile-menu{display:none;position:fixed;top:64px;left:12px;right:12px;z-index:49;background:rgba(16,8,14,0.96);backdrop-filter:blur(16px);border:1px solid var(--line);border-radius:16px;padding:12px;flex-direction:column;gap:6px}
+#navToggle:checked ~ .mobile-menu{display:flex}
+.mobile-menu a{padding:12px 14px;border-radius:10px;color:var(--muted);font-size:13px;letter-spacing:0.06em;border:1px solid transparent}
+.mobile-menu a:hover{background:rgba(255,255,255,0.04);color:var(--text);border-color:var(--line)}
+@media(max-width:980px){nav{padding:14px 16px}.nav-links,.nav-cta{display:none}.hamburger{display:grid}}
+/* hero */
+.hero{
+  min-height:100vh;
+  min-height:100svh;
+  display:grid;grid-template-columns:1fr 1fr;
+  align-items:center;
+  padding:110px 40px 60px;
+  gap:40px;
+  position:relative;
+  max-width:1440px;margin:0 auto;
+}
+@media(max-width:980px){.hero{grid-template-columns:1fr;padding:96px 20px 40px}}
+.eyebrow{
+  display:inline-flex;align-items:center;gap:10px;
+  font-size:11px;letter-spacing:0.22em;color:var(--red);
+  border:1px solid rgba(255,90,95,0.3);padding:6px 12px;border-radius:999px;
+  background:rgba(255,90,95,0.06);
+}
+.eyebrow i{width:6px;height:6px;border-radius:50%;background:var(--red);box-shadow:0 0 10px var(--red);display:inline-block;animation:pulse 1.8s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}
+.hero h1{
+  font-family:"Noto Serif SC",serif;
+  font-size:clamp(44px,7vw,84px);
+  line-height:1;letter-spacing:0.04em;font-weight:900;
+  margin:20px 0 8px;
+}
+.hero h1 em{
+  font-style:normal;
+  background:linear-gradient(100deg,#ff8a8d 10%,#ff5a5f 45%,#7eb8da 95%);
+  -webkit-background-clip:text;background-clip:text;color:transparent;
+}
+.hero h1 .sub{
+  display:block;font-size:12px;letter-spacing:0.46em;font-weight:400;color:var(--muted);
+  margin-top:14px;font-family:"Cinzel",serif;
+}
+.hero-desc{
+  color:var(--muted);font-size:15.5px;max-width:560px;line-height:1.9;font-weight:300;
+  margin-top:14px;
+}
+.hero-desc strong{color:var(--text);font-weight:500}
+.hero-actions{display:flex;gap:12px;margin-top:26px;flex-wrap:wrap}
+.btn-primary{
+  padding:13px 22px;background:linear-gradient(180deg,#ff8a8d,#e5484d);
+  color:#1c0507;border-radius:999px;font-size:13px;letter-spacing:0.12em;font-weight:700;
+  box-shadow:0 8px 24px rgba(229,72,77,0.28);transition:filter .2s,transform .2s;
+}
+.btn-primary:hover{filter:brightness(1.07);transform:translateY(-1px)}
+.btn-primary:active{transform:translateY(0);filter:brightness(0.98)}
+.btn-ghost{
+  padding:13px 22px;border:1px solid var(--line);border-radius:999px;
+  font-size:13px;letter-spacing:0.08em;color:var(--text);background:rgba(255,255,255,0.04);
+  backdrop-filter:blur(8px);
+}
+.hero-meta{display:flex;gap:14px;margin-top:28px;flex-wrap:wrap}
+.meta-card{
+  min-width:150px;padding:14px 16px;border:1px solid var(--line);border-radius:14px;
+  background:linear-gradient(180deg, rgba(255,255,255,0.05), rgba(255,255,255,0.02));
+  backdrop-filter:blur(10px);flex:1;
+}
+.meta-card label{font-size:10px;letter-spacing:0.18em;color:var(--dim);display:block;margin-bottom:4px}
+.meta-card b{font-size:12.5px;color:var(--cold);font-weight:500;line-height:1.5;display:block}
+/* sim panel */
+.sim-panel{
+  position:relative;height:600px;border:1px solid var(--line);border-radius:22px;
+  background:
+    radial-gradient(circle at 50% 45%, #1c0d16 0%, #0d060b 62%, #0a0508 100%);
+  overflow:hidden;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,0.05), 0 30px 60px rgba(0,0,0,0.45);
+}
+@media(max-width:980px){.sim-panel{height:420px}}
+.sim-panel canvas{display:block;width:100%;height:100%}
+.sim-hud{
+  position:absolute;top:14px;left:16px;right:16px;
+  display:flex;justify-content:space-between;pointer-events:none;
+  font-family:"JetBrains Mono",monospace;font-size:10px;letter-spacing:0.18em;color:var(--dim);
+}
+.sim-hud b{color:var(--red);font-weight:600}
+.era-badge{
+  position:absolute;left:16px;bottom:52px;
+  font-family:"JetBrains Mono",monospace;font-size:11px;letter-spacing:0.2em;
+  color:var(--gold);border:1px solid rgba(232,213,163,0.25);border-radius:999px;padding:5px 12px;
+  background:rgba(10,5,8,0.55);backdrop-filter:blur(6px);pointer-events:none;
+}
+.era-badge.chaos{color:var(--red);border-color:rgba(255,90,95,0.4)}
+.sim-btn{
+  position:absolute;right:14px;bottom:14px;
+  font-family:"JetBrains Mono",monospace;font-size:10.5px;letter-spacing:0.16em;
+  color:var(--text);border:1px solid var(--line);border-radius:999px;padding:8px 14px;
+  background:rgba(255,255,255,0.05);backdrop-filter:blur(8px);cursor:pointer;transition:.2s;
+}
+.sim-btn:hover{border-color:rgba(255,90,95,0.5);color:var(--red)}
+.float-tag{
+  position:absolute;font-family:"JetBrains Mono",monospace;font-size:9.5px;letter-spacing:0.16em;
+  color:var(--muted);border:1px solid var(--line);border-radius:999px;padding:5px 11px;
+  background:rgba(10,5,8,0.65);backdrop-filter:blur(8px);
+}
+.tag-1{top:64px;right:12px;max-width:70%;animation:floaty 7s ease-in-out infinite}
+.tag-2{bottom:110px;left:12px;max-width:70%;animation:floaty 9s ease-in-out infinite reverse}
+@keyframes floaty{0%,100%{transform:translateY(0)}50%{transform:translateY(-10px)}}
+@media(max-width:980px){.tag-1{right:8px}.tag-2{left:8px}}
+.divider{height:1px;background:linear-gradient(90deg,transparent,var(--line) 20%,var(--line) 80%,transparent);margin:0 40px}
+@media(max-width:980px){.divider{margin:0 20px}}
+/* sections */
+section{padding:84px 40px;max-width:1280px;margin:0 auto}
+#dual,#concepts,#insights{padding-top:28px}
+#reading{padding-top:20px}
+@media(max-width:980px){section{padding:60px 18px}}
+.section-head{
+  display:flex;justify-content:space-between;align-items:flex-end;gap:40px;margin-bottom:44px;flex-wrap:wrap;
+}
+.section-head h2{
+  font-family:"Noto Serif SC",serif;font-size:clamp(26px,3.4vw,40px);font-weight:900;line-height:1.25;margin-top:10px;
+}
+.section-head h2 em{font-style:normal;color:var(--red)}
+.section-head p{color:var(--muted);font-size:14px;max-width:480px;line-height:1.85}
+.kicker{font-family:"JetBrains Mono",monospace;font-size:11px;letter-spacing:0.24em;color:var(--red);opacity:0.9}
+.card{
+  border:1px solid var(--line);border-radius:var(--radius);
+  background:linear-gradient(180deg, rgba(255,255,255,0.035), rgba(255,255,255,0.01));
+  backdrop-filter:blur(10px);padding:28px;
+}
+.reveal{opacity:0;transform:translateY(20px);transition:opacity .7s cubic-bezier(.16,1,.3,1),transform .7s cubic-bezier(.16,1,.3,1)}
+.reveal.in{opacity:1;transform:none}
+@media (prefers-reduced-motion: reduce){
+  html{scroll-behavior:auto}
+  *,*::before,*::after{animation-duration:.001ms!important;animation-iteration-count:1!important;transition-duration:.001ms!important;scroll-behavior:auto!important}
+  .reveal{opacity:1;transform:none}
+}
+@media(max-width:640px){
+  nav{backdrop-filter:blur(8px) saturate(1.1)}
+  .card,.meta-card,.sim-panel,.mobile-menu,.era-badge,.float-tag{backdrop-filter:blur(6px)}
+}
+</style>
+<style>
+/* intro */
+.intro-grid{display:grid;grid-template-columns:1fr 0.9fr;gap:20px}
+@media(max-width:980px){.intro-grid{grid-template-columns:1fr}}
+.book-cover{display:flex;gap:20px;align-items:flex-start;flex-wrap:wrap}
+.cover-art{
+  width:120px;height:168px;border-radius:8px;flex-shrink:0;
+  background:
+    radial-gradient(circle at 30% 25%, rgba(255,90,95,0.55), transparent 42%),
+    radial-gradient(circle at 72% 68%, rgba(126,184,218,0.35), transparent 45%),
+    radial-gradient(circle at 52% 48%, rgba(232,213,163,0.22), transparent 38%),
+    linear-gradient(160deg,#1c1016,#0b0509);
+  border:1px solid var(--line);
+  position:relative;
+}
+.cover-art::after{
+  content:"三体";position:absolute;left:10px;top:12px;
+  font-family:"Noto Serif SC",serif;font-weight:900;font-size:26px;color:var(--text);letter-spacing:0.14em;
+  writing-mode:vertical-rl;text-orientation:upright;
+}
+.book-info h3{font-family:"Noto Serif SC",serif;font-size:19px;margin-bottom:8px}
+.book-info h3 span{display:block;font-family:"Cinzel",serif;font-size:9px;letter-spacing:0.2em;color:var(--dim);margin-bottom:6px}
+.book-info p{color:var(--muted);font-size:13.5px;line-height:1.85}
+.book-info strong{color:var(--text)}
+.specs{display:flex;gap:8px;margin-top:14px;flex-wrap:wrap}
+.spec{
+  font-size:11px;color:var(--muted);border:1px solid var(--line);border-radius:999px;padding:4px 11px;
+  background:rgba(255,255,255,0.03);
+}
+.toc{margin-top:18px;display:grid;gap:8px}
+.toc a{
+  font-size:13px;color:var(--muted);padding:10px 14px;border:1px solid var(--line);border-radius:12px;
+  transition:.2s;background:rgba(255,255,255,0.02);
+}
+.toc a b{color:var(--red);font-weight:500;margin-right:6px}
+.toc a:hover{border-color:rgba(255,90,95,0.4);color:var(--text)}
+.quote-card blockquote{
+  font-family:"Noto Serif SC",serif;font-size:17px;line-height:1.9;color:var(--text);
+}
+.quote-card blockquote span{color:var(--red)}
+.quote-card cite{display:block;margin-top:12px;font-style:normal;font-size:12px;color:var(--dim);letter-spacing:0.06em}
+/* dual timelines */
+.dual{display:grid;grid-template-columns:1fr auto 1fr;gap:20px;align-items:stretch}
+@media(max-width:1080px){.dual{grid-template-columns:1fr}}
+.dual-col{border:1px solid var(--line);border-radius:var(--radius);padding:26px;background:linear-gradient(180deg, rgba(255,255,255,0.035), rgba(255,255,255,0.01))}
+.dual-col label{font-family:"JetBrains Mono",monospace;font-size:10px;letter-spacing:0.24em;color:var(--cold)}
+.dual-col.warm label{color:var(--red)}
+.dual-col h3{font-family:"Noto Serif SC",serif;font-size:20px;margin:8px 0 6px}
+.dual-col>p{color:var(--muted);font-size:13px;line-height:1.85;margin-bottom:14px}
+.dual-list{list-style:none;display:grid;gap:9px}
+.dual-list li{
+  font-size:13px;color:var(--muted);padding-left:16px;position:relative;line-height:1.7;
+}
+.dual-list li::before{content:"";position:absolute;left:0;top:9px;width:6px;height:1.5px;background:var(--dim)}
+.dual-list li b{color:var(--text);font-weight:500}
+.dual-mid{
+  display:flex;align-items:center;justify-content:center;
+  writing-mode:vertical-rl;font-family:"Noto Serif SC",serif;font-weight:900;font-size:26px;
+  color:var(--red);letter-spacing:0.5em;border:1px dashed rgba(255,90,95,0.35);border-radius:var(--radius);
+  padding:24px 14px;background:rgba(255,90,95,0.05);
+}
+@media(max-width:1080px){.dual-mid{writing-mode:horizontal-tb;letter-spacing:0.3em;padding:12px}}
+.dual-note{margin-top:18px;border-left:2px solid var(--red);padding:4px 0 4px 18px;color:var(--muted);font-size:13.5px;line-height:1.9}
+.dual-note b{color:var(--text)}
+/* timeline */
+.timeline{display:grid;grid-template-columns:repeat(5,1fr);gap:14px}
+@media(max-width:1180px){.timeline{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:640px){.timeline{grid-template-columns:1fr}}
+.tl-item{border:1px solid var(--line);border-radius:var(--radius);padding:22px;background:linear-gradient(180deg, rgba(255,255,255,0.035), rgba(255,255,255,0.01));position:relative;display:flex;flex-direction:column}
+.tl-item::before{content:"";position:absolute;top:0;left:22px;right:22px;height:2px;border-radius:2px;background:linear-gradient(90deg,var(--red),transparent)}
+.tl-item label{font-family:"JetBrains Mono",monospace;font-size:9.5px;letter-spacing:0.18em;color:var(--red);opacity:0.9}
+.tl-item h3{font-family:"Noto Serif SC",serif;font-size:16.5px;margin:8px 0;line-height:1.4}
+.tl-item p{color:var(--muted);font-size:12.5px;line-height:1.8;flex:1}
+.tl-item ul{list-style:none;margin-top:10px;display:grid;gap:5px}
+.tl-item ul li{font-size:12px;color:var(--dim);padding-left:14px;position:relative}
+.tl-item ul li::before{content:"·";position:absolute;left:0;color:var(--red)}
+.tl-item .tag{margin-top:14px;font-size:11px;color:var(--gold);border:1px solid rgba(232,213,163,0.22);border-radius:999px;padding:4px 11px;align-self:flex-start;background:rgba(232,213,163,0.05)}
+/* concepts */
+.concept-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
+@media(max-width:1080px){.concept-grid{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:640px){.concept-grid{grid-template-columns:1fr}}
+.concept-card{border:1px solid var(--line);border-radius:var(--radius);padding:24px;background:linear-gradient(180deg, rgba(255,255,255,0.035), rgba(255,255,255,0.01));transition:border-color .25s, transform .25s}
+.concept-card:hover{border-color:rgba(255,90,95,0.4);transform:translateY(-3px)}
+.concept-card.hot{background:linear-gradient(160deg, rgba(255,90,95,0.10), rgba(255,90,95,0.02));border-color:rgba(255,90,95,0.28)}
+.concept-card.frosty{background:linear-gradient(160deg, rgba(126,184,218,0.09), rgba(126,184,218,0.01));border-color:rgba(126,184,218,0.25)}
+.concept-card .no{font-family:"JetBrains Mono",monospace;font-size:10px;letter-spacing:0.2em;color:var(--dim)}
+.concept-card h3{font-family:"Noto Serif SC",serif;font-size:17px;margin:8px 0 4px}
+.concept-card h3 em{font-style:normal;font-family:"JetBrains Mono",monospace;font-size:9.5px;letter-spacing:0.16em;color:var(--dim);display:block;margin-top:3px}
+.concept-card p{color:var(--muted);font-size:13px;line-height:1.85;margin-top:8px}
+.concept-card p b{color:var(--text);font-weight:500}
+.countdown{
+  margin-top:14px;font-family:"JetBrains Mono",monospace;font-size:21px;letter-spacing:0.1em;
+  color:var(--red);text-shadow:0 0 18px rgba(255,90,95,0.5);
+  border-top:1px dashed var(--line);padding-top:12px;
+}
+.countdown small{display:block;font-size:9.5px;letter-spacing:0.2em;color:var(--dim);text-shadow:none;margin-bottom:4px}
+.eto-row{display:grid;grid-template-columns:auto 1fr 1fr 1fr;gap:14px;margin-top:18px;align-items:center}
+@media(max-width:900px){.eto-row{grid-template-columns:1fr}}
+.eto-title{font-family:"Noto Serif SC",serif;font-size:15px;font-weight:700;line-height:1.5}
+.eto-title span{display:block;font-family:"JetBrains Mono",monospace;font-size:9px;letter-spacing:0.2em;color:var(--dim);font-weight:400}
+.eto{border:1px solid var(--line);border-radius:14px;padding:16px 18px;background:rgba(255,255,255,0.025)}
+.eto b{font-size:13.5px;color:var(--text)}
+.eto b i{font-style:normal;font-family:"JetBrains Mono",monospace;font-size:9px;color:var(--red);margin-left:8px;letter-spacing:0.12em}
+.eto p{color:var(--muted);font-size:12px;line-height:1.7;margin-top:5px}
+</style>
+<style>
+/* chars */
+.char-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
+@media(max-width:1080px){.char-grid{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:640px){.char-grid{grid-template-columns:1fr}}
+.char{border:1px solid var(--line);border-radius:var(--radius);padding:22px;display:flex;gap:16px;background:linear-gradient(180deg, rgba(255,255,255,0.035), rgba(255,255,255,0.01))}
+.char .avatar{
+  width:58px;height:58px;border-radius:14px;flex-shrink:0;
+  display:grid;place-items:center;font-family:"Noto Serif SC",serif;font-weight:900;font-size:19px;
+  border:1px solid var(--line);
+}
+.char h3{font-family:"Noto Serif SC",serif;font-size:16px}
+.char h3 span{font-family:"JetBrains Mono",monospace;font-size:9px;letter-spacing:0.16em;color:var(--red);margin-left:8px;font-weight:400}
+.char p{color:var(--muted);font-size:12.5px;line-height:1.8;margin-top:5px}
+.char.featured{border-color:rgba(255,90,95,0.4);background:linear-gradient(160deg, rgba(255,90,95,0.10), rgba(255,90,95,0.02))}
+/* insights */
+.insights{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+@media(max-width:1080px){.insights{grid-template-columns:1fr}}
+.insight{border:1px solid var(--line);border-radius:var(--radius);padding:24px;display:flex;gap:18px;background:linear-gradient(180deg, rgba(255,255,255,0.035), rgba(255,255,255,0.01));transition:border-color .25s}
+.insight:hover{border-color:rgba(255,90,95,0.35)}
+.insight i{
+  font-style:normal;font-family:"JetBrains Mono",monospace;font-size:13px;color:var(--red);
+  width:40px;height:40px;border-radius:12px;border:1px solid rgba(255,90,95,0.3);
+  display:grid;place-items:center;flex-shrink:0;background:rgba(255,90,95,0.06);
+}
+.insight h3{font-family:"Noto Serif SC",serif;font-size:16.5px;line-height:1.5;margin-bottom:7px}
+.insight p{color:var(--muted);font-size:13px;line-height:1.85}
+.insight p b{color:var(--text);font-weight:500}
+.highlight{
+  grid-column:1/-1;border:1px solid rgba(255,90,95,0.35);border-radius:var(--radius);
+  padding:28px;background:
+    radial-gradient(circle at 15% 20%, rgba(255,90,95,0.10), transparent 55%),
+    linear-gradient(160deg, rgba(255,90,95,0.07), rgba(255,90,95,0.02));
+  box-shadow:inset 0 1px 0 rgba(255,255,255,0.06);
+}
+.highlight h3{font-family:"Noto Serif SC",serif;font-size:17px;margin-bottom:8px}
+.highlight p{color:var(--text);font-size:15px;line-height:1.9;max-width:70ch}
+.highlight blockquote{margin-top:14px;border-left:2px solid var(--red);padding-left:16px;color:var(--muted);font-size:13px;line-height:1.85}
+/* quotes */
+.quotes{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
+@media(max-width:1080px){.quotes{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:640px){.quotes{grid-template-columns:1fr}}
+.q{border:1px solid var(--line);border-radius:var(--radius);padding:26px;background:linear-gradient(180deg, rgba(255,255,255,0.035), rgba(255,255,255,0.01));display:flex;flex-direction:column;justify-content:space-between;gap:16px}
+.q blockquote{font-family:"Noto Serif SC",serif;font-size:15.5px;line-height:1.9;color:var(--text)}
+.q.big{grid-column:span 2;background:radial-gradient(circle at 85% 15%, rgba(255,90,95,0.10), transparent 60%),linear-gradient(180deg, rgba(255,255,255,0.035), rgba(255,255,255,0.01))}
+@media(max-width:640px){.q.big{grid-column:span 1}}
+.q.big blockquote{font-size:18px}
+.q cite{font-style:normal;font-size:11.5px;color:var(--dim);letter-spacing:0.08em}
+.q cite b{color:var(--red);font-weight:500}
+/* reading guide */
+.guide{display:grid;grid-template-columns:1fr 0.85fr;gap:16px}
+@media(max-width:1080px){.guide{grid-template-columns:1fr}}
+.steps{display:grid;gap:12px}
+.step{border:1px solid var(--line);border-radius:var(--radius);padding:20px 22px;display:flex;gap:18px;background:linear-gradient(180deg, rgba(255,255,255,0.035), rgba(255,255,255,0.01))}
+.step b{
+  font-family:"JetBrains Mono",monospace;font-size:14px;color:var(--red);flex-shrink:0;
+  width:38px;height:38px;border-radius:50%;border:1px solid rgba(255,90,95,0.35);display:grid;place-items:center;
+}
+.step h3{font-family:"Noto Serif SC",serif;font-size:15.5px;margin-bottom:4px}
+.step p{color:var(--muted);font-size:12.5px;line-height:1.8}
+.check-list{list-style:none;padding-left:2px!important;color:var(--muted)!important;font-size:13px!important;line-height:2!important;display:grid;gap:6px}
+.check-list li::marker{content:"";}
+.check-list li{padding-left:22px;position:relative}
+.check-list li::before{content:"?";position:absolute;left:0;top:0;font-family:"JetBrains Mono",monospace;color:var(--red);font-size:12px}
+/* footer */
+footer{
+  border-top:1px solid var(--line);margin-top:40px;padding:44px 40px;
+  display:flex;justify-content:space-between;gap:32px;flex-wrap:wrap;
+  max-width:1280px;margin-left:auto;margin-right:auto;color:var(--dim);font-size:12.5px;
+}
+footer a:hover{color:var(--text)}
+</style>
+
+<style>
+.hidden-panel { display: none; }
+#realPage .container { max-width: 760px; width: 100%; margin: 0 auto; }
+#realPage .glass-card { background: rgba(255,255,255,.055); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); border: 1px solid rgba(255,255,255,.11); border-radius: 22px; padding: 22px 24px; margin-bottom: 18px; box-shadow: 0 18px 50px rgba(0,0,0,.45); text-align: left; }
+#realPage .header-area { display: flex; justify-content: space-between; align-items: center; padding-bottom: 4px; margin-bottom: 18px; }
+#realPage .header-area h1 { font-size: 22px; font-weight: 800; margin: 0; border: none; padding: 0; width: auto; background: linear-gradient(92deg,#fff,#a5b4fc 60%,#67e8f9); -webkit-background-clip: text; background-clip: text; color: transparent; }
+#realPage .badge { background: rgba(52,211,153,.14); color: #6ee7b7; border: 1px solid rgba(52,211,153,.45); font-size: 11px; padding: 5px 12px; border-radius: 99px; font-weight: bold; }
+#realPage .card { background: rgba(255,255,255,.055); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); border: 1px solid rgba(255,255,255,.11); border-radius: 22px; padding: 22px 24px; margin-bottom: 18px; box-shadow: 0 18px 50px rgba(0,0,0,.45); text-align: left; }
+#realPage .label { font-weight: 700; font-size: 14px; color: #e5e7eb; margin-bottom: 8px; letter-spacing: 0.02em;}
+#realPage .value { font-family: monospace; font-size: 11px; word-break: break-all; background: rgba(0,0,0,.32); padding: 12px; border-radius: 12px; border: 1px solid rgba(255,255,255,.1); color: #cbd5e1; overflow-y: auto; margin-bottom: 12px;}
+#realPage .input-group { display: flex; gap: 10px; }
+#realPage input { flex: 1; background: rgba(255,255,255,.07); border: 1px solid rgba(255,255,255,.14); border-radius: 10px; padding: 10px 12px; color: white; font-family: monospace; font-size: 13px; }
+#realPage button { color: white; border: none; padding: 11px 14px; border-radius: 12px; cursor: pointer; font-size: 13px; font-weight: 600; transition: transform .12s ease, filter .15s ease; }
+#realPage button:hover { filter: brightness(1.12); }
+#realPage button:active { transform: scale(.98); }
+#realPage .btn-apply { background: #0ea5e9; color: #06121f; font-weight: 700; }
+#realPage .btn-copy { width: 100%; background: linear-gradient(92deg,#075985,#0369a1); font-size: 13px; font-weight: bold; padding: 11px; border: none; border-radius: 12px; color: white; cursor: pointer; box-shadow: 0 6px 22px rgba(2,132,199,.4);}
+#realPage .ip-tag { background: rgba(56,189,248,.1); border: 1px solid rgba(56,189,248,.35); padding: 5px 12px; border-radius: 99px; font-size: 12px; font-family: monospace; color: #38bdf8; cursor: pointer; }
+#realPage .ip-tag:hover { background: #38bdf8; color: #0f172a; box-shadow: 0 0 16px rgba(56,189,248,.5); }
+#realPage .pool-error { font-size: 12px; color: #fca5a5; }
+#realPage .btn-retry { width: auto; background: rgba(255,255,255,.08); border: 1px solid rgba(255,255,255,.2); padding: 6px 16px; margin-left: 8px; }
+@media(max-width:640px){#realPage .header-area{flex-wrap:wrap;gap:10px}#realPage .header-area h1{font-size:19px}#realPage .input-group{flex-wrap:wrap}#realPage input{flex:1 1 100%;min-width:180px;font-size:16px}#realPage .glass-card{padding:18px 16px;border-radius:18px}#realPage button{min-height:44px}#realPage .ip-tag{padding:8px 14px}#real-toast{right:max(12px,env(safe-area-inset-right));bottom:max(12px,env(safe-area-inset-bottom));left:max(12px,env(safe-area-inset-left))}#real-toast .toast-msg{max-width:none}}
+#realPage .footer { text-align: center; font-size: 11px; color: #69707f; margin-top: 15px; padding-top: 12px; }
+#realPage .path-pill { display: inline-block; font-family: monospace; font-size: 11px; padding: 2px 8px; border-radius: 99px; margin-left: 8px; vertical-align: middle; }
+#realPage .path-direct { background: rgba(56,189,248,0.15); color: #38bdf8; border: 1px solid rgba(56,189,248,0.4); }
+#realPage .path-chain { background: rgba(52,211,153,0.15); color: #34d399; border: 1px solid rgba(52,211,153,0.4); }
+#realPage .card-direct { border-left: 3px solid #38bdf8; }
+#realPage .card-chain { border-left: 3px solid #34d399; }
+#realPage .route-hint { font-size: 12px; color: #8b91a5; margin-bottom: 10px; }
+#realPage .btn-copy-chain { width: 100%; background: linear-gradient(92deg,#065f46,#047857); font-size: 13px; font-weight: bold; padding: 11px; border: none; border-radius: 12px; color: white; cursor: pointer; box-shadow: 0 6px 22px rgba(5,150,105,.4);}
+#realPage .btn-copy-gray { width: 100%; background: rgba(255,255,255,.1); border: 1px solid rgba(255,255,255,.16); font-size: 13px; font-weight: bold; padding: 11px; border-radius: 12px; color: #e5e7eb; cursor: pointer;}
+#realPage #btn-copy-both { width: 100%; background: linear-gradient(92deg,#4338ca,#0369a1); font-size: 14px; font-weight: bold; padding: 13px; border: none; border-radius: 14px; color: white; cursor: pointer; margin-bottom: 18px; box-shadow: 0 8px 26px rgba(67,56,202,.45);}
+#real-toast { position: fixed; right: 22px; bottom: 22px; z-index: 100; display: flex; flex-direction: column; gap: 10px; }
+#real-toast .toast-msg { background: rgba(16,20,36,.94); border: 1px solid rgba(110,231,183,.45); color: #d1fae5; border-radius: 14px; padding: 12px 18px; font-size: 13px; max-width: 360px; box-shadow: 0 10px 30px rgba(0,0,0,.5); }
+</style>
+<noscript><style>.reveal{opacity:1;transform:none}</style></noscript>
+</head>
+<body>
+<div id="fakePage">
+<a href="#main" class="skip-link">跳至主内容</a>
+<div class="stars" aria-hidden="true"></div>
+
+<input type="checkbox" id="navToggle" class="visually-hidden">
+<nav aria-label="主导航">
+  <div class="nav-left">
+    <div class="logo">三</div>
+    <div class="nav-title">三体<span>EARTH'S PAST · BOOK I</span></div>
+  </div>
+  <div class="nav-links">
+    <a href="#intro">导语</a><a href="#dual">双线</a><a href="#plot">脉络</a><a href="#concepts">设定</a><a href="#chars">人物</a><a href="#insights">解读</a><a href="#quotes">语录</a><a href="#reading">重读</a>
+  </div>
+  <a class="nav-cta" href="#insights">直达独特解读</a>
+  <label for="navToggle" class="hamburger" role="button" tabindex="0" aria-expanded="false" aria-controls="mobileMenu" aria-label="打开菜单"><span></span></label>
+</nav>
+<div class="mobile-menu" id="mobileMenu" role="navigation" aria-label="移动端导航">
+  <a href="#intro">导语</a><a href="#dual">双线</a><a href="#plot">脉络</a><a href="#concepts">设定</a><a href="#chars">人物</a><a href="#insights">解读</a><a href="#quotes">语录</a><a href="#reading">重读</a>
+</div>
+
+<header class="hero" id="top">
+  <div class="hero-copy">
+    <div class="eyebrow"><i></i>地球往事三部曲 · 第一部 · 深度解读站</div>
+    <h1>三<em>体</em>
+      <span class="sub">THE THREE-BODY PROBLEM</span>
+    </h1>
+    <p class="hero-desc">一切从一个疯狂年代的深夜开始：一位在天文台蒙受屈辱的女物理学家，向太阳发射了地球文明的第一声呐喊。<strong>八年后，回音抵达——「不要回答」。</strong>而她已经按下了第二次按键。本站不复述剧情，只提供一种理解它的方式：<strong>宇宙级的恶意，来自人间。</strong></p>
+    <div class="hero-actions">
+      <a href="#intro" class="btn-primary">开始阅读解读</a>
+      <a href="#concepts" class="btn-ghost">查看核心设定</a>
+    </div>
+    <div class="hero-meta">
+      <div class="meta-card"><label>原著</label><b>刘慈欣 · 2006 连载 / 2008 出版</b></div>
+      <div class="meta-card"><label>时间跨度</label><b>1967 批斗会 — 2007 古筝行动</b></div>
+      <div class="meta-card"><label>核心命题</label><b>疯狂年代 / 宇宙回音 / 虫子</b></div>
+    </div>
+  </div>
+
+  <div class="sim-panel">
+    <canvas id="sim" aria-hidden="true"></canvas>
+    <div class="sim-hud"><span>THREE-BODY SIMULATION · N=3</span><b>第 <span id="epoch">1</span> 号文明</b></div>
+    <div class="era-badge" id="era">ERA · 恒纪元</div>
+    <button class="sim-btn" id="perturb" type="button">扰动重启 ↻ 初始条件微扰 +ε</button>
+    <div class="float-tag tag-1">不要回答！不要回答！！不要回答！！！</div>
+    <div class="float-tag tag-2">脱水 —— 「脱水！」</div>
+  </div>
+</header>
+
+<div class="divider"></div>
+<main id="main">
+<section id="intro">
+  <div class="section-head">
+    <div>
+      <div class="kicker">01 — 为什么第一部值得单独一站</div>
+      <h2>一部把<em>伤痕</em>写进<em>宇宙</em>的书</h2>
+    </div>
+    <p>人们记住《三体》往往因为后两部：黑暗森林、二向箔。但第一部才是整个宇宙观的出生证明——它回答的不是"外星人来了怎么办"，而是"人类凭什么值得被审判"。</p>
+  </div>
+
+  <div class="intro-grid">
+    <div class="card reveal">
+      <div class="book-cover">
+        <div class="cover-art"></div>
+        <div class="book-info">
+          <h3><span>BOOK I of REMEMBRANCE OF EARTH'S PAST</span>三体</h3>
+          <p>文革中目睹父亲被打死的叶文洁，在秘密基地<strong>红岸</strong>向太阳发射信号；三体世界警告"不要回答"，她却回复：<strong>"到这里来吧，我将帮助你们获得这个世界。"</strong>四十年后，纳米学家汪淼被卷入科学家连环自杀之谜，在一款名为"三体"的游戏里，逐步逼近这个跨越光年的答案。</p>
+          <div class="specs"><span class="spec">雨果奖系列开篇</span><span class="spec">2008 单行本</span><span class="spec">关键词：红岸·智子·虫子</span></div>
+        </div>
+      </div>
+      <div class="toc">
+        <a href="#dual"><b>双线结构</b>疯狂年代 × 科学边缘 →</a>
+        <a href="#concepts"><b>核心设定</b>智子为什么可怕 →</a>
+        <a href="#insights"><b>独特解读</b>五把钥匙 →</a>
+      </div>
+    </div>
+
+    <div class="card quote-card reveal">
+      <div class="kicker" style="margin-bottom:10px">EDITOR'S THESIS / 本站解读核心</div>
+      <blockquote>《三体》讲背叛，《黑暗森林》讲孤独，《死神永生》讲遗忘。<br>而一切的起点是：当一个社会系统性地摧毁了一个人的全部信任，她就会去<span>星空之外寻找裁判</span>——叶文洁的按钮不是科幻，是<span>人间的回声</span>。</blockquote>
+      <cite>— 本站解读核心：第一部是披着科幻外壳的伤痕文学</cite>
+      <p style="margin-top:14px;color:var(--muted);font-size:12.5px;line-height:1.75">多数解读停在"人类引来了外星人"。本站认为方向恰好相反：<strong style="color:var(--text)">是人间先毁灭了一个人，这个人再去请求宇宙毁灭人间。</strong>三体舰队只是这场审判迟到的执行者。</p>
+    </div>
+  </div>
+</section>
+
+<section id="dual">
+  <div class="section-head">
+    <div>
+      <div class="kicker">02 — 叙事结构</div>
+      <h2>两条时间线，<em>一个交汇点</em></h2>
+    </div>
+    <p>全书由两条相隔四十年的线绞成一股：一条通向疯狂年代的深渊，一条通向现代科学的悬崖。它们在雷达峰顶汇合——那里站着叶文洁。</p>
+  </div>
+
+  <div class="dual">
+    <div class="dual-col warm reveal">
+      <label>TIMELINE A · 1967—1979 · 疯狂年代线</label>
+      <h3>信任如何被杀死</h3>
+      <p>这不是背景板，而是全书的"案发现场"。每一步都是对叶文洁世界观的一次精确拆除：</p>
+      <ul class="dual-list">
+        <li><b>1967 批斗会：</b>物理学家叶哲泰因拒绝否认相对论，被自己的学生当众打死。妻子当场划清界限。科学、亲情、师道在同一场雨里死去。</li>
+        <li><b>大兴安岭林场：</b>被发配的叶文洁读着《寂静的春天》，第一次意识到人类内部也可能是一种"恶"。</li>
+        <li><b>进入红岸：</b>命运的吊诡——摧毁她的体制，把她送到了能向宇宙说话的位置上。</li>
+        <li><b>两次按键：</b>利用太阳增益反射发射信号（第一次），收到警告后仍然回复（第二次）。</li>
+      </ul>
+    </div>
+
+    <div class="dual-mid reveal">交汇点<br><br><br>叶文洁</div>
+
+    <div class="dual-col reveal">
+      <label>TIMELINE B · 2007 · 科学边缘线</label>
+      <h3>物理学不存在了</h3>
+      <p>现代线以侦探小说的方式开场，谜面一层层收紧：</p>
+      <ul class="dual-list">
+        <li><b>科学家连环自杀：</b>杨冬留下遗书"物理学从来没有存在过"。她的实验数据在加速器里自相矛盾。</li>
+        <li><b>台球实验：</b>丁仪用十二组完全相同的台球撞击，证明物理规律的不变性——这是给读者上的"科学为何值得信仰"第一课。</li>
+        <li><b>倒计时与宇宙闪烁：</b>汪淼视野里出现只有他能看见的倒计时；随后整个宇宙背景为他闪烁。科学家的恐惧被具象化了。</li>
+        <li><b>三体游戏与古筝行动：</b>V装具游戏揭示三体世界的真相；纳米丝在巴拿马运河切开"审判日"号，拿到 ETO 的完整情报。</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="dual-note reveal">
+    本站认为，双线的真正功能是<b>互为镜像</b>：文革的荒诞（群众高喊口号审判物理规律）与三体游戏的荒诞（文明反复脱水重生）共享同一个语法——<b>当现实不再服从理性，人就只能靠信仰活下去。</b>叶文洁在两条线上各活了一遍，所以她是唯一有资格"替人类做决定"的人——这正是全书最大的悲剧。
+  </div>
+</section>
+
+<section id="plot">
+  <div class="section-head">
+    <div>
+      <div class="kicker">03 — 故事脉络</div>
+      <h2>从一次批斗到<em>一次切割</em></h2>
+    </div>
+    <p>五幕结构。注意它的形状：开始于一场人群中的暴力，结束于一场无人性的精准切割——暴力升级为技术，但恶意从未变过。</p>
+  </div>
+
+  <div class="timeline">
+    <div class="tl-item reveal">
+      <label>序幕 · 1967</label>
+      <h3>尖叫的年代</h3>
+      <p>批斗会上，叶哲泰拒绝承认强加于他的罪名，被打死在女儿面前。叶文洁的世界观在这一夜完成坍缩：人性不可信任。</p>
+      <ul><li>母亲邵琳的当场揭发</li><li>此后所有选择的种子</li></ul>
+      <span class="tag">关键词：崩塌</span>
+    </div>
+    <div class="tl-item reveal">
+      <label>ACT I · 2007 春</label>
+      <h3>科学边界</h3>
+      <p>各国物理学家接连自杀。汪淼被迫接触"科学边界"组织，卷入调查，随即遭遇只属于他的倒计时。</p>
+      <ul><li>丁仪的台球实验</li><li>宇宙闪烁：为一个人眨眼的宇宙</li></ul>
+      <span class="tag">关键词：谜面</span>
+    </div>
+    <div class="tl-item reveal">
+      <label>ACT II · 游戏之中</label>
+      <h3>192 次文明轮回</h3>
+      <p>《三体》游戏让玩家亲历一颗行星的炼狱：三颗恒星无规则运动，文明在乱纪元中脱水封存，在恒纪元中浸泡复苏，又一次次归零。</p>
+      <ul><li>周文王、墨子、秦始皇、爱因斯坦同台</li><li>人列计算机：三千万士兵组成的运算阵列</li></ul>
+      <span class="tag">关键词：轮回</span>
+    </div>
+    <div class="tl-item reveal">
+      <label>ACT III · 真相</label>
+      <h3>红岸往事</h3>
+      <p>汪淼与大史追查 ETO，挖出红岸基地的全部档案：叶文洁的身份、两次发射、以及"地球叛军"的组织图谱。</p>
+      <ul><li>1379 号监听员的警告</li><li>降临派 / 拯救派 / 幸存派</li></ul>
+      <span class="tag">关键词：案底</span>
+    </div>
+    <div class="tl-item reveal">
+      <label>终章 · 巴拿马运河</label>
+      <h3>古筝行动</h3>
+      <p>数十根纳米飞刃“飞刃”横贯河道，将藏有数据的“审判日”号切割为 40 余片，船上 ETO 成员无一生还。人类对叛军的第一次反击，冷酷得没有一滴热血。</p>
+      <ul><li>伊文斯之死与数据回收</li><li>叶文洁被捕："我点燃了火，却控制不了它"</li></ul>
+      <span class="tag">关键词：代价</span>
+    </div>
+  </div>
+</section>
+<section id="concepts">
+  <div class="section-head">
+    <div>
+      <div class="kicker">04 — 核心设定</div>
+      <h2>六个装置，<em>六种恐惧</em></h2>
+    </div>
+    <p>第一部的每一项设定都不是炫技，而是一种被精确放大的时代恐惧。读懂它们各自在"怕什么"，就读懂了这部小说。</p>
+  </div>
+
+  <div class="concept-grid">
+    <div class="concept-card hot reveal">
+      <span class="no">DEVICE 01</span>
+      <h3>红岸基地<em>RED COAST BASE</em></h3>
+      <p>建于雷达峰的绝密工程，名义上对抗苏联与美国的监听系统，实则搜寻地外文明。<b>叶文洁发现太阳可以作为信号放大器</b>——把发射天线对准太阳，地球的声音就能以恒星之力传遍银河。一个信息最封闭的年代，完成了人类历史上最大规模的一次信息公开。</p>
+    </div>
+    <div class="concept-card frosty reveal">
+      <span class="no">DEVICE 02</span>
+      <h3>智子<em>SOPHON</em></h3>
+      <p>三体人将一颗质子在二维展开、蚀刻电路后再收回高维，派往地球。<b>它锁死人类基础物理，并实时监视一切</b>——但读不了人的思想。这个唯一的盲区，正是第二部"面壁计划"的伏笔：思想是人类最后的密室。</p>
+      <div class="countdown"><small>SOPHON COUNTDOWN · 汪淼视野中的倒计时</small><span id="cd">1153:47:32</span></div>
+    </div>
+    <div class="concept-card reveal">
+      <span class="no">DEVICE 03</span>
+      <h3>三体游戏<em>THE THREE-BODY GAME</em></h3>
+      <p>V 装具中的虚拟世界，玩家从周文王一路玩到爱因斯坦。<b>它是三体组织招募同路人的筛选器</b>——能理解并爱上这个苦难文明的人，才会收到邀请。游戏里近 200 轮文明毁灭重生的历史，让玩家对入侵者产生共情而非仇恨：这是刘慈欣替敌人写的辩护词。</p>
+    </div>
+    <div class="concept-card reveal">
+      <span class="no">DEVICE 04</span>
+      <h3>古筝行动<em>OPERATION GUZHENG</em></h3>
+      <p>用纳米材料“飞刃”在巴拿马运河设下死亡琴弦，无声切开“审判日”号。<b>全书最具争议的场面</b>：为夺取数据，船上 ETO 成员无一生还。它预告了后两部的主旋律——为了生存，人类的手段可以冷到什么程度。</p>
+    </div>
+    <div class="concept-card frosty reveal">
+      <span class="no">DEVICE 05</span>
+      <h3>宇宙闪烁<em>THE UNIVERSE FLICKERS</em></h3>
+      <p>宇宙微波背景辐射为汪淼一人有节奏地明灭——<b>一次成本高到荒谬的恐吓</b>。它的目的不是伤害而是摧毁信念：让你确信规律本身不可靠。这是第一部真正的恐怖内核：杀死一个文明不需要消灭它，让它停止思考即可。</p>
+    </div>
+    <div class="concept-card reveal">
+      <span class="no">DEVICE 06</span>
+      <h3>射手与农场主<em>SHOOTER &amp; FARMER</em></h3>
+      <p>两个思想实验：<b>射手</b>每隔十厘米打一个洞，于是靶面上的"科学家"发现了宇宙定律；<b>农场主</b>每天中午喂食，火鸡"科学家"由此总结出规律——直到感恩节。<b>我们以为的宇宙规律，会不会只是更高存在的随手为之？</b></p>
+    </div>
+  </div>
+
+  <div class="eto-row reveal">
+    <div class="eto-title">ETO<br><span>EARTH-TRIZARIS ORGANIZATION · 地球三体组织的三种人</span></div>
+    <div class="eto"><b>降临派<i>ADVENTISTS</i></b><p>以迈克·伊文斯为首，认定人类已不可救药，邀请三体的目的是借刀清除人类文明——其信条“人类真正的道德自觉是不可能的，就像人不能拉着自己的头发离开大地”。</p></div>
+    <div class="eto"><b>拯救派<i>REDEMPTIONISTS</i></b><p>以潘寒为代表，把三体文明当作受难的神来信仰，视拯救“主”的苦难为最高使命，沉迷于为三体世界求存。</p></div>
+    <div class="eto"><b>幸存派<i>SURVIVORS</i></b><p>最诚实的投机者，多为 ETO 内部的技术官僚：背叛同类，为后代在三体治下的世界里换取生存名额。</p></div>
+  </div>
+</section>
+
+<section id="chars">
+  <div class="section-head">
+    <div>
+      <div class="kicker">05 — 人物群像</div>
+      <h2>没有反派，只有<em>伤口</em></h2>
+    </div>
+    <p>第一部的人物几乎都带着一道来自时代的伤口出场。他们的选择不同，但逻辑同样完整。</p>
+  </div>
+  <div class="char-grid">
+    <div class="char featured reveal">
+      <div class="avatar" style="background:linear-gradient(135deg,#3a1420,#0d060b);color:var(--red)">叶</div>
+      <div><h3>叶文洁<span>按下按钮的人</span></h3><p>天体物理学家。受害者、加害者、忏悔者三位一体。她晚年重返雷达峰说出"我点燃了火，却控制不了它"——她从未自认正确，只是别无选择。</p></div>
+    </div>
+    <div class="char reveal">
+      <div class="avatar" style="background:linear-gradient(135deg,#12222e,#0a0f14);color:var(--cold)">汪</div>
+      <div><h3>汪淼<span>见证者</span></h3><p>纳米材料学家，全书视角人物。他不是英雄而是侦探兼证人：读者通过他的恐惧（倒计时）第一次触摸到智子的存在。他的武器"飞刃"最终成为古筝行动的刀刃。</p></div>
+    </div>
+    <div class="char reveal">
+      <div class="avatar" style="background:linear-gradient(135deg,#241c12,#100c08);color:var(--gold)">史</div>
+      <div><h3>史强<span>大史 · 人间锚点</span></h3><p>满嘴粗话的刑警，全书唯一不恐慌的人。他不懂数物理，却懂人；当所有精英陷入绝望时，是他用蝗虫论把汪淼和丁仪从悬崖边拉了回来。</p></div>
+    </div>
+    <div class="char reveal">
+      <div class="avatar" style="background:linear-gradient(135deg,#1c1420,#0c0810);color:#c9a8e8">伊</div>
+      <div><h3>迈克·伊文斯<span>物种共产主义者</span></h3><p>富商之子，因目睹候鸟灭绝而背叛人类，创立 ETO。他的信条："人类真正的道德自觉是不可能的。"他是降临派的教父，也是古筝行动的首要目标。</p></div>
+    </div>
+    <div class="char reveal">
+      <div class="avatar" style="background:linear-gradient(135deg,#101c20,#08100e);color:#9adbc8">杨冬</div>
+      <div><h3>杨冬<span>第一个放弃的人</span></h3><p>理论物理学家，叶文洁之女。遗书只有一句"物理学从来没有存在过"。她的自杀不是脆弱，而是一次诚实的坍塌——信仰对象死了，信徒还怎么活。</p></div>
+    </div>
+    <div class="char reveal">
+      <div class="avatar" style="background:linear-gradient(135deg,#20201a,#0e0e0a);color:var(--gold)">监听员</div>
+      <div><h3>1379 号监听员<span>说"不要回答"的人</span></h3><p>三体世界的异见者。他在监听到地球信号的一瞬间选择了背叛自己的文明——因为他知道和平意味着什么，也知道三体世界早已失去它。</p></div>
+    </div>
+  </div>
+</section>
+<section id="insights">
+  <div class="section-head">
+    <div>
+      <div class="kicker">06 — 本站独特解读 · 五把钥匙</div>
+      <h2>我们对<em>三体</em>的再理解</h2>
+    </div>
+    <p>不复述情节，只提供五个你在别处少见的视角。若你已读过原著，这些观点会让你重读时后背发凉。</p>
+  </div>
+
+  <div class="insights">
+    <div style="display:grid;gap:16px">
+      <div class="insight reveal">
+        <i>01</i>
+        <div>
+          <h3>叶文洁不是反派，是一个逻辑闭环</h3>
+          <p>常见读法把叶文洁当"人类叛徒"。本站认为她是全书唯一<b>完成了推理的人</b>：前提——人类无法自我约束（父亲之死、生态破坏、红岸内部的倾轧）；结论——需要外部力量介入。她的每一步都符合形式逻辑，错的是前提本身。<b>她不是疯了，而是太清醒地相信了自己仅剩的证据。</b>晚年她说"我点燃了火"，那不是忏悔的修辞，而是一次诚实的复盘。</p>
+        </div>
+      </div>
+      <div class="insight reveal">
+        <i>02</i>
+        <div>
+          <h3>第一部骨子里是一部侦探小说</h3>
+          <p>"物理学不存在了"是悬疑钩子，汪淼是侦探，红岸档案是案卷。但真正的谜底不是"谁在杀科学家"，而是<b>"人类的绝望从何而来"</b>。刘慈欣把伤痕文学的内核翻译成了宇宙语法：批斗会、告发、信仰崩塌，这些七十年代的词汇被改写为智子、倒计时、宇宙闪烁。<b>读懂这一层，第一部就从科幻变成了历史小说。</b></p>
+        </div>
+      </div>
+      <div class="insight reveal">
+        <i>03</i>
+        <div>
+          <h3>大史的蝗虫：全书唯一一次反形而上的胜利</h3>
+          <p>当丁仪和汪淼被"物理学死了"击穿时，大史带他们去看蝗灾：人类用尽一切手段灭蝗几千年，<b>"虫子从来没有被真正战胜过"</b>。这段常被当作爽点，本站认为它是三部曲真正的题眼——面对不可知的力量，最科学的答案恰恰来自最不科学的人：<b>先活下去，别急着下结论。</b>精英们的错误从来不是知识不够，而是太急于为文明写判决书。</p>
+        </div>
+      </div>
+    </div>
+
+    <div style="display:grid;gap:16px">
+      <div class="insight reveal">
+        <i>04</i>
+        <div>
+          <h3>三体游戏是替敌人写的辩护词</h3>
+          <p>大多数科幻让读者憎恨入侵者，《三体》却用整整一卷让你<b>亲历入侵者的苦难</b>：192 轮文明脱水、焚烧、冻毙、归零。当你玩到第 192 号文明终于掌握恒纪元规律时，你会由衷松一口气——然后才意识到，你刚刚共情的是即将毁灭你的敌人。<b>这是刘慈欣最阴险也最仁慈的设计：</b>他拒绝正邪二元，逼你承认"求生不构成罪"，哪怕求生的方式是杀死别人。</p>
+        </div>
+      </div>
+      <div class="insight reveal">
+        <i>05</i>
+        <div>
+          <h3>智子的恐怖不在技术，而在隐喻</h3>
+          <p>锁死加速器的意义常被低估。它意味着：<b>杀死一个文明不需要消灭它的肉体，只需要冻结它的思考。</b>基础科学是所有应用技术的根，根断了，树冠再茂盛也只是等死。反过来看红岸：一个连收听"敌台"都要判刑的年代，却向全宇宙广播了地球坐标——<b>信息封锁与信息公开在同一座基地里完成，这是全书最大的反讽。</b></p>
+        </div>
+      </div>
+      <div class="highlight reveal">
+        <h3>一句话总结我们的解读</h3>
+        <p>《三体》第一部讲的是：<strong>宇宙级的恶意并不来自宇宙，它来自人间；星空只是那面把它反射回来的镜子。</strong></p>
+        <blockquote>"叶文洁按下按钮的那一刻，审判日号还只是巴拿马运河上的一艘普通货轮；真正驶向地球的三体舰队，四十年前就已经从批斗会的雨夜里出发了。"</blockquote>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="quotes">
+  <div class="section-head">
+    <div>
+      <div class="kicker">07 — 经典语句</div>
+      <h2>值得<em>抄下来</em>的话</h2>
+    </div>
+  </div>
+  <div class="quotes">
+    <div class="q big reveal"><blockquote>“不要回答！不要回答！！不要回答！！！我收到这条信息可能只是偶然，但你们必须明白：向宇宙暴露自己的位置，就是暴露自己的存在。”</blockquote><cite><b>1379 号监听员</b> — 来自四光年外的警告（节选 · 原著第 15 章）</cite></div>
+    <div class="q reveal"><blockquote>“到这里来吧，我将帮助你们获得这个世界。我们的文明已无力解决自己的问题，需要你们的力量介入。”</blockquote><cite><b>叶文洁</b> — 第二次按键（节选 · 原著第 18 章）</cite></div>
+    <div class="q reveal"><blockquote>“虫子从来没有被真正战胜过。”</blockquote><cite><b>史强</b> — 华北平原的蝗灾之夜</cite></div>
+    <div class="q reveal"><blockquote>“物理学从来没有存在过。将来也不会存在。我在不知不觉中浪费了自己的一生。”</blockquote><cite><b>杨冬</b> — 遗书（节选 · 原著第 1 章）</cite></div>
+    <div class="q reveal"><blockquote>“在中国，任何超脱飞扬的思想都会砰然坠地——现实的引力太沉重了。”</blockquote><cite><b>叶文洁</b></cite></div>
+    <div class="q reveal"><blockquote>“我点燃了火，却控制不了它。”</blockquote><cite><b>叶文洁</b> — 雷达峰顶 · 全书终章</cite></div>
+  </div>
+</section>
+
+<section id="reading">
+  <div class="section-head">
+    <div>
+      <div class="kicker">08 — 如何重读《三体》</div>
+      <h2>给<em>二刷</em>读者的路线图</h2>
+    </div>
+    <p>第一次读情节，第二次读结构，第三次读伤口。</p>
+  </div>
+  <div class="guide">
+    <div class="steps">
+      <div class="step reveal"><b>1</b><div><h3>先记住两个场景再进正文</h3><p>1967 年的批斗会与 1971 年前后的雷达峰发射。全书所有人物动机都从这两个场景里生长出来，带着它们阅读，每章都会多出一层意思。</p></div></div>
+      <div class="step reveal"><b>2</b><div><h3>把三体游戏当成一部独立小说读</h3><p>注意游戏里的历史人物如何排列：周文王、墨子、秦始皇、牛顿、冯·诺依曼、爱因斯坦——那是人类文明史的一次压缩打包，也是三体组织世界观的完整陈述。</p></div></div>
+      <div class="step reveal"><b>3</b><div><h3>留意叶文洁每一次出场时的天气</h3><p>雨、雪、风声、寂静——环境描写几乎是她内心的心电图。重读时把这些句子挑出来连成一条线，你会发现一条完整的暗叙事。</p></div></div>
+      <div class="step reveal"><b>4</b><div><h3>读完立刻回头重看第一章</h3><p>知道全部真相后再看"科学边界"与科学家自杀案，每个细节都会换一副面孔——这正是侦探小说式结构的报酬，也是刘慈欣埋得最深的一处机关。</p></div></div>
+    </div>
+    <div class="card reveal" style="display:flex;flex-direction:column;justify-content:center">
+      <div class="kicker">READING CHECKLIST</div>
+      <h3 style="font-family:'Noto Serif SC',serif;margin:8px 0 10px;font-size:18px">三个问题检验你是否读懂了</h3>
+      <ul class="check-list" style="padding-left:2px">
+        <li>叶文洁一共按了几次发射键？为什么"两次"这个数字本身就是全书的悲剧结构？</li>
+        <li>杨冬的遗书为什么说"物理学从来没有存在过"——她究竟发现了什么？</li>
+        <li>大史为什么不恐慌？他的"蝗虫论"到底反驳的是谁？</li>
+      </ul>
+      <div style="margin-top:16px;display:flex;gap:8px;flex-wrap:wrap">
+        <span class="spec">建议阅读时长：10 小时</span><span class="spec">难度：★★★★☆</span><span class="spec">震撼：★★★★★</span>
+      </div>
+      <a href="#top" class="btn-primary" style="margin-top:18px;text-align:center;display:block">回到顶部重读导语</a>
+    </div>
+  </div>
+</section>
+</main>
+
+<footer>
+  <div>
+    <div style="font-family:'Noto Serif SC',serif;font-weight:700;letter-spacing:0.08em;color:var(--text)">三体 · 地球往事 深度解读站</div>
+    <div style="margin-top:6px;max-width:560px;line-height:1.7">本站为读者自制的非官方解读站，内容基于刘慈欣《三体》（地球往事三部曲之一）原著的理解与再创作。所有观点为一家之言，欢迎指正。给岁月以文明，给时光以生命。</div>
+  </div>
+  <div style="text-align:right">
+    <div style="font-family:'JetBrains Mono',monospace;letter-spacing:0.12em">BUILT FOR READERS · 2026</div>
+    <div style="margin-top:6px"><a href="#top">返回顶部</a> · <a href="#dual">双线结构</a> · <a href="#concepts">核心设定</a></div>
+    <div style="margin-top:8px;color:var(--dim)">Design: Red Coast Edition · No ads</div>
+  </div>
+</footer>
+<script>
+// reveal on scroll
+(function(){
+  const reveals = document.querySelectorAll('.reveal');
+  const showAll = () => reveals.forEach(el => el.classList.add('in'));
+  if(!('IntersectionObserver' in window)){ showAll(); return; }
+  try{
+    const obs = new IntersectionObserver(es=>{
+      es.forEach(e=>{ if(e.isIntersecting) e.target.classList.add('in') })
+    },{threshold:0.12});
+    reveals.forEach(el=>obs.observe(el));
+  }catch(e){ showAll(); }
+})();
+
+/* ===== three-body simulation ===== */
+try{
+(function(){
+  const cv = document.getElementById('sim');
+  if(!cv) return;
+  const ctx = cv.getContext('2d');
+  const epochEl = document.getElementById('epoch');
+  const eraEl = document.getElementById('era');
+  let W=0,H=0;
+  const G = 820000, SOFT2 = 900, DT = 0.012, SUB = 4;
+  let bodies, planet, epoch = 1, frame = 0;
+
+  function fit(){
+    const dpr = Math.min(window.devicePixelRatio||1, 2);
+    const r = cv.parentElement.getBoundingClientRect();
+    W = Math.max(200, r.width); H = Math.max(200, r.height);
+    cv.width = W*dpr; cv.height = H*dpr;
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.fillStyle = '#0d060b'; ctx.fillRect(0,0,W,H);
+  }
+
+  function init(perturb){
+    const r = Math.min(W,H)*0.28;
+    const a0 = Math.random()*Math.PI*2;
+    const v0 = 54 + Math.random()*6;
+    bodies = [0,1,2].map(i=>{
+      const a = a0 + i*2.0944;
+      const x = W/2 + r*Math.cos(a), y = H/2 + r*Math.sin(a);
+      const dx = x-W/2, dy = y-H/2, d = Math.hypot(dx,dy);
+      const k = v0*(0.98+Math.random()*0.04) + (perturb?(Math.random()-0.5)*perturb:0);
+      return {x,y,vx:-dy/d*k, vy:dx/d*k,
+        m:[1.03,1.0,0.97][i], col:['#ff5a5f','#7eb8da','#e8d5a3'][i]};
+    });
+    // planet on a wide orbit around star 0
+    const s = bodies[0], pr = Math.min(W,H)*0.46, pa = Math.random()*Math.PI*2;
+    const px = s.x+pr*Math.cos(pa), py = s.y+pr*Math.sin(pa);
+    const pdx = px-s.x, pdy = py-s.y, pd = Math.hypot(pdx,pdy);
+    const pv = Math.sqrt(G*s.m/pr)*(0.88+Math.random()*0.12);
+    planet = {x:px,y:py,vx:s.vx-pdy/pd*pv,vy:s.vy+pdx/pd*pv,col:'#ffffff'};
+    ctx.fillStyle = '#0d060b'; ctx.fillRect(0,0,W,H);
+  }
+
+  function accel(x,y,self){
+    let ax=0, ay=0;
+    for(const o of bodies){
+      if(o===self) continue;
+      const dx=o.x-x, dy=o.y-y;
+      const d2 = dx*dx+dy*dy+SOFT2;
+      const inv = G*o.m/(d2*Math.sqrt(d2));
+      ax+=dx*inv; ay+=dy*inv;
+    }
+    return [ax,ay];
+  }
+
+  function step(){
+    for(let s=0;s<SUB;s++){
+      for(const b of bodies){
+        const [ax,ay] = accel(b.x,b.y,b);
+        b.vx+=ax*DT; b.vy+=ay*DT;
+      }
+      for(const b of bodies){
+        // cap speed to avoid extreme slingshots / numerical blow-up
+        const sp = Math.hypot(b.vx,b.vy);
+        if(sp>420){ b.vx*=420/sp; b.vy*=420/sp; }
+        b.x+=b.vx*DT; b.y+=b.vy*DT;
+      }
+      let axp=0, ayp=0;
+      for(const o of bodies){
+        const dx=o.x-planet.x, dy=o.y-planet.y;
+        const d2=dx*dx+dy*dy+400;
+        const inv=G*o.m/(d2*Math.sqrt(d2));
+        axp+=dx*inv; ayp+=dy*inv;
+      }
+      planet.vx+=axp*DT; planet.vy+=ayp*DT;
+      const psp = Math.hypot(planet.vx,planet.vy);
+      if(psp>520){ planet.vx*=520/psp; planet.vy*=520/psp; }
+      planet.x+=planet.vx*DT; planet.y+=planet.vy*DT;
+    }
+  }
+
+  function draw(){
+    ctx.fillStyle='rgba(13,6,11,0.045)';
+    ctx.fillRect(0,0,W,H);
+    // trails (skip long segments to avoid streak artifacts)
+    for(const b of bodies){
+      if(Math.hypot(b.x-b.px,b.y-b.py)<=26){
+        ctx.strokeStyle=b.col; ctx.globalAlpha=0.55; ctx.lineWidth=1;
+        ctx.beginPath(); ctx.moveTo(b.px,b.py); ctx.lineTo(b.x,b.y); ctx.stroke();
+      }
+      b.px=b.x; b.py=b.y;
+    }
+    ctx.globalAlpha=0.7; ctx.strokeStyle='#fff'; ctx.lineWidth=1;
+    if(Math.hypot(planet.x-planet.px,planet.y-planet.py)<=26){
+      ctx.beginPath(); ctx.moveTo(planet.px,planet.py); ctx.lineTo(planet.x,planet.y); ctx.stroke();
+    }
+    ctx.globalAlpha=1;
+    // stars glow
+    for(const b of bodies){
+      const g=ctx.createRadialGradient(b.x,b.y,0,b.x,b.y,9);
+      g.addColorStop(0,'#ffffff'); g.addColorStop(0.25,b.col); g.addColorStop(1,'rgba(0,0,0,0)');
+      ctx.fillStyle=g;
+      ctx.beginPath(); ctx.arc(b.x,b.y,9,0,6.2832); ctx.fill();
+    }
+    // planet
+    const pg=ctx.createRadialGradient(planet.x,planet.y,0,planet.x,planet.y,4);
+    pg.addColorStop(0,'#ffffff'); pg.addColorStop(1,'rgba(255,255,255,0)');
+    ctx.fillStyle=pg;
+    ctx.beginPath(); ctx.arc(planet.x,planet.y,4,0,6.2832); ctx.fill();
+  }
+
+  function escaped(){
+    const M=Math.max(W,H)*1.5;
+    // non-finite coordinates mean numerical blow-up -> treat as escape
+    const bad = b=>![b.x,b.y,b.vx,b.vy].every(isFinite);
+    if(bodies.some(bad) || ![planet.x,planet.y,planet.vx,planet.vy].every(isFinite)) return true;
+    return bodies.some(b=>b.x<-M||b.x>W+M||b.y<-M||b.y>H+M) ||
+           planet.x<-M||planet.x>W+M||planet.y<-M||planet.y>H+M ||
+           bodies.some(b=>Math.hypot(b.x-planet.x,b.y-planet.y)<6);
+  }
+
+  function newEpoch(perturb){
+    init(perturb);
+    for(const b of bodies){ b.px=b.x; b.py=b.y; }
+    planet.px=planet.x; planet.py=planet.y;
+    epoch++; epochEl.textContent=epoch;
+  }
+
+  function updateEra(){
+    // era heuristic: planet alive & stars loosely clustered
+    let cx=0,cy=0; bodies.forEach(b=>{cx+=b.x/3;cy+=b.y/3});
+    const spread = Math.max(...bodies.map(b=>Math.hypot(b.x-cx,b.y-cy)));
+    const stable = spread < Math.max(W,H)*0.45 && !escaped();
+    eraEl.textContent = stable ? 'ERA · 恒纪元' : 'ERA · 乱纪元';
+    eraEl.classList.toggle('chaos', !stable);
+  }
+
+  fit();
+  newEpoch(0);
+
+  const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  let rafId=null;
+  let running=false;
+  const fakePageEl = document.getElementById('fakePage');
+  const pageHidden = () => document.hidden || !!(fakePageEl && fakePageEl.style.display === 'none');
+
+  function loop(){
+    if(!running) return;
+    frame++;
+    step();
+    draw();
+    if(frame%24===0) updateEra();
+    if(escaped() || frame>4200){ frame=0; newEpoch(6); updateEra(); }
+    rafId=requestAnimationFrame(loop);
+  }
+  function start(){
+    if(reduced || running || pageHidden()) return;
+    running=true;
+    rafId=requestAnimationFrame(loop);
+  }
+  function stop(){
+    running=false;
+    if(rafId!==null){ cancelAnimationFrame(rafId); rafId=null; }
+  }
+  window.__threeBody = { start: start, stop: stop };
+
+  if(reduced){
+    for(let i=0;i<1200;i++){ step(); if(i%12===0) draw(); }
+  } else {
+    start();
+  }
+
+  window.addEventListener('resize', ()=>{ if(pageHidden()) return; fit(); newEpoch(0); epoch=1; epochEl.textContent=1; });
+  const perturbBtn = document.getElementById('perturb');
+  if(perturbBtn) perturbBtn.addEventListener('click', ()=>{ frame=0; newEpoch(14); updateEra(); start(); });
+  document.addEventListener('visibilitychange', ()=>{ if(document.hidden) stop(); else start(); });
+})();
+}catch(e){ console.warn('three-body init failed', e); }
+
+/* ===== sophon countdown ticker ===== */
+try{
+(function(){
+  const el=document.getElementById('cd'); if(!el) return;
+  let h=1153,m=47,s=32;
+  let timer=setInterval(tick,1000);
+  function tick(){
+    if(document.hidden) return;
+    if(h===0&&m===0&&s===0) return;
+    s--; if(s<0){s=59;m--;} if(m<0){m=59;h--;}
+    h=Math.max(0,h); m=Math.max(0,m); s=Math.max(0,s);
+    el.textContent = (h===0&&m===0&&s===0) ? '已开始' : h+':'+String(m).padStart(2,'0')+':'+String(s).padStart(2,'0');
+  }
+  document.addEventListener('visibilitychange', ()=>{
+    if(document.hidden){ clearInterval(timer); timer=null; }
+    else if(!timer){ timer=setInterval(tick,1000); }
+  });
+})();
+}catch(e){ console.warn('countdown init failed', e); }
+
+/* subtle parallax — rAF-throttled, disabled on coarse pointers */
+try{
+const simPanel = document.querySelector('.sim-panel');
+if(simPanel && !window.matchMedia('(prefers-reduced-motion: reduce)').matches && !window.matchMedia('(pointer: coarse)').matches){
+  let ticking=false;
+  simPanel.style.willChange='transform';
+  document.addEventListener('mousemove', e=>{
+    if(ticking) return;
+    ticking=true;
+    requestAnimationFrame(()=>{
+      const x=(e.clientX/window.innerWidth-0.5)*8;
+      const y=(e.clientY/window.innerHeight-0.5)*5;
+      simPanel.style.transform=`translate(${x}px, ${y}px)`;
+      ticking=false;
+    });
+  });
+}
+}catch(e){ console.warn('parallax init failed', e); }
+
+/* ===== mobile menu keyboard support ===== */
+try{
+(function(){
+  const toggle = document.getElementById('navToggle');
+  const hamburger = document.querySelector('.hamburger');
+  const menu = document.getElementById('mobileMenu');
+  if(!toggle || !hamburger) return;
+  const sync = () => hamburger.setAttribute('aria-expanded', toggle.checked ? 'true' : 'false');
+  hamburger.addEventListener('keydown', e=>{
+    if(e.key === 'Enter' || e.key === ' ' || e.key === 'Spacebar'){
+      e.preventDefault();
+      toggle.checked = !toggle.checked;
+      sync();
+    }
+  });
+  toggle.addEventListener('change', sync);
+  if(menu){
+    menu.querySelectorAll('a').forEach(a=>a.addEventListener('click', ()=>{ toggle.checked = false; sync(); }));
+  }
+  document.addEventListener('keydown', e=>{
+    if(e.key === 'Escape' && toggle.checked){ toggle.checked = false; sync(); }
+  });
+  sync();
+})();
+}catch(e){ console.warn('mobile menu init failed', e); }
+</script>
+</div>
+
+<div id="realPage" class="hidden-panel">
+        <div class="container">
+            <div class="header-area">
+                <h1>🛸 边缘计算网关综合控制面板</h1>
+                <span class="badge">安全防扫描激活</span>
+            </div>
+
+            <div class="card glass-card" id="ipPoolCard">
+                <div class="label">⚡ 优选 IP 池（按需获取）</div>
+                <div style="font-size:12px; color:#8b91a5; margin-bottom:10px;">不会自动请求第三方资源；点击按钮从公网拉取优选 IP，或手动填入接入点。</div>
+                <div id="ipPool" style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:15px;">
+                    <button type="button" class="btn-retry" onclick="fetchOptimizedIPs()">获取优选 IP</button>
+                </div>
+                <label class="label" for="cfIpInput" style="font-size:12px; color:#38bdf8;">手动覆盖接入点 IP 或优选域名:</label>
+                <div class="input-group">
+                    <input type="text" id="cfIpInput" placeholder="例如: 104.16.88.9 或 cf.aliyun.com">
+                    <button type="button" id="applyIpBtn" class="btn-apply" onclick="applyCustomIp()">强制套用接入点</button>
+                </div>
+            </div>
+
+            <div class="card card-direct glass-card" id="directCard">
+                <div class="label" style="color:#38bdf8;">🪐 VLESS 直连节点<span class="path-pill path-direct">VLESS_DIRECT_PATH_PLACEHOLDER</span></div>
+                <div class="route-hint">出口 = Railway 本地 IP · 低延迟优先</div>
+                <div class="value" id="nodeLink" style="height:50px;">生成中...</div>
+                <button class="btn-copy" onclick="copyText('nodeLink', this)">📋 一键复制直连节点链接</button>
+            </div>
+
+            <div class="card card-chain glass-card" id="chainCard">
+                <div class="label" style="color:#34d399;">🔗 VLESS 链式节点<span class="path-pill path-chain">VLESS_CHAIN_PATH_PLACEHOLDER</span></div>
+                <div class="route-hint">出口 = VPNGate 落地 IP · 换出口优先</div>
+                <div class="value" id="nodeLinkChain" style="height:50px;">生成中...</div>
+                <button class="btn-copy-chain" onclick="copyText('nodeLinkChain', this)">📋 一键复制链式节点链接</button>
+            </div>
+
+            <div class="card card-chain glass-card" id="resiCard" style="display:none;">
+                <div class="label" style="color:#a78bfa;">🏠 VLESS 轮换出口<span class="path-pill path-chain">RESI_PATH_PLACEHOLDER</span></div>
+                <div class="route-hint">出口 = VPNGate 节点 IP · 每条新连接换一个（客户端须关闭 mux）</div>
+                <div class="value" id="nodeLinkResi" style="height:50px;">生成中...</div>
+                <button class="btn-copy-chain" onclick="copyText('nodeLinkResi', this)">📋 一键复制第三出口链接</button>
+            </div>
+
+            <div class="card glass-card" id="vlessDisabled" style="display:none;">
+                <div class="label" style="color:#f59e0b;">⚠️ VLESS 未启用</div>
+                <div class="route-hint">服务端未设置 VLESS_UUID（或显式留空），直连、链式与轮换链接均不可用。</div>
+            </div>
+
+            <button id="btn-copy-both" onclick="copyBoth(this)">📋 一键复制两个链接（直连 + 链式）</button>
+
+            <div class="card glass-card" id="subCard">
+                <div class="label">📦 Base64 订阅内容（直连 + 链式，共两行）</div>
+                <div class="value" id="subContent" style="height:50px;">生成中...</div>
+                <button class="btn-copy-gray" onclick="copyRaw('subContent', this)">📋 一键复制通用订阅内容</button>
+            </div>
+
+            <div class="footer">Powered by sing-box & Cloudflare Tunnel (QUIC Mode)</div>
+            <div id="real-toast" role="status" aria-live="polite"></div>
+        </div>
+    </div>
+
+<script>
+
+        const uuid = "UUID_PLACEHOLDER";
+        const vlessEnabled = ("VLESS_ENABLED_PLACEHOLDER" === "true");
+        const wsPath = "VLESS_DIRECT_PATH_PLACEHOLDER";
+        const wsChainPath = "VLESS_CHAIN_PATH_PLACEHOLDER";
+        const wsResiPath = "RESI_PATH_PLACEHOLDER";
+        const nodeRemark = "NODE_REMARK_PLACEHOLDER";
+        const chainRemark = nodeRemark + "-chain";
+        const resiRemark = nodeRemark + "-resi";
+        const hostName = window.location.hostname.replace(/^\[|\]$/g, '');
+        const uriHost = hostName.indexOf(':') !== -1 ? '[' + hostName + ']' : hostName;
+
+        // mirror handling lives in the single IIFE at the end of body.
+
+        function setVlessDisabled() {
+            ['directCard', 'chainCard', 'resiCard', 'subCard', 'btn-copy-both', 'ipPoolCard'].forEach((id) => {
+                const el = document.getElementById(id);
+                if (el) el.style.display = 'none';
+            });
+            ['nodeLink', 'nodeLinkChain', 'nodeLinkResi', 'subContent'].forEach((id) => {
+                const el = document.getElementById(id);
+                if (el) el.innerText = '';
+            });
+            ['applyIpBtn', 'cfIpInput'].forEach((id) => {
+                const el = document.getElementById(id);
+                if (el) el.disabled = true;
+            });
+            const notice = document.getElementById('vlessDisabled');
+            if (notice) notice.style.display = '';
+        }
+
+        function generateLinks(connectAddress) {
+            // R2-4-18: with VLESS_UUID empty there is no valid link.  Hide the
+            // cards instead of producing dead links with an empty user.
+            if (!vlessEnabled) {
+                setVlessDisabled();
+                return;
+            }
+            const address = connectAddress || uriHost;
+            const authority = address.indexOf(':') !== -1 && address.charAt(0) !== '[' ? '[' + address + ']' : address;
+            const vlessLink = `vless://${uuid}@${authority}:443?encryption=none&security=tls&type=ws&host=${hostName}&sni=${hostName}&path=${encodeURIComponent(wsPath)}#${nodeRemark}`;
+            const chainLink = `vless://${uuid}@${authority}:443?encryption=none&security=tls&type=ws&host=${hostName}&sni=${hostName}&path=${encodeURIComponent(wsChainPath)}#${chainRemark}`;
+            document.getElementById('nodeLink').innerText = vlessLink;
+            document.getElementById('nodeLinkChain').innerText = chainLink;
+            // The residential path only exists when RESI_PATH_PLACEHOLDER was
+            // replaced at boot (inject_page.py); an unreplaced placeholder
+            // must not leave a dead link on the page.  The path itself was
+            // already validated server-side.
+            let resiLink = "";
+            if (wsResiPath.charAt(0) === "/" && wsResiPath.indexOf("PLACEHOLDER") === -1) {
+                resiLink = `vless://${uuid}@${authority}:443?encryption=none&security=tls&type=ws&host=${hostName}&sni=${hostName}&path=${encodeURIComponent(wsResiPath)}#${resiRemark}`;
+                document.getElementById('nodeLinkResi').innerText = resiLink;
+                document.getElementById('resiCard').style.display = "";
+            }
+            const sub = [vlessLink, chainLink, resiLink].filter(Boolean).join(String.fromCharCode(10));
+            document.getElementById('subContent').innerText = btoa(unescape(encodeURIComponent(sub)));
+        }
+
+        function realToast(msg) {
+            const box = document.getElementById('real-toast');
+            const olds = Array.from(box.children);
+            if (olds.some(c => c.innerText === msg)) return;
+            while (box.children.length >= 3) box.firstChild.remove();
+            const el = document.createElement('div');
+            el.className = 'toast-msg';
+            el.innerText = msg;
+            box.appendChild(el);
+            setTimeout(() => el.remove(), 3000);
+        }
+
+        function fallbackCopy(t) {
+            try {
+                const ta = document.createElement('textarea');
+                ta.value = t;
+                ta.style.position = 'fixed';
+                ta.style.opacity = '0';
+                document.body.appendChild(ta);
+                ta.select();
+                const ok = document.execCommand('copy');
+                ta.remove();
+                return ok;
+            } catch (e) { return false; }
+        }
+
+        function isValidIPv4(ip) {
+            const parts = ip.split('.');
+            if (parts.length !== 4) return false;
+            return parts.every(o => /^(0|[1-9]\d{0,2})$/.test(o) && +o <= 255);
+        }
+
+        function isValidIPv6(h) {
+            if (h.indexOf(':') === -1) return false;
+            try { new URL('http://[' + h + ']'); return true; } catch (e) { return false; }
+        }
+
+        function isValidHost(h) {
+            if (!h) return false;
+            if (h === 'localhost') return true;
+            if (/^\d{1,3}(\.\d{1,3}){3}$/.test(h)) return isValidIPv4(h);
+            if (isValidIPv6(h)) return true;
+            if (!/^[A-Za-z0-9.-]+$/.test(h) || h.indexOf('..') !== -1) return false;
+            try { new URL('http://' + h); return true; } catch (e) { return false; }
+        }
+
+        function flashButton(btn, doneText) {
+            if (!btn) return;
+            if (btn._t) clearTimeout(btn._t);
+            if (btn._orig === undefined) btn._orig = btn.innerText;
+            btn.innerText = doneText || '✓ 已复制';
+            btn._t = setTimeout(() => { btn.innerText = btn._orig; btn._orig = undefined; btn._t = null; }, 1500);
+        }
+
+        function applyCustomIp() {
+            if (!vlessEnabled) {
+                realToast('VLESS 未启用');
+                return;
+            }
+            const input = document.getElementById('cfIpInput');
+            const inputVal = input ? input.value.trim() : '';
+            if (inputVal && !isValidHost(inputVal)) {
+                realToast('格式错误：请输入合法 IP 或域名');
+                return;
+            }
+            generateLinks(inputVal || uriHost);
+            realToast(inputVal ? `已成功套用接入点: ${inputVal}` : '已恢复默认隧道域名解析');
+        }
+
+        function parsePoolLine(line) {
+            const m = line.trim().match(/^(\d{1,3}(?:\.\d{1,3}){3})/);
+            return m ? m[1] : null;
+        }
+
+        function renderPool(ips) {
+            const poolDiv = document.getElementById('ipPool');
+            if (!poolDiv) return;
+            poolDiv.innerHTML = '';
+            ips.forEach(ip => {
+                const tag = document.createElement('button');
+                tag.type = 'button';
+                tag.className = 'ip-tag';
+                tag.innerText = ip;
+                tag.onclick = () => {
+                    document.getElementById('cfIpInput').value = ip;
+                    generateLinks(ip);
+                    realToast(`✨ 已成功切换到该优选 IP: ${ip}`);
+                };
+                poolDiv.appendChild(tag);
+            });
+        }
+
+        function poolFailed() {
+            const poolDiv = document.getElementById('ipPool');
+            if (!poolDiv) return;
+            poolDiv.innerHTML = '<span class="pool-error">公网资源池打捞失败。</span><button type="button" class="btn-retry" onclick="fetchOptimizedIPs()">重试</button>';
+        }
+
+        function fetchPoolText(url, signal) {
+            return fetch(url, { signal: signal, referrerPolicy: 'no-referrer' }).then(res => {
+                if (!res.ok) throw new Error('pool ' + res.status);
+                return res.text();
+            });
+        }
+
+        function fetchOptimizedIPs() {
+            if (!vlessEnabled) {
+                realToast('VLESS 未启用');
+                return;
+            }
+            const poolDiv = document.getElementById('ipPool');
+            if (poolDiv) poolDiv.innerHTML = '<span style="font-size:13px;color:#64748b;">正在获取优选 IP...</span>';
+            const controller = typeof AbortController === 'function' ? new AbortController() : null;
+            const signal = controller ? controller.signal : undefined;
+            const timer = controller ? setTimeout(() => controller.abort(), 6000) : null;
+            fetchPoolText('https://raw.githubusercontent.com/joname1/BestCFip/refs/heads/main/ipv4.txt', signal)
+                .catch(() => fetchPoolText('https://cdn.jsdelivr.net/gh/joname1/BestCFip@main/ipv4.txt', signal))
+                .then(text => {
+                    const ips = [];
+                    for (const line of text.split('\n')) {
+                        const ip = parsePoolLine(line);
+                        if (ip && isValidIPv4(ip) && !ips.includes(ip)) ips.push(ip);
+                        if (ips.length >= 6) break;
+                    }
+                    if (!ips.length) throw new Error('empty pool');
+                    renderPool(ips);
+                })
+                .catch(poolFailed)
+                .then(() => { if (timer) clearTimeout(timer); });
+        }
+
+        function copyWithFallback(text) {
+            const clipboard = navigator.clipboard;
+            if (clipboard && typeof clipboard.writeText === 'function') {
+                return clipboard.writeText(text).then(() => true, () => fallbackCopy(text));
+            }
+            return Promise.resolve(fallbackCopy(text));
+        }
+
+        function copyText(elementId, btn) {
+            const el = document.getElementById(elementId);
+            const text = el ? el.innerText.trim() : '';
+            if (!text || !text.startsWith('vless://')) {
+                realToast('链接还没生成好，请稍后再试');
+                return;
+            }
+            copyWithFallback(text).then(ok => {
+                if (ok) { flashButton(btn); realToast('已成功复制到剪贴板！'); }
+                else realToast('复制失败，请手动选择复制');
+            });
+        }
+
+        function copyRaw(elementId, btn) {
+            const el = document.getElementById(elementId);
+            const text = el ? el.innerText.trim() : '';
+            if (!text) {
+                realToast('内容还没生成好，请稍后再试');
+                return;
+            }
+            copyWithFallback(text).then(ok => {
+                if (ok) { flashButton(btn); realToast('已成功复制到剪贴板！'); }
+                else realToast('复制失败，请手动选择复制');
+            });
+        }
+
+        function copyBoth(btn) {
+            const directEl = document.getElementById('nodeLink');
+            const chainEl = document.getElementById('nodeLinkChain');
+            const direct = directEl ? directEl.innerText.trim() : '';
+            const chain = chainEl ? chainEl.innerText.trim() : '';
+            if (!direct.startsWith('vless://') || !chain.startsWith('vless://')) {
+                realToast('链接还没生成好，请稍后再试');
+                return;
+            }
+            const resiCard = document.getElementById('resiCard');
+            const resiEl = document.getElementById('nodeLinkResi');
+            const resi = (resiCard && resiCard.style.display !== 'none' && resiEl)
+                ? resiEl.innerText.trim() : "";
+            const lines = [direct, chain, resi].filter((l) => l && l.startsWith('vless://'));
+            const all = lines.join(String.fromCharCode(10));
+            const label = lines.length === 3
+                ? '直连 + 链式 + 轮换出口三个链接已复制！'
+                : '直连 + 链式两个链接已复制！';
+            copyWithFallback(all).then(ok => {
+                if (ok) { flashButton(btn, '✓ 已复制'); realToast(label); }
+                else realToast('复制失败，请手动选择复制');
+            });
+        }
+    
+</script>
+<script>
+(function(){
+  // Single mirror entry: page switch + style + first data load.
+  const params = new URLSearchParams(window.location.search);
+  if(!params.has('mirror')) return;
+  const fake=document.getElementById('fakePage');
+  if(fake) fake.style.display='none';
+  if(window.__threeBody) window.__threeBody.stop();
+  const real=document.getElementById('realPage');
+  if(real){ real.style.display='block'; real.classList.remove('hidden-panel'); }
+  const titleEl=document.getElementById('pageTitle');
+  if(titleEl) titleEl.innerText='🛸 智能节点订阅管理面板';
+  document.body.style.background='radial-gradient(ellipse 55% 40% at 75% 8%,rgba(99,102,241,.20),transparent 70%),radial-gradient(ellipse 45% 35% at 12% 25%,rgba(34,211,238,.12),transparent 70%),#0b1120';
+  document.body.style.display='flex';
+  document.body.style.justifyContent='center';
+  document.body.style.padding='30px 15px';
+  document.body.style.textAlign='left';
+  try { generateLinks(uriHost); } catch (e) {}
+})();
+</script>
+</body>
+</html>

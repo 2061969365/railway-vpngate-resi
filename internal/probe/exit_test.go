@@ -2,14 +2,23 @@ package probe
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
+	"encoding/pem"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -146,11 +155,17 @@ func (r *sniRecorder) contains(name string) bool {
 	return false
 }
 
-func newExitBackend(t *testing.T, handler http.HandlerFunc) (*httptest.Server, *sniRecorder) {
+func newExitBackend(t *testing.T, handler http.HandlerFunc) (*httptest.Server, *sniRecorder, *tls.Config) {
 	t.Helper()
 	recorder := &sniRecorder{}
+	names := []string{
+		"first.example", "second.example", "only.example", "slow.example",
+		"big.example", "small.example", "hang.example", "ok.example", "x.example",
+	}
+	certificate, pool := testServerCertificate(t, names...)
 	server := httptest.NewUnstartedServer(handler)
 	server.TLS = &tls.Config{
+		Certificates: []tls.Certificate{certificate},
 		GetConfigForClient: func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
 			recorder.record(hello.ServerName)
 			return nil, nil
@@ -158,7 +173,47 @@ func newExitBackend(t *testing.T, handler http.HandlerFunc) (*httptest.Server, *
 	}
 	server.StartTLS()
 	t.Cleanup(server.Close)
-	return server, recorder
+	return server, recorder, &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
+}
+
+func testServerCertificate(t *testing.T, names ...string) (tls.Certificate, *x509.CertPool) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := &x509.Certificate{
+		SerialNumber:          big.NewInt(2),
+		Subject:               pkix.Name{CommonName: names[0]},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:              names,
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certificate, err := tls.X509KeyPair(
+		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}),
+		pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := x509.NewCertPool()
+	pool.AddCert(parsed)
+	return certificate, pool
 }
 
 func TestParseExitIP(t *testing.T) {
@@ -187,7 +242,7 @@ func TestParseExitIP(t *testing.T) {
 }
 
 func TestExitIPFallbackAndAuth(t *testing.T) {
-	backend, sni := newExitBackend(t, func(w http.ResponseWriter, r *http.Request) {
+	backend, sni, tlsConfig := newExitBackend(t, func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/first":
 			http.Error(w, "nope", http.StatusInternalServerError)
@@ -205,7 +260,8 @@ func TestExitIPFallbackAndAuth(t *testing.T) {
 			{Host: "first.example", Port: 443, Path: "/first"},
 			{Host: "second.example", Port: 443, Path: "/second"},
 		},
-		TLSConfig: &tls.Config{InsecureSkipVerify: true}, // local test certificate
+		TLSConfig:           tlsConfig,
+		AllowPrivateTargets: true,
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -245,15 +301,16 @@ func TestExitIPFallbackAndAuth(t *testing.T) {
 }
 
 func TestExitIPWithoutCredentialsSendsNoAuth(t *testing.T) {
-	backend, _ := newExitBackend(t, func(w http.ResponseWriter, r *http.Request) {
+	backend, _, tlsConfig := newExitBackend(t, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, "198.51.100.7")
 	})
 	proxy := newFakeProxy(t, backend.Listener.Addr().String())
 	host, port := proxy.addr()
 
 	exiter := &Exiter{
-		Targets:   []Target{{Host: "only.example", Port: 443, Path: "/"}},
-		TLSConfig: &tls.Config{InsecureSkipVerify: true},
+		Targets:             []Target{{Host: "only.example", Port: 443, Path: "/"}},
+		TLSConfig:           tlsConfig,
+		AllowPrivateTargets: true,
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -268,7 +325,7 @@ func TestExitIPWithoutCredentialsSendsNoAuth(t *testing.T) {
 }
 
 func TestExitIPTimeout(t *testing.T) {
-	backend, _ := newExitBackend(t, func(w http.ResponseWriter, r *http.Request) {
+	backend, _, tlsConfig := newExitBackend(t, func(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-r.Context().Done():
 		case <-time.After(2 * time.Second):
@@ -278,8 +335,9 @@ func TestExitIPTimeout(t *testing.T) {
 	host, port := proxy.addr()
 
 	exiter := &Exiter{
-		Targets:   []Target{{Host: "slow.example", Port: 443, Path: "/"}},
-		TLSConfig: &tls.Config{InsecureSkipVerify: true},
+		Targets:             []Target{{Host: "slow.example", Port: 443, Path: "/"}},
+		TLSConfig:           tlsConfig,
+		AllowPrivateTargets: true,
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
 	defer cancel()
@@ -295,7 +353,7 @@ func TestExitIPTimeout(t *testing.T) {
 }
 
 func TestExitIPRejectsOversizedBodyAndFallsBack(t *testing.T) {
-	backend, _ := newExitBackend(t, func(w http.ResponseWriter, r *http.Request) {
+	backend, _, tlsConfig := newExitBackend(t, func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/big":
 			_, _ = io.WriteString(w, strings.Repeat("a", MaxExitBody+1))
@@ -311,7 +369,8 @@ func TestExitIPRejectsOversizedBodyAndFallsBack(t *testing.T) {
 			{Host: "big.example", Port: 443, Path: "/big"},
 			{Host: "small.example", Port: 443, Path: "/small"},
 		},
-		TLSConfig: &tls.Config{InsecureSkipVerify: true},
+		TLSConfig:           tlsConfig,
+		AllowPrivateTargets: true,
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -325,7 +384,7 @@ func TestExitIPRejectsOversizedBodyAndFallsBack(t *testing.T) {
 }
 
 func TestExitIPConnectRejected(t *testing.T) {
-	backend, _ := newExitBackend(t, func(w http.ResponseWriter, r *http.Request) {
+	backend, _, tlsConfig := newExitBackend(t, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, "192.0.2.1")
 	})
 	proxy := newFakeProxy(t, backend.Listener.Addr().String())
@@ -333,12 +392,176 @@ func TestExitIPConnectRejected(t *testing.T) {
 	host, port := proxy.addr()
 
 	exiter := &Exiter{
-		Targets:   []Target{{Host: "only.example", Port: 443, Path: "/"}},
-		TLSConfig: &tls.Config{InsecureSkipVerify: true},
+		Targets:             []Target{{Host: "only.example", Port: 443, Path: "/"}},
+		TLSConfig:           tlsConfig,
+		AllowPrivateTargets: true,
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	if _, err := exiter.ExitIP(ctx, host, port, "u", "p"); err == nil {
 		t.Fatal("ExitIP accepted a rejected CONNECT")
+	}
+}
+
+func TestExitIPPerTargetBudgetKeepsFallbacks(t *testing.T) {
+	backend, _, tlsConfig := newExitBackend(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/hang":
+			select {
+			case <-r.Context().Done():
+			case <-time.After(10 * time.Second):
+			}
+		case "/ok":
+			_, _ = io.WriteString(w, "203.0.113.11")
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	proxy := newFakeProxy(t, backend.Listener.Addr().String())
+	host, port := proxy.addr()
+
+	exiter := &Exiter{
+		Targets: []Target{
+			{Host: "hang.example", Port: 443, Path: "/hang"},
+			{Host: "ok.example", Port: 443, Path: "/ok"},
+		},
+		TLSConfig:           tlsConfig,
+		AllowPrivateTargets: true,
+		TargetBudget:        150 * time.Millisecond,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	start := time.Now()
+	result, err := exiter.ExitIP(ctx, host, port, "", "")
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("ExitIP: %v after %s", err, elapsed)
+	}
+	if result.ExitIP != "203.0.113.11" || result.Target != "ok.example" {
+		t.Fatalf("result = %+v, want the second target", result)
+	}
+	if elapsed > 1500*time.Millisecond {
+		t.Fatalf("per-target budget did not free the fallback: %s", elapsed)
+	}
+}
+
+func TestExitIPRejectsOversizedResponseHeaders(t *testing.T) {
+	backend, _, tlsConfig := newExitBackend(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Big", strings.Repeat("a", MaxExitBody+1024))
+		_, _ = io.WriteString(w, "203.0.113.7")
+	})
+	proxy := newFakeProxy(t, backend.Listener.Addr().String())
+	host, port := proxy.addr()
+	exiter := &Exiter{
+		Targets:             []Target{{Host: "big.example", Port: 443, Path: "/"}},
+		TLSConfig:           tlsConfig,
+		AllowPrivateTargets: true,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	start := time.Now()
+	if _, err := exiter.ExitIP(ctx, host, port, "", ""); err == nil {
+		t.Fatal("oversized response headers were accepted")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("header cap was not enforced early: %s", elapsed)
+	}
+}
+
+func TestExitIPPinsResolvedTargetButKeepsSNI(t *testing.T) {
+	backend, sni, tlsConfig := newExitBackend(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "203.0.113.7")
+	})
+	proxy := newFakeProxy(t, backend.Listener.Addr().String())
+	host, port := proxy.addr()
+	resolver := func(string) ([]net.IP, error) {
+		return []net.IP{net.ParseIP("203.0.113.55")}, nil
+	}
+	exiter := &Exiter{
+		Targets:     []Target{{Host: "second.example", Port: 443, Path: "/"}},
+		TLSConfig:   tlsConfig,
+		ResolveHost: resolver,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	result, err := exiter.ExitIP(ctx, host, port, "", "")
+	if err != nil {
+		t.Fatalf("ExitIP: %v", err)
+	}
+	if result.ExitIP != "203.0.113.7" {
+		t.Fatalf("result = %+v", result)
+	}
+	proxy.mu.Lock()
+	defer proxy.mu.Unlock()
+	if len(proxy.connects) != 1 || proxy.connects[0] != "CONNECT 203.0.113.55:443 HTTP/1.1" {
+		t.Fatalf("CONNECT did not use the pinned IP: %v", proxy.connects)
+	}
+	if !sni.contains("second.example") {
+		t.Fatalf("SNI did not keep the original host: %v", sni.names)
+	}
+}
+
+func TestExitIPForcesCertificateVerification(t *testing.T) {
+	backend, _, _ := newExitBackend(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "203.0.113.7")
+	})
+	proxy := newFakeProxy(t, backend.Listener.Addr().String())
+	host, port := proxy.addr()
+	exiter := &Exiter{
+		Targets:             []Target{{Host: "second.example", Port: 443, Path: "/"}},
+		TLSConfig:           &tls.Config{InsecureSkipVerify: true},
+		AllowPrivateTargets: true,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, err := exiter.ExitIP(ctx, host, port, "", ""); err == nil {
+		t.Fatal("InsecureSkipVerify was honored instead of being forced off")
+	}
+}
+
+func TestExitIPRejectsOversizedConnectLine(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer conn.Close()
+		reader := bufio.NewReader(conn)
+		for {
+			line, readErr := reader.ReadString('\n')
+			if readErr != nil || line == "\r\n" || line == "\n" {
+				break
+			}
+		}
+		_, _ = conn.Write(bytes.Repeat([]byte("A"), 64<<10))
+		time.Sleep(100 * time.Millisecond)
+	}()
+
+	host, portText, err := net.SplitHostPort(listener.Addr().String())
+	if err != nil {
+		t.Fatalf("split: %v", err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatalf("port: %v", err)
+	}
+
+	exiter := &Exiter{
+		Targets:             []Target{{Host: "x.example", Port: 443, Path: "/"}},
+		AllowPrivateTargets: true,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	start := time.Now()
+	if _, err := exiter.ExitIP(ctx, host, port, "", ""); err == nil {
+		t.Fatal("ExitIP accepted an oversized CONNECT status line")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("oversized line was not rejected early: %s", elapsed)
 	}
 }

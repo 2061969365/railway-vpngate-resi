@@ -11,12 +11,33 @@ import json
 import os
 import threading
 import time
+import urllib.parse
 import urllib.request
 
 DEFAULT_BASE_URL = "http://127.0.0.1:39001"
 DEFAULT_DELAY_URL = "https://www.gstatic.com/generate_204"
 
 _DISABLED_VALUES = frozenset({"0", "false", "no", "off"})
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """The sidecar never redirects; refuse instead of forwarding the token."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _origin(url: str) -> tuple[str, str, int | None]:
+    parts = urllib.parse.urlsplit(url)
+    scheme = (parts.scheme or "").lower()
+    try:
+        port = parts.port
+    except ValueError:
+        port = None
+    if port is None:
+        port = 443 if scheme == "https" else (80 if scheme == "http" else None)
+    return (scheme, (parts.hostname or "").lower(), port)
+
 
 
 def _delay_results(body: dict | None) -> list[dict] | None:
@@ -74,12 +95,20 @@ class ProbeClient:
         breaker_cooldown: float = 5.0,
     ) -> None:
         base = (base_url or DEFAULT_BASE_URL).strip().rstrip("/")
-        if not base.startswith(("http://", "https://")):
+        if "://" not in base:
             base = "http://" + base
+        parsed = urllib.parse.urlsplit(base)
+        if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname:
+            raise ValueError("base_url must be an http(s) URL with a host")
         self.base_url = base
         self.token = (token or "").strip()
         self.timeout = max(0.1, float(timeout))
         self._breaker = _Breaker(breaker_threshold, breaker_cooldown)
+        # No environment proxies (an HTTP_PROXY would receive the bearer
+        # token) and no redirects (a 302 would forward it cross-origin).
+        self._opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}), _NoRedirect()
+        )
 
     @classmethod
     def from_env(cls) -> "ProbeClient | None":
@@ -199,6 +228,9 @@ class ProbeClient:
     def _request(self, method: str, path: str, payload: dict | None = None, timeout: float | None = None):
         if not self._breaker.allow():
             return None
+        url = self.base_url + path
+        if _origin(url) != _origin(self.base_url):
+            return None
         data = None
         headers = {"Accept": "application/json"}
         if self.token:
@@ -207,10 +239,10 @@ class ProbeClient:
             data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
             headers["Content-Type"] = "application/json"
         request = urllib.request.Request(
-            self.base_url + path, data=data, headers=headers, method=method
+            url, data=data, headers=headers, method=method
         )
         try:
-            with urllib.request.urlopen(request, timeout=timeout or self.timeout) as response:
+            with self._opener.open(request, timeout=timeout or self.timeout) as response:
                 raw = response.read(1 << 20)
         except Exception:
             self._breaker.failure()

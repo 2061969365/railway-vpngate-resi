@@ -1,0 +1,381 @@
+{
+  "name": "tags-two-pass",
+  "kind": "tags",
+  "old": [
+    {
+      "server": "203.0.113.10",
+      "server_port": 443,
+      "country": "",
+      "country_short": "",
+      "speed": 0,
+      "latency_ms": null,
+      "real_latency_ms": null,
+      "endpoint": {
+        "type": "openvpn-client",
+        "tag": "vpngate-0",
+        "server": "203.0.113.10",
+        "server_port": 443,
+        "network": "tcp",
+        "username": "vpn",
+        "password": "vpn",
+        "tls": {
+          "certificate": "-----BEGIN CERTIFICATE-----\nQ0E=\n-----END CERTIFICATE-----",
+          "certificate_profile": "legacy",
+          "client_certificate": "-----BEGIN CERTIFICATE-----\nQ0VSVA==\n-----END CERTIFICATE-----",
+          "client_key": "-----BEGIN PRIVATE KEY-----\nS0VZ\n-----END PRIVATE KEY-----"
+        },
+        "data_ciphers": [
+          "AES-128-CBC",
+          "AES-256-CBC",
+          "BF-CBC"
+        ],
+        "data_ciphers_fallback": "AES-128-CBC",
+        "auth": "SHA1",
+        "auth_retry": "nointeract",
+        "on_demand": true,
+        "ping_interval": "10s",
+        "ping_restart": "60s",
+        "system": false,
+        "redirect_gateway": true
+      }
+    },
+    {
+      "server": "203.0.113.11",
+      "server_port": 443,
+      "country": "",
+      "country_short": "",
+      "speed": 0,
+      "latency_ms": null,
+      "real_latency_ms": null,
+      "endpoint": {
+        "type": "openvpn-client",
+        "tag": "vpngate-1",
+        "server": "203.0.113.11",
+        "server_port": 443,
+        "network": "tcp",
+        "username": "vpn",
+        "password": "vpn",
+        "tls": {
+          "certificate": "-----BEGIN CERTIFICATE-----\nQ0E=\n-----END CERTIFICATE-----",
+          "certificate_profile": "legacy",
+          "client_certificate": "-----BEGIN CERTIFICATE-----\nQ0VSVA==\n-----END CERTIFICATE-----",
+          "client_key": "-----BEGIN PRIVATE KEY-----\nS0VZ\n-----END PRIVATE KEY-----"
+        },
+        "data_ciphers": [
+          "AES-128-CBC",
+          "AES-256-CBC",
+          "BF-CBC"
+        ],
+        "data_ciphers_fallback": "AES-128-CBC",
+        "auth": "SHA1",
+        "auth_retry": "nointeract",
+        "on_demand": true,
+        "ping_interval": "10s",
+        "ping_restart": "60s",
+        "system": false,
+        "redirect_gateway": true
+      }
+    }
+  ],
+  "new": [
+    {
+      "server": "198.51.100.20",
+      "server_port": 443,
+      "country": "",
+      "country_short": "",
+      "speed": 0,
+      "latency_ms": null,
+      "real_latency_ms": null,
+      "endpoint": {
+        "type": "openvpn-client",
+        "tag": "vpngate-2",
+        "server": "198.51.100.20",
+        "server_port": 443,
+        "network": "tcp",
+        "username": "vpn",
+        "password": "vpn",
+        "tls": {
+          "certificate": "-----BEGIN CERTIFICATE-----\nQ0E=\n-----END CERTIFICATE-----",
+          "certificate_profile": "legacy",
+          "client_certificate": "-----BEGIN CERTIFICATE-----\nQ0VSVA==\n-----END CERTIFICATE-----",
+          "client_key": "-----BEGIN PRIVATE KEY-----\nS0VZ\n-----END PRIVATE KEY-----"
+        },
+        "data_ciphers": [
+          "AES-128-CBC",
+          "AES-256-CBC",
+          "BF-CBC"
+        ],
+        "data_ciphers_fallback": "AES-128-CBC",
+        "auth": "SHA1",
+        "auth_retry": "nointeract",
+        "on_demand": true,
+        "ping_interval": "10s",
+        "ping_restart": "60s",
+        "system": false,
+        "redirect_gateway": true
+      }
+    },
+    {
+      "server": "203.0.113.11",
+      "server_port": 443,
+      "country": "",
+      "country_short": "",
+      "speed": 0,
+      "latency_ms": null,
+      "real_latency_ms": null,
+      "endpoint": {
+        "type": "openvpn-client",
+        "tag": "vpngate-1",
+        "server": "203.0.113.11",
+        "server_port": 443,
+        "network": "tcp",
+        "username": "vpn",
+        "password": "vpn",
+        "tls": {
+          "certificate": "-----BEGIN CERTIFICATE-----\nQ0E=\n-----END CERTIFICATE-----",
+          "certificate_profile": "legacy",
+          "client_certificate": "-----BEGIN CERTIFICATE-----\nQ0VSVA==\n-----END CERTIFICATE-----",
+          "client_key": "-----BEGIN PRIVATE KEY-----\nS0VZ\n-----END PRIVATE KEY-----"
+        },
+        "data_ciphers": [
+          "AES-128-CBC",
+          "AES-256-CBC",
+          "BF-CBC"
+        ],
+        "data_ciphers_fallback": "AES-128-CBC",
+        "auth": "SHA1",
+        "auth_retry": "nointeract",
+        "on_demand": true,
+        "ping_interval": "10s",
+        "ping_restart": "60s",
+        "system": false,
+        "redirect_gateway": true
+      }
+    },
+    {
+      "server": "203.0.113.10",
+      "server_port": 443,
+      "country": "",
+      "country_short": "",
+      "speed": 0,
+      "latency_ms": null,
+      "real_latency_ms": null,
+      "endpoint": {
+        "type": "openvpn-client",
+        "tag": "vpngate-0",
+        "server": "203.0.113.10",
+        "server_port": 443,
+        "network": "tcp",
+        "username": "vpn",
+        "password": "vpn",
+        "tls": {
+          "certificate": "-----BEGIN CERTIFICATE-----\nQ0E=\n-----END CERTIFICATE-----",
+          "certificate_profile": "legacy",
+          "client_certificate": "-----BEGIN CERTIFICATE-----\nQ0VSVA==\n-----END CERTIFICATE-----",
+          "client_key": "-----BEGIN PRIVATE KEY-----\nS0VZ\n-----END PRIVATE KEY-----"
+        },
+        "data_ciphers": [
+          "AES-128-CBC",
+          "AES-256-CBC",
+          "BF-CBC"
+        ],
+        "data_ciphers_fallback": "AES-128-CBC",
+        "auth": "SHA1",
+        "auth_retry": "nointeract",
+        "on_demand": true,
+        "ping_interval": "10s",
+        "ping_restart": "60s",
+        "system": false,
+        "redirect_gateway": true
+      }
+    },
+    {
+      "server": "198.51.100.21",
+      "server_port": 443,
+      "country": "",
+      "country_short": "",
+      "speed": 0,
+      "latency_ms": null,
+      "real_latency_ms": null,
+      "endpoint": {
+        "type": "openvpn-client",
+        "tag": "vpngate-3",
+        "server": "198.51.100.21",
+        "server_port": 443,
+        "network": "tcp",
+        "username": "vpn",
+        "password": "vpn",
+        "tls": {
+          "certificate": "-----BEGIN CERTIFICATE-----\nQ0E=\n-----END CERTIFICATE-----",
+          "certificate_profile": "legacy",
+          "client_certificate": "-----BEGIN CERTIFICATE-----\nQ0VSVA==\n-----END CERTIFICATE-----",
+          "client_key": "-----BEGIN PRIVATE KEY-----\nS0VZ\n-----END PRIVATE KEY-----"
+        },
+        "data_ciphers": [
+          "AES-128-CBC",
+          "AES-256-CBC",
+          "BF-CBC"
+        ],
+        "data_ciphers_fallback": "AES-128-CBC",
+        "auth": "SHA1",
+        "auth_retry": "nointeract",
+        "on_demand": true,
+        "ping_interval": "10s",
+        "ping_restart": "60s",
+        "system": false,
+        "redirect_gateway": true
+      }
+    }
+  ],
+  "prefix": "vpngate",
+  "expected": [
+    {
+      "server": "198.51.100.20",
+      "server_port": 443,
+      "country": "",
+      "country_short": "",
+      "speed": 0,
+      "latency_ms": null,
+      "real_latency_ms": null,
+      "endpoint": {
+        "type": "openvpn-client",
+        "tag": "vpngate-2",
+        "server": "198.51.100.20",
+        "server_port": 443,
+        "network": "tcp",
+        "username": "vpn",
+        "password": "vpn",
+        "tls": {
+          "certificate": "-----BEGIN CERTIFICATE-----\nQ0E=\n-----END CERTIFICATE-----",
+          "certificate_profile": "legacy",
+          "client_certificate": "-----BEGIN CERTIFICATE-----\nQ0VSVA==\n-----END CERTIFICATE-----",
+          "client_key": "-----BEGIN PRIVATE KEY-----\nS0VZ\n-----END PRIVATE KEY-----"
+        },
+        "data_ciphers": [
+          "AES-128-CBC",
+          "AES-256-CBC",
+          "BF-CBC"
+        ],
+        "data_ciphers_fallback": "AES-128-CBC",
+        "auth": "SHA1",
+        "auth_retry": "nointeract",
+        "on_demand": true,
+        "ping_interval": "10s",
+        "ping_restart": "60s",
+        "system": false,
+        "redirect_gateway": true
+      }
+    },
+    {
+      "server": "203.0.113.11",
+      "server_port": 443,
+      "country": "",
+      "country_short": "",
+      "speed": 0,
+      "latency_ms": null,
+      "real_latency_ms": null,
+      "endpoint": {
+        "type": "openvpn-client",
+        "tag": "vpngate-1",
+        "server": "203.0.113.11",
+        "server_port": 443,
+        "network": "tcp",
+        "username": "vpn",
+        "password": "vpn",
+        "tls": {
+          "certificate": "-----BEGIN CERTIFICATE-----\nQ0E=\n-----END CERTIFICATE-----",
+          "certificate_profile": "legacy",
+          "client_certificate": "-----BEGIN CERTIFICATE-----\nQ0VSVA==\n-----END CERTIFICATE-----",
+          "client_key": "-----BEGIN PRIVATE KEY-----\nS0VZ\n-----END PRIVATE KEY-----"
+        },
+        "data_ciphers": [
+          "AES-128-CBC",
+          "AES-256-CBC",
+          "BF-CBC"
+        ],
+        "data_ciphers_fallback": "AES-128-CBC",
+        "auth": "SHA1",
+        "auth_retry": "nointeract",
+        "on_demand": true,
+        "ping_interval": "10s",
+        "ping_restart": "60s",
+        "system": false,
+        "redirect_gateway": true
+      }
+    },
+    {
+      "server": "203.0.113.10",
+      "server_port": 443,
+      "country": "",
+      "country_short": "",
+      "speed": 0,
+      "latency_ms": null,
+      "real_latency_ms": null,
+      "endpoint": {
+        "type": "openvpn-client",
+        "tag": "vpngate-0",
+        "server": "203.0.113.10",
+        "server_port": 443,
+        "network": "tcp",
+        "username": "vpn",
+        "password": "vpn",
+        "tls": {
+          "certificate": "-----BEGIN CERTIFICATE-----\nQ0E=\n-----END CERTIFICATE-----",
+          "certificate_profile": "legacy",
+          "client_certificate": "-----BEGIN CERTIFICATE-----\nQ0VSVA==\n-----END CERTIFICATE-----",
+          "client_key": "-----BEGIN PRIVATE KEY-----\nS0VZ\n-----END PRIVATE KEY-----"
+        },
+        "data_ciphers": [
+          "AES-128-CBC",
+          "AES-256-CBC",
+          "BF-CBC"
+        ],
+        "data_ciphers_fallback": "AES-128-CBC",
+        "auth": "SHA1",
+        "auth_retry": "nointeract",
+        "on_demand": true,
+        "ping_interval": "10s",
+        "ping_restart": "60s",
+        "system": false,
+        "redirect_gateway": true
+      }
+    },
+    {
+      "server": "198.51.100.21",
+      "server_port": 443,
+      "country": "",
+      "country_short": "",
+      "speed": 0,
+      "latency_ms": null,
+      "real_latency_ms": null,
+      "endpoint": {
+        "type": "openvpn-client",
+        "tag": "vpngate-3",
+        "server": "198.51.100.21",
+        "server_port": 443,
+        "network": "tcp",
+        "username": "vpn",
+        "password": "vpn",
+        "tls": {
+          "certificate": "-----BEGIN CERTIFICATE-----\nQ0E=\n-----END CERTIFICATE-----",
+          "certificate_profile": "legacy",
+          "client_certificate": "-----BEGIN CERTIFICATE-----\nQ0VSVA==\n-----END CERTIFICATE-----",
+          "client_key": "-----BEGIN PRIVATE KEY-----\nS0VZ\n-----END PRIVATE KEY-----"
+        },
+        "data_ciphers": [
+          "AES-128-CBC",
+          "AES-256-CBC",
+          "BF-CBC"
+        ],
+        "data_ciphers_fallback": "AES-128-CBC",
+        "auth": "SHA1",
+        "auth_retry": "nointeract",
+        "on_demand": true,
+        "ping_interval": "10s",
+        "ping_restart": "60s",
+        "system": false,
+        "redirect_gateway": true
+      }
+    }
+  ]
+}

@@ -16,4 +16,12 @@ singbox-railway.json.last-good
 singbox-railway.json.stderr.log
 smoke.log
 .resi-rot-*
+settings.json
+*.stderr.log
+*.log
+zen-direct-400s.log
+.pytest_cache/
+.review/
+.env
+.venv/
 

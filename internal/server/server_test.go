@@ -2,7 +2,9 @@ package server
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -169,11 +171,14 @@ func TestExitEndpointThroughFakeCONNECTProxy(t *testing.T) {
 	t.Cleanup(tlsServer.Close)
 	proxy := newTestConnectProxy(t, tlsServer.Listener.Addr().String())
 	host, port := proxy.address(t)
+	pool := x509.NewCertPool()
+	pool.AddCert(tlsServer.Certificate())
 
 	handler := New(Options{
 		Exit: &probe.Exiter{
-			Targets:   []probe.Target{{Host: "exit.example", Port: 443, Path: "/"}},
-			TLSConfig: &tls.Config{InsecureSkipVerify: true}, // local test certificate
+			Targets:             []probe.Target{{Host: "exit.example", Port: 443, Path: "/"}},
+			TLSConfig:           &tls.Config{RootCAs: pool, ServerName: "example.com"},
+			AllowPrivateTargets: true,
 		},
 	})
 	payload := fmt.Sprintf(`{"host":%q,"port":%d,"username":"u","password":"p","timeout_ms":3000}`, host, port)
@@ -203,8 +208,8 @@ func TestExitEndpointThroughFakeCONNECTProxy(t *testing.T) {
 func TestExitEndpointFailureIs200(t *testing.T) {
 	handler := New(Options{
 		Exit: &probe.Exiter{
-			Targets:   []probe.Target{{Host: "exit.example", Port: 443, Path: "/"}},
-			TLSConfig: &tls.Config{InsecureSkipVerify: true},
+			Targets:             []probe.Target{{Host: "exit.example", Port: 443, Path: "/"}},
+			AllowPrivateTargets: true,
 		},
 	})
 	payload := `{"host":"127.0.0.1","port":1,"timeout_ms":250}`
@@ -360,6 +365,103 @@ func TestDelayEndpointWithoutClash(t *testing.T) {
 		strings.NewReader(`{"tags":["vpngate-1"]}`)))
 	if recorder.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body)
+	}
+}
+
+func TestExitRejectsNonLoopbackHost(t *testing.T) {
+	handler := New(Options{Exit: &probe.Exiter{}})
+	for _, host := range []string{"10.0.0.1", "192.168.1.10", "169.254.169.254", "8.8.8.8", "0.0.0.0"} {
+		t.Run(host, func(t *testing.T) {
+			payload := fmt.Sprintf(`{"host":%q,"port":3001,"timeout_ms":100}`, host)
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/exit", strings.NewReader(payload)))
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("host %q status = %d, want 400; body = %s", host, recorder.Code, recorder.Body)
+			}
+		})
+	}
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/exit",
+		strings.NewReader(`{"host":"localhost","port":1,"timeout_ms":100}`)))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("loopback host rejected: status = %d, body = %s", recorder.Code, recorder.Body)
+	}
+}
+
+func TestDelayRejectsTooManyTags(t *testing.T) {
+	clash := newClashServer(t, http.StatusOK)
+	handler := New(Options{Clash: &probe.ClashClient{BaseURL: clash.URL}})
+	tags := make([]string, maxTags+1)
+	for index := range tags {
+		tags[index] = fmt.Sprintf("tag-%d", index)
+	}
+	body, err := json.Marshal(delayRequest{Tags: tags})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/delay", bytes.NewReader(body)))
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body = %s", recorder.Code, recorder.Body)
+	}
+}
+
+func TestDelayNormalizesTags(t *testing.T) {
+	clash := newClashServer(t, http.StatusOK)
+	handler := New(Options{Clash: &probe.ClashClient{BaseURL: clash.URL}})
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/delay",
+		strings.NewReader(`{"tags":["a","","a"," b "],"timeout_ms":500}`)))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body)
+	}
+	var payload delayPayload
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(payload.Results) != 2 {
+		t.Fatalf("results = %+v, want empty and duplicate tags removed", payload.Results)
+	}
+	if payload.Results[0].Tag != "a" || payload.Results[1].Tag != "b" {
+		t.Fatalf("tags = %q/%q, want a/b", payload.Results[0].Tag, payload.Results[1].Tag)
+	}
+}
+
+func TestDelayRejectsInvalidURL(t *testing.T) {
+	clash := newClashServer(t, http.StatusOK)
+	handler := New(Options{Clash: &probe.ClashClient{BaseURL: clash.URL}})
+	rejected := []string{
+		"http://example.com/generate_204",
+		"ftp://127.0.0.1/generate_204",
+		"file:///etc/passwd",
+		"https://" + strings.Repeat("a", 3000) + ".com/",
+	}
+	for _, probeURL := range rejected {
+		payload := fmt.Sprintf(`{"tags":["t"],"url":%q,"timeout_ms":100}`, probeURL)
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/delay", strings.NewReader(payload)))
+		if recorder.Code != http.StatusBadRequest {
+			t.Fatalf("url %q status = %d, want 400; body = %s", probeURL, recorder.Code, recorder.Body)
+		}
+	}
+
+	for _, probeURL := range []string{"https://example.com/generate_204", "http://127.0.0.1:8080/generate_204"} {
+		payload := fmt.Sprintf(`{"tags":["t"],"url":%q,"timeout_ms":100}`, probeURL)
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/delay", strings.NewReader(payload)))
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("url %q status = %d, want 200; body = %s", probeURL, recorder.Code, recorder.Body)
+		}
+	}
+}
+
+func TestNewClampsConcurrency(t *testing.T) {
+	if handler := New(Options{Concurrency: 1000}); handler.concurrency != maxConcurrency {
+		t.Fatalf("concurrency = %d, want %d", handler.concurrency, maxConcurrency)
+	}
+	if handler := New(Options{Concurrency: -1}); handler.concurrency != 8 {
+		t.Fatalf("concurrency = %d, want default 8", handler.concurrency)
 	}
 }
 

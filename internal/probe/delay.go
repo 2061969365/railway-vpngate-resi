@@ -19,6 +19,11 @@ const DefaultDelayURL = "https://www.gstatic.com/generate_204"
 
 const (
 	maxClashBody = 64 << 10
+	// maxDelayTags / maxDelayConcurrency are defensive caps. The server
+	// enforces the same limits, but Delays is exported and may be called with
+	// unvalidated input.
+	maxDelayTags        = 256
+	maxDelayConcurrency = 64
 	// delayContextMarginMS must stay below the Python caller's fixed 2s
 	// transport margin (timeout_ms/1000 + 2.0). Keeping 500ms of that margin
 	// in reserve leaves room for the response to reach the caller.
@@ -87,12 +92,18 @@ func (c *ClashClient) Version(ctx context.Context) error {
 // Delays probes every tag concurrently, bounded by concurrency. The returned
 // slice is in the same order as tags.
 func (c *ClashClient) Delays(ctx context.Context, tags []string, probeURL string, timeoutMS, concurrency int) []DelayResult {
+	if len(tags) > maxDelayTags {
+		tags = tags[:maxDelayTags]
+	}
 	results := make([]DelayResult, len(tags))
 	if len(tags) == 0 {
 		return results
 	}
 	if concurrency < 1 {
 		concurrency = 1
+	}
+	if concurrency > maxDelayConcurrency {
+		concurrency = maxDelayConcurrency
 	}
 	limit := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup

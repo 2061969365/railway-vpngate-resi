@@ -53,6 +53,18 @@ func TestFromGetterInvalidNumbersFallBack(t *testing.T) {
 	}
 }
 
+func TestFromGetterClampsConcurrency(t *testing.T) {
+	cfg := FromGetter(func(key string) string {
+		if key == "PROBE_CONCURRENCY" {
+			return "1000000000"
+		}
+		return ""
+	})
+	if cfg.Concurrency != MaxConcurrency {
+		t.Fatalf("Concurrency = %d, want %d", cfg.Concurrency, MaxConcurrency)
+	}
+}
+
 func TestValidateLoopback(t *testing.T) {
 	allowed := []string{"127.0.0.1:39001", "localhost:39001", "[::1]:39001", "127.0.0.2:1"}
 	for _, listen := range allowed {

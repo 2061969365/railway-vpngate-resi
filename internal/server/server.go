@@ -7,8 +7,11 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -18,6 +21,16 @@ import (
 const (
 	maxRequestBody = 1 << 20
 	maxTimeoutMS   = 120_000
+	// maxConcurrency mirrors config.MaxConcurrency; server.New clamps again so
+	// callers that build Options directly cannot bypass the bound.
+	maxConcurrency = 64
+	// maxTags bounds /v1/delay fan-out. The body cap alone allows ~100k short
+	// tags, which would spawn as many goroutines.
+	maxTags = 256
+	// maxTagLength bounds one tag before it is embedded in a Clash path.
+	maxTagLength = 256
+	// maxProbeURLLength bounds the caller-supplied delay URL.
+	maxProbeURLLength = 2048
 	// delayFallbackBudget bounds the extra /version check after all delay
 	// probes failed. A slow delay batch already proves the Clash data path is
 	// unhealthy; spending the caller's remaining deadline on a second round
@@ -72,6 +85,9 @@ func New(options Options) *Server {
 	concurrency := options.Concurrency
 	if concurrency <= 0 {
 		concurrency = 8
+	}
+	if concurrency > maxConcurrency {
+		concurrency = maxConcurrency
 	}
 	clashTimeout := options.ClashCheckTimeout
 	if clashTimeout <= 0 {
@@ -176,7 +192,12 @@ func (s *Server) handleExit(w http.ResponseWriter, r *http.Request) {
 	if !s.decode(w, r, &request) {
 		return
 	}
-	if strings.TrimSpace(request.Host) == "" || request.Port < 1 || request.Port > 65535 {
+	host := strings.TrimSpace(request.Host)
+	if host == "" || request.Port < 1 || request.Port > 65535 {
+		writeJSON(w, http.StatusBadRequest, errorPayload{Error: "invalid host or port"})
+		return
+	}
+	if err := validateLoopbackHost(r.Context(), host); err != nil {
 		writeJSON(w, http.StatusBadRequest, errorPayload{Error: "invalid host or port"})
 		return
 	}
@@ -214,9 +235,25 @@ func (s *Server) handleDelay(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, errorPayload{Error: "clash unavailable"})
 		return
 	}
+	if len(request.Tags) > maxTags {
+		writeJSON(w, http.StatusBadRequest, errorPayload{Error: "too many tags"})
+		return
+	}
+	tags, err := normalizeTags(request.Tags)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errorPayload{Error: "invalid tag"})
+		return
+	}
 	probeURL := strings.TrimSpace(request.URL)
 	if probeURL == "" {
 		probeURL = probe.DefaultDelayURL
+	} else {
+		validated, err := validateProbeURL(probeURL)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, errorPayload{Error: "invalid url"})
+			return
+		}
+		probeURL = validated
 	}
 	timeoutMS := request.TimeoutMS
 	if timeoutMS <= 0 {
@@ -226,7 +263,7 @@ func (s *Server) handleDelay(w http.ResponseWriter, r *http.Request) {
 		timeoutMS = maxTimeoutMS
 	}
 	started := time.Now()
-	results := s.clash.Delays(r.Context(), request.Tags, probeURL, timeoutMS, s.concurrency)
+	results := s.clash.Delays(r.Context(), tags, probeURL, timeoutMS, s.concurrency)
 	if len(results) == 0 || allDelaysFailed(results) {
 		if time.Since(started) < delayFallbackBudget && !s.clashReachable(r.Context()) {
 			writeJSON(w, http.StatusServiceUnavailable, errorPayload{Error: "clash unavailable"})
@@ -265,6 +302,92 @@ func (s *Server) clashReachable(ctx context.Context) bool {
 	checkCtx, cancel := context.WithTimeout(ctx, s.clashCheckTimeout)
 	defer cancel()
 	return s.clash.Version(checkCtx) == nil
+}
+
+// validateLoopbackHost restricts /v1/exit to the local mixed inbound. The
+// endpoint dials whatever host it is given and issues a CONNECT through it, so
+// accepting non-loopback addresses would turn the sidecar into a local port
+// scanner. Domain names are resolved first and must resolve to loopback only.
+func validateLoopbackHost(ctx context.Context, host string) error {
+	if isLoopbackName(host) {
+		return nil
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return fmt.Errorf("host %q is not loopback", host)
+	}
+	lookupCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	addresses, err := net.DefaultResolver.LookupIP(lookupCtx, "ip", host)
+	if err != nil || len(addresses) == 0 {
+		return fmt.Errorf("host %q cannot be resolved", host)
+	}
+	for _, address := range addresses {
+		if !address.IsLoopback() {
+			return fmt.Errorf("host %q resolves outside loopback", host)
+		}
+	}
+	return nil
+}
+
+func isLoopbackName(host string) bool {
+	host = strings.TrimSpace(host)
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// normalizeTags trims, drops empty tags, and removes duplicates while keeping
+// the caller's order. Duplicate tags would otherwise probe the same proxy twice
+// and produce ambiguous results.
+func normalizeTags(tags []string) ([]string, error) {
+	normalized := make([]string, 0, len(tags))
+	seen := make(map[string]struct{}, len(tags))
+	for _, tag := range tags {
+		tag = strings.TrimSpace(tag)
+		if tag == "" {
+			continue
+		}
+		if len(tag) > maxTagLength {
+			return nil, fmt.Errorf("tag exceeds %d bytes", maxTagLength)
+		}
+		if _, ok := seen[tag]; ok {
+			continue
+		}
+		seen[tag] = struct{}{}
+		normalized = append(normalized, tag)
+	}
+	return normalized, nil
+}
+
+// validateProbeURL keeps /v1/delay from becoming an arbitrary-URL fetcher
+// through the Clash outbound. https is always allowed; http is allowed only for
+// loopback test servers.
+func validateProbeURL(raw string) (string, error) {
+	if len(raw) > maxProbeURLLength {
+		return "", fmt.Errorf("url exceeds %d bytes", maxProbeURLLength)
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return "", err
+	}
+	if parsed.Host == "" {
+		return "", fmt.Errorf("url has no host")
+	}
+	if parsed.User != nil {
+		return "", fmt.Errorf("url must not carry credentials")
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "https":
+	case "http":
+		if !isLoopbackName(parsed.Hostname()) {
+			return "", fmt.Errorf("http url must target loopback")
+		}
+	default:
+		return "", fmt.Errorf("url must use https")
+	}
+	return parsed.String(), nil
 }
 
 func (s *Server) decode(w http.ResponseWriter, r *http.Request, destination any) bool {

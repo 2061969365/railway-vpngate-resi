@@ -1,0 +1,5 @@
+# Reproducible test tooling for CI and local runs.
+# Pinned to the interpreter version measured in this workspace
+# (`python -m pytest --version` -> pytest 9.0.3).  Update this file and the
+# workflows together; tests/test_supply_chain.py enforces an exact pin.
+pytest==9.0.3

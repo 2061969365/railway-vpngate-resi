@@ -1,0 +1,130 @@
+{
+  "name": "snapshot-basic",
+  "kind": "snapshot",
+  "csv": "#HostName,IP,Score,Ping,Speed,CountryLong,CountryShort,NumVpnSessions,Uptime,TotalUsers,TotalTraffic,LogType,Operator,Message,OpenVPN_ConfigData_Base64\n198.51.100.1,203.0.113.1,0,0,1000,Japan,jp,0,0,0,0,,,,Y2xpZW50CmRldiB0dW4KcHJvdG8gdGNwLWNsaWVudApyZW1vdGUgMTk4LjUxLjEwMC4xIDQ0MyB0Y3AKY2lwaGVyIEFFUy0xMjgtQ0JDCmF1dGggU0hBMQphdXRoLXVzZXItcGFzcwo8Y2E+Ci0tLS0tQkVHSU4gQ0VSVElGSUNBVEUtLS0tLQpRMEU9Ci0tLS0tRU5EIENFUlRJRklDQVRFLS0tLS0KPC9jYT4KPGNlcnQ+Ci0tLS0tQkVHSU4gQ0VSVElGSUNBVEUtLS0tLQpRMFZTVkE9PQotLS0tLUVORCBDRVJUSUZJQ0FURS0tLS0tCjwvY2VydD4KPGtleT4KLS0tLS1CRUdJTiBQUklWQVRFIEtFWS0tLS0tClMwVloKLS0tLS1FTkQgUFJJVkFURSBLRVktLS0tLQo8L2tleT4K\n198.51.100.2,203.0.113.1,0,0,3000,Korea,kr,0,0,0,0,,,,Y2xpZW50CmRldiB0dW4KcHJvdG8gdGNwLWNsaWVudApyZW1vdGUgMTk4LjUxLjEwMC4yIDQ0MyB0Y3AKcmVtb3RlIDE5OC41MS4xMDAuMjIgODQ0MyB0Y3AKY2lwaGVyIEFFUy0xMjgtQ0JDCmF1dGggU0hBMQphdXRoLXVzZXItcGFzcwo8Y2E+Ci0tLS0tQkVHSU4gQ0VSVElGSUNBVEUtLS0tLQpRMEU9Ci0tLS0tRU5EIENFUlRJRklDQVRFLS0tLS0KPC9jYT4KPGNlcnQ+Ci0tLS0tQkVHSU4gQ0VSVElGSUNBVEUtLS0tLQpRMFZTVkE9PQotLS0tLUVORCBDRVJUSUZJQ0FURS0tLS0tCjwvY2VydD4KPGtleT4KLS0tLS1CRUdJTiBQUklWQVRFIEtFWS0tLS0tClMwVloKLS0tLS1FTkQgUFJJVkFURSBLRVktLS0tLQo8L2tleT4K\n198.51.100.3,203.0.113.1,0,0,2000,United States,us,0,0,0,0,,,,Y2xpZW50CmRldiB0dW4KcHJvdG8gdGNwLWNsaWVudApyZW1vdGUgMTk4LjUxLjEwMC4zIDQ0MyB0Y3AKY2lwaGVyIEFFUy0xMjgtQ0JDCmF1dGggU0hBMQphdXRoLXVzZXItcGFzcwo8Y2E+Ci0tLS0tQkVHSU4gQ0VSVElGSUNBVEUtLS0tLQpRMEU9Ci0tLS0tRU5EIENFUlRJRklDQVRFLS0tLS0KPC9jYT4KPGNlcnQ+Ci0tLS0tQkVHSU4gQ0VSVElGSUNBVEUtLS0tLQpRMFZTVkE9PQotLS0tLUVORCBDRVJUSUZJQ0FURS0tLS0tCjwvY2VydD4KPGtleT4KLS0tLS1CRUdJTiBQUklWQVRFIEtFWS0tLS0tClMwVloKLS0tLS1FTkQgUFJJVkFURSBLRVktLS0tLQo8L2tleT4K\n",
+  "limit": 0,
+  "prefix": "vpngate",
+  "expected": [
+    {
+      "server": "198.51.100.2",
+      "server_port": 443,
+      "country": "Korea",
+      "country_short": "KR",
+      "speed": 3000,
+      "latency_ms": null,
+      "real_latency_ms": null,
+      "endpoint": {
+        "type": "openvpn-client",
+        "tag": "vpngate-0",
+        "servers": [
+          {
+            "server": "198.51.100.2",
+            "server_port": 443,
+            "network": "tcp"
+          },
+          {
+            "server": "198.51.100.22",
+            "server_port": 8443,
+            "network": "tcp"
+          }
+        ],
+        "network": "tcp",
+        "username": "vpn",
+        "password": "vpn",
+        "tls": {
+          "certificate": "-----BEGIN CERTIFICATE-----\nQ0E=\n-----END CERTIFICATE-----",
+          "certificate_profile": "legacy",
+          "client_certificate": "-----BEGIN CERTIFICATE-----\nQ0VSVA==\n-----END CERTIFICATE-----",
+          "client_key": "-----BEGIN PRIVATE KEY-----\nS0VZ\n-----END PRIVATE KEY-----"
+        },
+        "data_ciphers": [
+          "AES-128-CBC",
+          "AES-256-CBC",
+          "BF-CBC"
+        ],
+        "data_ciphers_fallback": "AES-128-CBC",
+        "auth": "SHA1",
+        "auth_retry": "nointeract",
+        "on_demand": true,
+        "ping_interval": "10s",
+        "ping_restart": "60s",
+        "system": false,
+        "redirect_gateway": true
+      }
+    },
+    {
+      "server": "198.51.100.3",
+      "server_port": 443,
+      "country": "United States",
+      "country_short": "US",
+      "speed": 2000,
+      "latency_ms": null,
+      "real_latency_ms": null,
+      "endpoint": {
+        "type": "openvpn-client",
+        "tag": "vpngate-1",
+        "server": "198.51.100.3",
+        "server_port": 443,
+        "network": "tcp",
+        "username": "vpn",
+        "password": "vpn",
+        "tls": {
+          "certificate": "-----BEGIN CERTIFICATE-----\nQ0E=\n-----END CERTIFICATE-----",
+          "certificate_profile": "legacy",
+          "client_certificate": "-----BEGIN CERTIFICATE-----\nQ0VSVA==\n-----END CERTIFICATE-----",
+          "client_key": "-----BEGIN PRIVATE KEY-----\nS0VZ\n-----END PRIVATE KEY-----"
+        },
+        "data_ciphers": [
+          "AES-128-CBC",
+          "AES-256-CBC",
+          "BF-CBC"
+        ],
+        "data_ciphers_fallback": "AES-128-CBC",
+        "auth": "SHA1",
+        "auth_retry": "nointeract",
+        "on_demand": true,
+        "ping_interval": "10s",
+        "ping_restart": "60s",
+        "system": false,
+        "redirect_gateway": true
+      }
+    },
+    {
+      "server": "198.51.100.1",
+      "server_port": 443,
+      "country": "Japan",
+      "country_short": "JP",
+      "speed": 1000,
+      "latency_ms": null,
+      "real_latency_ms": null,
+      "endpoint": {
+        "type": "openvpn-client",
+        "tag": "vpngate-2",
+        "server": "198.51.100.1",
+        "server_port": 443,
+        "network": "tcp",
+        "username": "vpn",
+        "password": "vpn",
+        "tls": {
+          "certificate": "-----BEGIN CERTIFICATE-----\nQ0E=\n-----END CERTIFICATE-----",
+          "certificate_profile": "legacy",
+          "client_certificate": "-----BEGIN CERTIFICATE-----\nQ0VSVA==\n-----END CERTIFICATE-----",
+          "client_key": "-----BEGIN PRIVATE KEY-----\nS0VZ\n-----END PRIVATE KEY-----"
+        },
+        "data_ciphers": [
+          "AES-128-CBC",
+          "AES-256-CBC",
+          "BF-CBC"
+        ],
+        "data_ciphers_fallback": "AES-128-CBC",
+        "auth": "SHA1",
+        "auth_retry": "nointeract",
+        "on_demand": true,
+        "ping_interval": "10s",
+        "ping_restart": "60s",
+        "system": false,
+        "redirect_gateway": true
+      }
+    }
+  ]
+}

@@ -16,12 +16,25 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/2061969365/railway-vpngate-combined/probe/internal/singbox"
 )
 
 // ErrNoExitIP is returned when every target failed inside the timeout budget.
 var ErrNoExitIP = errors.New("no exit ip")
 
-const connectHeaderLimit = 64 << 10
+// errExitResponseTooLarge is returned when headers+body exceed MaxExitBody.
+var errExitResponseTooLarge = errors.New("exit response exceeds 64 KiB")
+
+const (
+	connectHeaderLimit = 64 << 10
+	// connectLineLimit caps one status/header line before it is buffered.
+	connectLineLimit = 8 << 10
+	// defaultTargetBudget is the per-target cap. The Python caller uses
+	// min(remaining, 6.0); Go keeps the same 6s ceiling so one black-holed
+	// target cannot consume the whole caller budget.
+	defaultTargetBudget = 6 * time.Second
+)
 
 // ExitResult is one successful real exit-IP measurement.
 type ExitResult struct {
@@ -36,24 +49,50 @@ type Exiter struct {
 	Targets []Target
 	// Dialer defaults to a zero net.Dialer.
 	Dialer *net.Dialer
-	// TLSConfig, when set, is cloned per connection. Tests supply a config
-	// that trusts their local server; production leaves it nil.
+	// TLSConfig, when set, is cloned per connection. It can add roots for a
+	// test/local server; certificate verification is always forced on.
 	TLSConfig *tls.Config
+	// TargetBudget caps one target attempt. Zero uses defaultTargetBudget.
+	TargetBudget time.Duration
+	// AllowPrivateTargets disables the snapshot SSRF policy for targets
+	// (tests/local labs). Production leaves it false.
+	AllowPrivateTargets bool
+	// ResolveHost overrides the DNS resolver used to pin a target hostname.
+	ResolveHost singbox.HostResolver
 }
 
 // ExitIP tries every configured target in order within one context deadline.
-// It returns the first IPv4 server response that parses as an exit IP.
+// Each target gets its own child context with a min(remaining, 6s) budget so a
+// black-holed first target cannot starve the fallbacks. It returns the first
+// IPv4 server response that parses as an exit IP.
 func (e *Exiter) ExitIP(ctx context.Context, proxyHost string, proxyPort int, username, password string) (ExitResult, error) {
 	start := time.Now()
 	targets := e.Targets
 	if len(targets) == 0 {
 		targets = DefaultTargets
 	}
+	budgetCap := e.TargetBudget
+	if budgetCap <= 0 {
+		budgetCap = defaultTargetBudget
+	}
+	deadline, hasDeadline := ctx.Deadline()
 	for _, target := range targets {
 		if err := ctx.Err(); err != nil {
 			return ExitResult{}, err
 		}
-		body, err := e.fetch(ctx, proxyHost, proxyPort, username, password, target)
+		budget := budgetCap
+		if hasDeadline {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				break
+			}
+			if remaining < budget {
+				budget = remaining
+			}
+		}
+		targetCtx, cancel := context.WithTimeout(ctx, budget)
+		body, err := e.fetch(targetCtx, proxyHost, proxyPort, username, password, target)
+		cancel()
 		if err != nil {
 			continue
 		}
@@ -77,6 +116,18 @@ func (e *Exiter) fetch(ctx context.Context, proxyHost string, proxyPort int, use
 	if target.Host == "" || target.Port < 1 || target.Port > 65535 {
 		return nil, fmt.Errorf("invalid target")
 	}
+	pinned := singbox.Remote{Host: target.Host, Port: target.Port}
+	if !e.AllowPrivateTargets {
+		resolve := e.ResolveHost
+		if resolve == nil {
+			resolve = singbox.LookupHost
+		}
+		var err error
+		pinned, err = singbox.ValidateRemote(target.Host, target.Port, false, resolve)
+		if err != nil {
+			return nil, err
+		}
+	}
 	dialer := e.Dialer
 	if dialer == nil {
 		dialer = &net.Dialer{}
@@ -90,7 +141,7 @@ func (e *Exiter) fetch(ctx context.Context, proxyHost string, proxyPort int, use
 		_ = conn.SetDeadline(deadline)
 	}
 
-	targetAddr := net.JoinHostPort(target.Host, strconv.Itoa(target.Port))
+	targetAddr := net.JoinHostPort(pinned.Host, strconv.Itoa(pinned.Port))
 	var request strings.Builder
 	fmt.Fprintf(&request, "CONNECT %s HTTP/1.1\r\n", targetAddr)
 	fmt.Fprintf(&request, "Host: %s\r\n", targetAddr)
@@ -104,7 +155,7 @@ func (e *Exiter) fetch(ctx context.Context, proxyHost string, proxyPort int, use
 		return nil, fmt.Errorf("write connect: %w", err)
 	}
 
-	reader := bufio.NewReader(conn)
+	reader := bufio.NewReaderSize(conn, connectLineLimit)
 	status, err := readConnectStatus(reader)
 	if err != nil {
 		return nil, err
@@ -133,7 +184,10 @@ func (e *Exiter) fetch(ctx context.Context, proxyHost string, proxyPort int, use
 		return nil, fmt.Errorf("write get: %w", err)
 	}
 
-	response, err := http.ReadResponse(bufio.NewReader(tlsConn), &http.Request{Method: http.MethodGet})
+	// Cap the whole response (headers included) at MaxExitBody before
+	// http.ReadResponse: net/textproto otherwise reads headers unbounded.
+	limited := &limitedReadConn{Conn: tlsConn, remaining: MaxExitBody}
+	response, err := http.ReadResponse(bufio.NewReader(limited), &http.Request{Method: http.MethodGet})
 	if err != nil {
 		return nil, fmt.Errorf("read response: %w", err)
 	}
@@ -158,14 +212,35 @@ func (e *Exiter) tlsConfig(serverName string) *tls.Config {
 	} else {
 		cfg = &tls.Config{MinVersion: tls.VersionTLS12}
 	}
+	// The public API never lets a caller disable certificate verification;
+	// TLSConfig only contributes extra roots.
+	cfg.InsecureSkipVerify = false
 	if cfg.ServerName == "" {
 		cfg.ServerName = serverName
 	}
 	return cfg
 }
 
+// limitedReadConn caps every byte read from the wrapped connection.
+type limitedReadConn struct {
+	net.Conn
+	remaining int
+}
+
+func (c *limitedReadConn) Read(p []byte) (int, error) {
+	if c.remaining <= 0 {
+		return 0, errExitResponseTooLarge
+	}
+	if len(p) > c.remaining {
+		p = p[:c.remaining]
+	}
+	n, err := c.Conn.Read(p)
+	c.remaining -= n
+	return n, err
+}
+
 func readConnectStatus(reader *bufio.Reader) (int, error) {
-	line, err := reader.ReadString('\n')
+	line, err := readConnectLine(reader)
 	if err != nil {
 		return 0, fmt.Errorf("read connect status: %w", err)
 	}
@@ -179,7 +254,7 @@ func readConnectStatus(reader *bufio.Reader) (int, error) {
 		return 0, fmt.Errorf("malformed connect status: %w", err)
 	}
 	for {
-		line, err = reader.ReadString('\n')
+		line, err = readConnectLine(reader)
 		if err != nil {
 			return 0, fmt.Errorf("read connect headers: %w", err)
 		}
@@ -191,6 +266,23 @@ func readConnectStatus(reader *bufio.Reader) (int, error) {
 			return status, nil
 		}
 	}
+}
+
+// readConnectLine caps each line before it is buffered. ReadString would grow
+// without bound until a newline arrived, letting a local malicious proxy push
+// the sidecar into OOM.
+func readConnectLine(reader *bufio.Reader) (string, error) {
+	line, err := reader.ReadSlice('\n')
+	if err != nil {
+		if errors.Is(err, bufio.ErrBufferFull) {
+			return "", fmt.Errorf("connect line exceeds %d bytes", connectLineLimit)
+		}
+		return "", err
+	}
+	if len(line) > connectLineLimit {
+		return "", fmt.Errorf("connect line exceeds %d bytes", connectLineLimit)
+	}
+	return string(line), nil
 }
 
 // bufferedConn preserves bytes already buffered while parsing the CONNECT

@@ -1,0 +1,120 @@
+{
+  "name": "singbox-basic",
+  "kind": "config",
+  "endpoints": [
+    {
+      "type": "openvpn-client",
+      "tag": "vpngate-0",
+      "server": "203.0.113.1",
+      "server_port": 443,
+      "network": "tcp",
+      "username": "vpn",
+      "password": "vpn",
+      "tls": {
+        "certificate": "-----BEGIN CERTIFICATE-----\nQ0E=\n-----END CERTIFICATE-----",
+        "certificate_profile": "legacy",
+        "client_certificate": "-----BEGIN CERTIFICATE-----\nQ0VSVA==\n-----END CERTIFICATE-----",
+        "client_key": "-----BEGIN PRIVATE KEY-----\nS0VZ\n-----END PRIVATE KEY-----"
+      },
+      "data_ciphers": [
+        "AES-128-CBC",
+        "AES-256-CBC",
+        "BF-CBC"
+      ],
+      "data_ciphers_fallback": "AES-128-CBC",
+      "auth": "SHA1",
+      "auth_retry": "nointeract",
+      "on_demand": true,
+      "ping_interval": "10s",
+      "ping_restart": "60s",
+      "system": false,
+      "redirect_gateway": true
+    }
+  ],
+  "options": {
+    "mixed_listen": "127.0.0.1",
+    "mixed_port": 40000,
+    "mixed_users": [
+      [
+        "u",
+        "p"
+      ]
+    ]
+  },
+  "expected": {
+    "log": {
+      "level": "info"
+    },
+    "endpoints": [
+      {
+        "type": "openvpn-client",
+        "tag": "vpngate-0",
+        "server": "203.0.113.1",
+        "server_port": 443,
+        "network": "tcp",
+        "username": "vpn",
+        "password": "vpn",
+        "tls": {
+          "certificate": "-----BEGIN CERTIFICATE-----\nQ0E=\n-----END CERTIFICATE-----",
+          "certificate_profile": "legacy",
+          "client_certificate": "-----BEGIN CERTIFICATE-----\nQ0VSVA==\n-----END CERTIFICATE-----",
+          "client_key": "-----BEGIN PRIVATE KEY-----\nS0VZ\n-----END PRIVATE KEY-----"
+        },
+        "data_ciphers": [
+          "AES-128-CBC",
+          "AES-256-CBC",
+          "BF-CBC"
+        ],
+        "data_ciphers_fallback": "AES-128-CBC",
+        "auth": "SHA1",
+        "auth_retry": "nointeract",
+        "on_demand": true,
+        "ping_interval": "10s",
+        "ping_restart": "60s",
+        "system": false,
+        "redirect_gateway": true
+      }
+    ],
+    "outbounds": [
+      {
+        "type": "selector",
+        "tag": "proxy",
+        "outbounds": [
+          "vpngate-0",
+          "direct"
+        ]
+      },
+      {
+        "type": "urltest",
+        "tag": "auto",
+        "outbounds": [
+          "vpngate-0"
+        ],
+        "interval": "15s",
+        "tolerance": 150
+      },
+      {
+        "type": "direct",
+        "tag": "direct"
+      }
+    ],
+    "route": {
+      "final": "auto",
+      "auto_detect_interface": true
+    },
+    "inbounds": [
+      {
+        "type": "mixed",
+        "tag": "mixed-in",
+        "listen": "127.0.0.1",
+        "listen_port": 40000,
+        "users": [
+          {
+            "username": "u",
+            "password": "p"
+          }
+        ]
+      }
+    ]
+  }
+}

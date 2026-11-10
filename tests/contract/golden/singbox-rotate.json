@@ -1,0 +1,381 @@
+{
+  "name": "singbox-rotate",
+  "kind": "config",
+  "endpoints": [
+    {
+      "type": "openvpn-client",
+      "tag": "vpngate-0",
+      "server": "203.0.113.1",
+      "server_port": 443,
+      "network": "tcp",
+      "username": "vpn",
+      "password": "vpn",
+      "tls": {
+        "certificate": "-----BEGIN CERTIFICATE-----\nQ0E=\n-----END CERTIFICATE-----",
+        "certificate_profile": "legacy",
+        "client_certificate": "-----BEGIN CERTIFICATE-----\nQ0VSVA==\n-----END CERTIFICATE-----",
+        "client_key": "-----BEGIN PRIVATE KEY-----\nS0VZ\n-----END PRIVATE KEY-----"
+      },
+      "data_ciphers": [
+        "AES-128-CBC",
+        "AES-256-CBC",
+        "BF-CBC"
+      ],
+      "data_ciphers_fallback": "AES-128-CBC",
+      "auth": "SHA1",
+      "auth_retry": "nointeract",
+      "on_demand": true,
+      "ping_interval": "10s",
+      "ping_restart": "60s",
+      "system": false,
+      "redirect_gateway": true
+    },
+    {
+      "type": "openvpn-client",
+      "tag": "vpngate-1",
+      "server": "203.0.113.2",
+      "server_port": 8443,
+      "network": "tcp",
+      "username": "vpn",
+      "password": "vpn",
+      "tls": {
+        "certificate": "-----BEGIN CERTIFICATE-----\nQ0E=\n-----END CERTIFICATE-----",
+        "certificate_profile": "legacy",
+        "client_certificate": "-----BEGIN CERTIFICATE-----\nQ0VSVA==\n-----END CERTIFICATE-----",
+        "client_key": "-----BEGIN PRIVATE KEY-----\nS0VZ\n-----END PRIVATE KEY-----",
+        "control_wrap": {
+          "type": "tls_auth",
+          "key": "VE9LRU4=",
+          "direction": "client"
+        }
+      },
+      "data_ciphers": [
+        "AES-128-CBC",
+        "AES-256-CBC",
+        "BF-CBC"
+      ],
+      "data_ciphers_fallback": "AES-128-CBC",
+      "auth": "SHA1",
+      "auth_retry": "nointeract",
+      "on_demand": true,
+      "ping_interval": "10s",
+      "ping_restart": "60s",
+      "system": false,
+      "redirect_gateway": true
+    },
+    {
+      "type": "openvpn-client",
+      "tag": "vpngate-2",
+      "server": "203.0.113.3",
+      "server_port": 443,
+      "network": "tcp",
+      "username": "vpn",
+      "password": "vpn",
+      "tls": {
+        "certificate": "-----BEGIN CERTIFICATE-----\nQ0E=\n-----END CERTIFICATE-----",
+        "certificate_profile": "legacy",
+        "client_certificate": "-----BEGIN CERTIFICATE-----\nQ0VSVA==\n-----END CERTIFICATE-----",
+        "client_key": "-----BEGIN PRIVATE KEY-----\nS0VZ\n-----END PRIVATE KEY-----",
+        "control_wrap": {
+          "type": "tls_crypt",
+          "key": "Q1JZUFQ="
+        }
+      },
+      "data_ciphers": [
+        "AES-128-CBC",
+        "AES-256-CBC",
+        "BF-CBC"
+      ],
+      "data_ciphers_fallback": "AES-128-CBC",
+      "auth": "SHA1",
+      "auth_retry": "nointeract",
+      "on_demand": true,
+      "renegotiate_disabled": true,
+      "ping_interval": "10s",
+      "ping_restart": "60s",
+      "system": false,
+      "redirect_gateway": true
+    }
+  ],
+  "options": {
+    "mixed_listen": "127.0.0.1",
+    "mixed_port": 40000,
+    "mixed_users": [
+      [
+        "u",
+        "p"
+      ]
+    ],
+    "final": "auto",
+    "preferred": "vpngate-1",
+    "backup": "vpngate-2",
+    "vless_uuid": "a29738e5-bee1-c0fc-b484-ae7c49cbc828",
+    "vless_direct_port": 8080,
+    "vless_direct_path": "/ws-node",
+    "vless_chain_port": 8082,
+    "vless_chain_path": "/ws-chain",
+    "resi": null,
+    "resi_port": 8084,
+    "resi_path": "/ws-resi",
+    "resi_in_port": 40001,
+    "resi_rotate": true,
+    "resi_rotate_tags": [
+      "vpngate-2",
+      "vpngate-0"
+    ],
+    "chain_candidates": [
+      "vpngate-0",
+      "vpngate-1",
+      "vpngate-2"
+    ],
+    "clash_api": {
+      "external_controller": "127.0.0.1:9090",
+      "secret": "secret"
+    },
+    "persistent_tags": [
+      "vpngate-1",
+      "vpngate-2"
+    ]
+  },
+  "expected": {
+    "log": {
+      "level": "info"
+    },
+    "endpoints": [
+      {
+        "type": "openvpn-client",
+        "tag": "vpngate-0",
+        "server": "203.0.113.1",
+        "server_port": 443,
+        "network": "tcp",
+        "username": "vpn",
+        "password": "vpn",
+        "tls": {
+          "certificate": "-----BEGIN CERTIFICATE-----\nQ0E=\n-----END CERTIFICATE-----",
+          "certificate_profile": "legacy",
+          "client_certificate": "-----BEGIN CERTIFICATE-----\nQ0VSVA==\n-----END CERTIFICATE-----",
+          "client_key": "-----BEGIN PRIVATE KEY-----\nS0VZ\n-----END PRIVATE KEY-----"
+        },
+        "data_ciphers": [
+          "AES-128-CBC",
+          "AES-256-CBC",
+          "BF-CBC"
+        ],
+        "data_ciphers_fallback": "AES-128-CBC",
+        "auth": "SHA1",
+        "auth_retry": "nointeract",
+        "on_demand": true,
+        "ping_interval": "10s",
+        "ping_restart": "60s",
+        "system": false,
+        "redirect_gateway": true
+      },
+      {
+        "type": "openvpn-client",
+        "tag": "vpngate-1",
+        "server": "203.0.113.2",
+        "server_port": 8443,
+        "network": "tcp",
+        "username": "vpn",
+        "password": "vpn",
+        "tls": {
+          "certificate": "-----BEGIN CERTIFICATE-----\nQ0E=\n-----END CERTIFICATE-----",
+          "certificate_profile": "legacy",
+          "client_certificate": "-----BEGIN CERTIFICATE-----\nQ0VSVA==\n-----END CERTIFICATE-----",
+          "client_key": "-----BEGIN PRIVATE KEY-----\nS0VZ\n-----END PRIVATE KEY-----",
+          "control_wrap": {
+            "type": "tls_auth",
+            "key": "VE9LRU4=",
+            "direction": "client"
+          }
+        },
+        "data_ciphers": [
+          "AES-128-CBC",
+          "AES-256-CBC",
+          "BF-CBC"
+        ],
+        "data_ciphers_fallback": "AES-128-CBC",
+        "auth": "SHA1",
+        "auth_retry": "nointeract",
+        "on_demand": false,
+        "ping_interval": "10s",
+        "ping_restart": "60s",
+        "system": false,
+        "redirect_gateway": true
+      },
+      {
+        "type": "openvpn-client",
+        "tag": "vpngate-2",
+        "server": "203.0.113.3",
+        "server_port": 443,
+        "network": "tcp",
+        "username": "vpn",
+        "password": "vpn",
+        "tls": {
+          "certificate": "-----BEGIN CERTIFICATE-----\nQ0E=\n-----END CERTIFICATE-----",
+          "certificate_profile": "legacy",
+          "client_certificate": "-----BEGIN CERTIFICATE-----\nQ0VSVA==\n-----END CERTIFICATE-----",
+          "client_key": "-----BEGIN PRIVATE KEY-----\nS0VZ\n-----END PRIVATE KEY-----",
+          "control_wrap": {
+            "type": "tls_crypt",
+            "key": "Q1JZUFQ="
+          }
+        },
+        "data_ciphers": [
+          "AES-128-CBC",
+          "AES-256-CBC",
+          "BF-CBC"
+        ],
+        "data_ciphers_fallback": "AES-128-CBC",
+        "auth": "SHA1",
+        "auth_retry": "nointeract",
+        "on_demand": false,
+        "renegotiate_disabled": true,
+        "ping_interval": "10s",
+        "ping_restart": "60s",
+        "system": false,
+        "redirect_gateway": true
+      }
+    ],
+    "outbounds": [
+      {
+        "type": "selector",
+        "tag": "proxy",
+        "outbounds": [
+          "vpngate-0",
+          "vpngate-1",
+          "vpngate-2",
+          "direct"
+        ]
+      },
+      {
+        "type": "urltest",
+        "tag": "auto",
+        "outbounds": [
+          "vpngate-0",
+          "vpngate-1",
+          "vpngate-2"
+        ],
+        "interval": "15s",
+        "tolerance": 150
+      },
+      {
+        "type": "direct",
+        "tag": "direct"
+      },
+      {
+        "type": "selector",
+        "tag": "chain",
+        "outbounds": [
+          "vpngate-1",
+          "vpngate-0",
+          "vpngate-2"
+        ],
+        "default": "vpngate-1",
+        "interrupt_exist_connections": false
+      }
+    ],
+    "route": {
+      "final": "chain",
+      "auto_detect_interface": true,
+      "rules": [
+        {
+          "inbound": "vless-direct",
+          "outbound": "direct"
+        },
+        {
+          "inbound": "vless-chain",
+          "outbound": "chain"
+        },
+        {
+          "inbound": "resi-rot-0",
+          "outbound": "vpngate-2"
+        },
+        {
+          "inbound": "resi-rot-1",
+          "outbound": "vpngate-0"
+        }
+      ]
+    },
+    "inbounds": [
+      {
+        "type": "mixed",
+        "tag": "mixed-in",
+        "listen": "127.0.0.1",
+        "listen_port": 40000,
+        "users": [
+          {
+            "username": "u",
+            "password": "p"
+          }
+        ]
+      },
+      {
+        "type": "vless",
+        "tag": "vless-direct",
+        "listen": "0.0.0.0",
+        "listen_port": 8080,
+        "users": [
+          {
+            "uuid": "a29738e5-bee1-c0fc-b484-ae7c49cbc828"
+          }
+        ],
+        "transport": {
+          "type": "ws",
+          "path": "/ws-node"
+        }
+      },
+      {
+        "type": "vless",
+        "tag": "vless-chain",
+        "listen": "0.0.0.0",
+        "listen_port": 8082,
+        "users": [
+          {
+            "uuid": "a29738e5-bee1-c0fc-b484-ae7c49cbc828"
+          }
+        ],
+        "transport": {
+          "type": "ws",
+          "path": "/ws-chain"
+        }
+      },
+      {
+        "type": "vless",
+        "tag": "resi-rot-0",
+        "listen": "127.0.0.1",
+        "listen_port": 41000,
+        "users": [
+          {
+            "uuid": "a29738e5-bee1-c0fc-b484-ae7c49cbc828"
+          }
+        ],
+        "transport": {
+          "type": "ws",
+          "path": "/ws-resi"
+        }
+      },
+      {
+        "type": "vless",
+        "tag": "resi-rot-1",
+        "listen": "127.0.0.1",
+        "listen_port": 41001,
+        "users": [
+          {
+            "uuid": "a29738e5-bee1-c0fc-b484-ae7c49cbc828"
+          }
+        ],
+        "transport": {
+          "type": "ws",
+          "path": "/ws-resi"
+        }
+      }
+    ],
+    "experimental": {
+      "clash_api": {
+        "external_controller": "127.0.0.1:9090",
+        "secret": "secret"
+      }
+    }
+  }
+}

@@ -7,6 +7,8 @@ No real gateway is contacted: the probe functions are patched.
 import json
 import os
 import socket
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -205,6 +207,26 @@ class EnvTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             build_config_from_env(env)
 
+    def test_private_gateway_is_allowed_and_warned_about(self) -> None:
+        """RESI_GATEWAY is operator config, not snapshot data: loopback is a
+        valid deployment, but the choice is visible in the startup log."""
+        env = self._env(RESI_GATEWAY="127.0.0.1:1080", RESI_USER="u",
+                        RESI_PASS="p")
+        with mock.patch("railway_manager._safe_print") as printed:
+            config = build_config_from_env(env)
+
+        self.assertEqual("127.0.0.1", config["resi"]["server"])
+        self.assertTrue(any("private/loopback" in str(call.args[0])
+                            for call in printed.call_args_list))
+
+    def test_operator_gateway_pinning_accepts_private_addresses(self) -> None:
+        """The serving config and the resi probe share the operator policy."""
+        from vpngate_to_singbox import _operator_remote_pin
+
+        self.assertEqual("127.0.0.1", _operator_remote_pin("127.0.0.1"))
+        self.assertEqual("10.0.0.5", _operator_remote_pin("[10.0.0.5]"))
+        self.assertEqual("192.168.1.9", _operator_remote_pin("192.168.1.9"))
+
 
 
 class RotateConfigTests(unittest.TestCase):
@@ -374,7 +396,7 @@ class ResiManagerTests(unittest.TestCase):
         status = json.loads(body.decode())
 
         self.assertTrue(status["resi"]["enabled"])
-        self.assertEqual("gw.example.com", status["resi"]["host"])
+        self.assertEqual("g***.example.com", status["resi"]["host"])
         self.assertEqual(1080, status["resi"]["port"])
         self.assertEqual("rotation", status["resi"]["mode"])
         self.assertEqual("/ws-resi", status["resi"]["path"])
@@ -455,6 +477,17 @@ class ResiManagerTests(unittest.TestCase):
         self.assertEqual(1, probe["distinct"])
         self.assertFalse(probe["rotating"])
 
+    def test_a_single_sample_cannot_judge_rotation(self) -> None:
+        sample = {"ips": ["1.1.1.1"], "ms": [10], "count": 1,
+                  "distinct": 1, "errors": [], "first_ms": 10, "last_ms": 10}
+        with mock.patch("railway_manager.measure_resi_rotation",
+                        return_value=sample):
+            self.manager._run_resi_probe(1)
+
+        probe = self.manager.status["resi"]["last_probe"]
+        self.assertIsNone(probe["rotating"],
+                          "one draw is not rotation proof either way")
+
     def test_probe_failure_marks_down_without_touching_health(self) -> None:
         self.manager.status["endpoints"] = [{"tag": "vpngate-0"}]
         with mock.patch("railway_manager.measure_resi_rotation", return_value=None):
@@ -483,6 +516,7 @@ class ResiManagerTests(unittest.TestCase):
         # settings_path=None keeps this test filesystem-free; persistence goes
         # through _write_private_json, covered by the existing manager tests.
         manager = _manager(settings_path=None)
+        manager.resi["template"] = "{user}-session-{session}"
         port = manager.start()
         try:
             sock = socket.create_connection(("127.0.0.1", port), timeout=5)
@@ -510,6 +544,16 @@ class ResiManagerTests(unittest.TestCase):
 
         self.assertIn(b"400", response)
         self.assertEqual(0, self.manager.resi_session_ttl)
+
+    def test_settings_reject_sticky_ttl_without_a_session_template(self) -> None:
+        # RESI's default template is {user}: nothing would carry the session
+        # id, so "sticky" would silently be rotation. Refuse the write.
+        response = self._request("POST", "/api/settings",
+                                 b'{"resi_session_ttl":600}')
+
+        self.assertIn(b"400", response)
+        self.assertEqual(0, self.manager.resi_session_ttl)
+        self.assertEqual("rotation", self.manager.status["resi"]["mode"])
 
 
 
@@ -696,7 +740,8 @@ class RotateManagerTests(unittest.TestCase):
                  "country_short": "JP", "speed": 1, "latency_ms": 10,
                  "real_latency_ms": 77, "endpoint": _endpoint("vpngate-a")},
             ]
-            manager.refresh_once(fetcher=lambda *a, **k: "csv")
+            with mock.patch.object(manager, "_check_config", return_value=True):
+                manager.refresh_once(fetcher=lambda *a, **k: "csv")
             nodes = {n["server"]: n for n in manager._nodes}
         finally:
             rm.snapshot_to_nodes = original
@@ -1106,6 +1151,7 @@ class RotateManagerTests(unittest.TestCase):
                     mock.patch.object(RailwayManager, "_clash_api_ready", return_value=True), \
                     mock.patch.object(RailwayManager, "_clash_select", return_value=True) as select, \
                     mock.patch.object(RailwayManager, "_mixed_listening", return_value=True), \
+                    mock.patch.object(RailwayManager, "_singbox_live", return_value=True), \
                     mock.patch.object(RailwayManager, "_served_exit_probe",
                                       return_value=("1.2.3.4", 30, True)),\
                     mock.patch.object(RailwayManager, "_apply_config") as apply_cfg, \
@@ -1132,6 +1178,7 @@ class RotateManagerTests(unittest.TestCase):
             with mock.patch.object(RailwayManager, "_clash_api_ready", return_value=True), \
                     mock.patch.object(RailwayManager, "_clash_select", return_value=True), \
                     mock.patch.object(RailwayManager, "_mixed_listening", return_value=True), \
+                    mock.patch.object(RailwayManager, "_singbox_live", return_value=True), \
                     mock.patch.object(RailwayManager, "_served_exit_probe",
                                       return_value=("1.2.3.4", 30, True)),\
                     mock.patch.object(RailwayManager, "_apply_config") as apply_cfg:
@@ -1161,6 +1208,7 @@ class RotateManagerTests(unittest.TestCase):
                     mock.patch.object(RailwayManager, "_serving_ok", return_value=True), \
                     mock.patch.object(RailwayManager, "_clash_api_ready", return_value=False), \
                     mock.patch.object(RailwayManager, "_mixed_listening", return_value=True), \
+                    mock.patch.object(RailwayManager, "_singbox_live", return_value=True), \
                     mock.patch.object(RailwayManager, "_served_exit_probe",
                                       return_value=("1.2.3.4", 30, True)),\
                     mock.patch.object(RailwayManager, "_apply_config", return_value=True) as apply_cfg, \
@@ -1800,6 +1848,10 @@ class RotateManagerTests(unittest.TestCase):
             started = time.monotonic()
             received = peer.recv(64)
             elapsed = time.monotonic() - started
+            # Half-close contract: the node's EOF reaches the client's read
+            # side at once, while the client->node direction stays open until
+            # the client closes its write side (PIPE_IDLE_TIMEOUT at worst).
+            peer.shutdown(socket.SHUT_WR)
             worker.join(timeout=5)
             alive = worker.is_alive()
         finally:
@@ -1840,6 +1892,12 @@ class RotateManagerTests(unittest.TestCase):
             try:
                 peer.recv(64)
             except socket.timeout:
+                pass
+            # End the client->node direction as well: the pump keeps it open
+            # after the node's EOF (half-close), and only then reports stats.
+            try:
+                peer.shutdown(socket.SHUT_WR)
+            except OSError:
                 pass
             worker.join(timeout=5)
             health = dict(manager._resi_health.get(f"port-{backend_port}") or {})
@@ -1964,7 +2022,12 @@ class RotateManagerTests(unittest.TestCase):
         started = time.monotonic()
 
         def run() -> None:
-            result.update(_pump_pair(client, backend, started))
+            # The first-byte watchdog is opt-in: the resi path passes its own
+            # budget explicitly (read inside the patch context for the test).
+            import railway_manager as manager_mod
+            result.update(_pump_pair(
+                client, backend, started,
+                first_byte_timeout=manager_mod.RESI_FIRST_BYTE_TIMEOUT))
 
         worker = threading.Thread(target=run, daemon=True)
         closed_after = 0.0
@@ -2115,6 +2178,994 @@ class RotateSampleTests(unittest.TestCase):
         self.assertEqual([], ips)
         self.assertLess(time.monotonic() - started, 2.0)
         self.assertLess(len(errors), 12)
+
+
+class ReapplyPinTests(unittest.TestCase):
+    """The clash-pin replay thread must never fight a pin transaction."""
+
+    def _manager(self, **kwargs) -> RailwayManager:
+        stem = os.path.join(os.getcwd(), f".resi-pin-{id(self)}")
+        self._stem = stem
+        params = dict(port=0, mixed_port=0, start_singbox=False,
+                      auto_refresh=False, fetch_on_start=False,
+                      admin_token="t0ken-0123456789abcdef",
+                      vless_uuid=VLESS, resi=None, resi_rotate=True,
+                      clash_api_port=9090,
+                      config_path=f"{stem}.json", nodes_path=f"{stem}-nodes.json",
+                      state_path=f"{stem}-state.json", settings_path=None)
+        params.update(kwargs)
+        return RailwayManager(**params)
+
+    def tearDown(self) -> None:
+        stem = getattr(self, "_stem", None)
+        if not stem:
+            return
+        for path in (f"{stem}.json", f"{stem}-nodes.json", f"{stem}-state.json",
+                     f"{stem}.json.last-good", f"{stem}.json.stderr.log",
+                     f"{stem}.json.stderr.log.prev"):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+    def test_config_default_same_pin_does_not_move_the_selector(self) -> None:
+        manager = self._manager()
+        try:
+            manager.preferred_tag = "vpngate-1"
+            with mock.patch.object(manager, "_clash_api_ready",
+                                   return_value=True) as ready, \
+                 mock.patch.object(manager, "_clash_select",
+                                   return_value=True) as select:
+                manager._reapply_pin_when_ready(config_default="vpngate-1")
+            ready.assert_not_called()
+            select.assert_not_called()
+        finally:
+            manager.stop()
+
+    def test_round_change_aborts_the_replay(self) -> None:
+        manager = self._manager()
+        try:
+            manager.preferred_tag = "vpngate-1"
+            with manager._lock:
+                round_id = manager._rescue_round
+            manager._rescue_round = round_id + 1
+            with mock.patch.object(manager, "_clash_api_ready",
+                                   return_value=True) as ready, \
+                 mock.patch.object(manager, "_clash_select",
+                                   return_value=True) as select:
+                manager._reapply_pin_when_ready(round_id=round_id)
+            ready.assert_not_called()
+            select.assert_not_called()
+        finally:
+            manager.stop()
+
+    def test_a_pin_transaction_blocks_the_replay(self) -> None:
+        manager = self._manager()
+        held = threading.Event()
+        release = threading.Event()
+
+        def holder() -> None:
+            with manager._pin_switch_lock:
+                held.set()
+                release.wait(5)
+
+        thread = threading.Thread(target=holder, daemon=True)
+        try:
+            manager.preferred_tag = "vpngate-1"
+            thread.start()
+            self.assertTrue(held.wait(2))
+            with mock.patch.object(manager, "_clash_api_ready",
+                                   return_value=True) as ready, \
+                 mock.patch.object(manager, "_clash_select",
+                                   return_value=True) as select:
+                manager._reapply_pin_when_ready()
+            ready.assert_not_called()
+            select.assert_not_called()
+        finally:
+            release.set()
+            thread.join(5)
+            manager.stop()
+
+    def test_the_replay_moves_the_selector_to_a_hot_only_pin(self) -> None:
+        manager = self._manager()
+        try:
+            manager.preferred_tag = "vpngate-1"
+            with mock.patch.object(manager, "_clash_api_ready",
+                                   return_value=True), \
+                 mock.patch.object(manager, "_clash_select",
+                                   return_value=True) as select:
+                manager._reapply_pin_when_ready(config_default="vpngate-0")
+            select.assert_called_once_with("vpngate-1")
+        finally:
+            manager.stop()
+
+    def test_auto_pin_config_rewrite_does_not_replay(self) -> None:
+        manager = self._manager()
+        try:
+            manager._nodes = [
+                {"server": "203.0.113.11", "server_port": 443,
+                 "real_latency_ms": 10, "endpoint": _endpoint("vpngate-a")}]
+            calls: list[dict] = []
+            with mock.patch.object(
+                    manager, "_apply_config",
+                    side_effect=lambda **kw: calls.append(kw) or True):
+                manager._auto_pin_best(manager._nodes, None)
+        finally:
+            manager.stop()
+        self.assertTrue(calls)
+        self.assertIs(False, calls[-1].get("reapply_pin"),
+                      "the config names the pin; do not replay it")
+
+    def test_config_fallback_restart_does_not_start_the_replay(self) -> None:
+        manager = self._manager()
+        calls = []
+        try:
+            with mock.patch.object(manager, "_reapply_pin_when_ready",
+                                   side_effect=lambda *a, **k: calls.append(a)), \
+                 mock.patch("railway_manager.subprocess.Popen"):
+                manager._restart_singbox(reapply_pin=False,
+                                         config_default="vpngate-0")
+                time.sleep(0.05)
+                self.assertEqual([], calls)
+                manager._restart_singbox(reapply_pin=True,
+                                         config_default="vpngate-0")
+                deadline = time.monotonic() + 2.0
+                while not calls and time.monotonic() < deadline:
+                    time.sleep(0.01)
+        finally:
+            manager.stop()
+        self.assertEqual(1, len(calls))
+
+    def test_a_failed_start_does_not_begin_the_pin_replay(self) -> None:
+        """R2-1-06: replaying onto a process that never started is pointless
+        and writes history/selector state for a dead runtime."""
+        manager = self._manager()
+        calls: list[tuple] = []
+        try:
+            with mock.patch.object(manager, "_reapply_pin_when_ready",
+                                   side_effect=lambda *a, **k: calls.append(a)), \
+                 mock.patch("railway_manager.subprocess.Popen",
+                            side_effect=OSError("no sing-box binary")):
+                self.assertFalse(manager._restart_singbox(
+                    reapply_pin=True, config_default="vpngate-0"))
+                time.sleep(0.1)
+        finally:
+            manager.stop()
+        self.assertEqual([], calls)
+        self.assertEqual(-1, manager._singbox_start_serial)
+
+    def test_restore_runtime_pin_rewrite_never_replays(self) -> None:
+        manager = self._manager()
+        calls: list[dict] = []
+        try:
+            with mock.patch.object(
+                    manager, "_apply_config",
+                    side_effect=lambda **kw: calls.append(kw) or True):
+                manager._restore_runtime_pin("vpngate-1", hot=False)
+        finally:
+            manager.stop()
+        self.assertTrue(calls)
+        self.assertIs(False, calls[-1].get("reapply_pin"),
+                      "a rollback rewrite must not replay the pin")
+
+
+class AtomicPublishTests(unittest.TestCase):
+    """A failed config publish must not leave a half-committed node set."""
+
+    def _manager(self) -> RailwayManager:
+        stem = os.path.join(os.getcwd(), f".resi-atomic-{id(self)}")
+        self._stem = stem
+        return RailwayManager(port=0, mixed_port=0, start_singbox=False,
+            auto_refresh=False, fetch_on_start=False,
+            admin_token="t0ken-0123456789abcdef", vless_uuid=VLESS,
+            resi=None, resi_rotate=True,
+            config_path=f"{stem}.json", nodes_path=f"{stem}-nodes.json",
+            state_path=f"{stem}-state.json", settings_path=None)
+
+    def tearDown(self) -> None:
+        stem = getattr(self, "_stem", None)
+        if not stem:
+            return
+        for path in (f"{stem}.json", f"{stem}-nodes.json", f"{stem}-state.json",
+                     f"{stem}.json.last-good"):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+    def test_a_failed_config_check_rolls_the_node_set_back(self) -> None:
+        manager = self._manager()
+        old_nodes = [
+            {"server": "203.0.113.21", "server_port": 443, "country": "Japan",
+             "country_short": "JP", "speed": 1, "latency_ms": 10,
+             "real_latency_ms": 30, "endpoint": _endpoint("vpngate-a")},
+            {"server": "203.0.113.22", "server_port": 443, "country": "Japan",
+             "country_short": "JP", "speed": 1, "latency_ms": 20,
+             "real_latency_ms": 40, "endpoint": _endpoint("vpngate-b")},
+        ]
+        new_nodes = [
+            {"server": "203.0.113.51", "server_port": 443, "country": "Japan",
+             "country_short": "JP", "speed": 1, "latency_ms": 30,
+             "real_latency_ms": None, "endpoint": _endpoint("vpngate-x")},
+            {"server": "203.0.113.52", "server_port": 443, "country": "Japan",
+             "country_short": "JP", "speed": 1, "latency_ms": 40,
+             "real_latency_ms": None, "endpoint": _endpoint("vpngate-y")},
+        ]
+        routes = [("vpngate-a", RESI_ROTATE_BASE),
+                  ("vpngate-b", RESI_ROTATE_BASE + 1)]
+        try:
+            manager._nodes = old_nodes
+            manager._set_resi_routes(list(routes))
+            with manager._lock:
+                manager.preferred_tag = "vpngate-a"
+                manager.status["preferred_tag"] = "vpngate-a"
+                manager.status["endpoints"] = [
+                    {"tag": "vpngate-a", "server": "203.0.113.21",
+                     "server_port": 443},
+                    {"tag": "vpngate-b", "server": "203.0.113.22",
+                     "server_port": 443}]
+                manager.status["last_error"] = None
+                manager._first_seen = {"203.0.113.21:443": "2026-01-01T00:00:00Z"}
+                rev = manager._nodes_rev
+                first_seen = dict(manager._first_seen)
+                before_evidence = dict(manager._node_evidence)
+            with mock.patch("railway_manager.snapshot_to_nodes",
+                            return_value=new_nodes), \
+                 mock.patch("railway_manager.probe_tcp_latency", return_value=100), \
+                 mock.patch.object(manager, "_check_config", return_value=False):
+                ok = manager._refresh_once_inner(
+                    fetcher=lambda url, timeout: "csv")
+            self.assertFalse(ok)
+            self.assertEqual(old_nodes, manager._nodes)
+            self.assertEqual(rev, manager._nodes_rev)
+            self.assertEqual(first_seen, manager._first_seen)
+            self.assertEqual(routes, manager._resi_routes)
+            self.assertEqual("vpngate-a", manager.preferred_tag)
+            self.assertEqual("vpngate-a", manager.status["preferred_tag"])
+            self.assertEqual(["vpngate-a", "vpngate-b"],
+                             [ep["tag"] for ep in manager.status["endpoints"]])
+            self.assertEqual(before_evidence, manager._node_evidence)
+            self.assertIn("config check failed", manager.status["last_error"])
+            self.assertFalse(os.path.exists(manager.config_path))
+        finally:
+            manager.stop()
+
+
+    def test_an_apply_exception_rolls_the_node_set_back(self) -> None:
+        """R2-6-03: an exception is the same contract as False, not a
+        half-committed node set with the old routes."""
+        manager = self._manager()
+        old_nodes = [
+            {"server": "203.0.113.21", "server_port": 443, "country": "Japan",
+             "country_short": "JP", "speed": 1, "latency_ms": 10,
+             "real_latency_ms": 30, "endpoint": _endpoint("vpngate-a")},
+        ]
+        new_nodes = [
+            {"server": "203.0.113.51", "server_port": 443, "country": "Japan",
+             "country_short": "JP", "speed": 1, "latency_ms": 30,
+             "real_latency_ms": 40, "endpoint": _endpoint("vpngate-x")},
+        ]
+        routes = [("vpngate-a", RESI_ROTATE_BASE)]
+        try:
+            manager._nodes = old_nodes
+            manager._set_resi_routes(list(routes))
+            with manager._lock:
+                manager.preferred_tag = "vpngate-a"
+                manager.status["preferred_tag"] = "vpngate-a"
+                manager.status["endpoints"] = [
+                    {"tag": "vpngate-a", "server": "203.0.113.21",
+                     "server_port": 443}]
+                manager.status["last_error"] = None
+                manager._first_seen = {"203.0.113.21:443": "2026-01-01T00:00:00Z"}
+                rev = manager._nodes_rev
+                first_seen = dict(manager._first_seen)
+                before_evidence = dict(manager._node_evidence)
+            with mock.patch("railway_manager.snapshot_to_nodes",
+                            return_value=new_nodes), \
+                 mock.patch("railway_manager.probe_tcp_latency", return_value=100), \
+                 mock.patch.object(manager, "_apply_config",
+                                   side_effect=OSError("disk full")):
+                ok = manager._refresh_once_inner(
+                    fetcher=lambda url, timeout: "csv")
+            self.assertFalse(ok)
+            self.assertEqual(old_nodes, manager._nodes)
+            self.assertEqual(rev, manager._nodes_rev)
+            self.assertEqual(first_seen, manager._first_seen)
+            self.assertEqual(routes, manager._resi_routes)
+            self.assertEqual(before_evidence, manager._node_evidence)
+            self.assertIn("disk full", manager.status["last_error"])
+            self.assertEqual("vpngate-a", manager.status["preferred_tag"])
+        finally:
+            manager.stop()
+
+    def test_a_concurrent_pin_commit_survives_an_apply_failure(self) -> None:
+        """R2-1-04: the status snapshot must be taken after merging the live
+        pin, or a failed apply resurrects the pin the operator just replaced."""
+        manager = self._manager()
+        old_nodes = [
+            {"server": "203.0.113.21", "server_port": 443, "country": "Japan",
+             "country_short": "JP", "speed": 1, "latency_ms": 10,
+             "real_latency_ms": 30, "endpoint": _endpoint("vpngate-a")},
+            {"server": "203.0.113.22", "server_port": 443, "country": "Japan",
+             "country_short": "JP", "speed": 1, "latency_ms": 20,
+             "real_latency_ms": 40, "endpoint": _endpoint("vpngate-b")},
+        ]
+        try:
+            manager._nodes = old_nodes
+            manager._set_resi_routes([("vpngate-a", RESI_ROTATE_BASE),
+                                      ("vpngate-b", RESI_ROTATE_BASE + 1)])
+            with manager._lock:
+                manager.preferred_tag = "vpngate-a"
+                manager.status["preferred_tag"] = "vpngate-a"
+                manager._auto_pinned = False
+                manager.status["auto_pinned"] = False
+                manager.status["endpoints"] = [
+                    {"tag": "vpngate-a", "server": "203.0.113.21",
+                     "server_port": 443}]
+
+            def _snapshot(*args, **kwargs):
+                # A hot pin transaction lands while the refresh is fetching.
+                with manager._lock:
+                    manager.preferred_tag = "vpngate-b"
+                    manager.status["preferred_tag"] = "vpngate-b"
+                    manager._auto_pinned = True
+                    manager.status["auto_pinned"] = True
+                return [{**node, "endpoint": dict(node["endpoint"])}
+                        for node in old_nodes]
+
+            with mock.patch("railway_manager.snapshot_to_nodes",
+                            side_effect=_snapshot), \
+                 mock.patch("railway_manager.probe_tcp_latency", return_value=100), \
+                 mock.patch.object(manager, "_check_config", return_value=False):
+                ok = manager._refresh_once_inner(
+                    fetcher=lambda url, timeout: "csv")
+            self.assertFalse(ok)
+            self.assertEqual("vpngate-b", manager.preferred_tag)
+            self.assertEqual("vpngate-b", manager.status["preferred_tag"])
+            self.assertTrue(manager._auto_pinned)
+            self.assertTrue(manager.status["auto_pinned"])
+        finally:
+            manager.stop()
+
+
+class RestartOrderTests(unittest.TestCase):
+    """The old sing-box must release its ports before the new one binds."""
+
+    @staticmethod
+    def _wait_bound(marker: str, count: int) -> None:
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            try:
+                with open(marker, encoding="utf-8") as handle:
+                    bound = [line for line in handle.read().splitlines()
+                             if line == "BOUND"]
+                if len(bound) >= count:
+                    return
+            except OSError:
+                pass
+            time.sleep(0.02)
+        raise AssertionError("fake sing-box did not bind in time")
+
+    def test_restart_binds_only_after_the_old_process_exited(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            port = _free_port()
+            script = os.path.join(tmpdir, "fake_singbox.py")
+            marker = os.path.join(tmpdir, "bind.log")
+            with open(script, "w", encoding="utf-8") as handle:
+                handle.write(
+                    "import json, socket, sys, time\n"
+                    "cfg = sys.argv[sys.argv.index('-c') + 1]\n"
+                    "with open(cfg) as src: data = json.load(src)\n"
+                    f"marker = {marker!r}\n"
+                    "sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
+                    "try:\n"
+                    f"    sock.bind(('127.0.0.1', {port}))\n"
+                    "    sock.listen(8)\n"
+                    "except OSError:\n"
+                    "    open(marker, 'a').write('BIND-FAILED\\n')\n"
+                    "    sys.exit(3)\n"
+                    "open(marker, 'a').write('BOUND\\n')\n"
+                    "while True: time.sleep(1)\n")
+            config_path = os.path.join(tmpdir, "singbox.json")
+            with open(config_path, "w", encoding="utf-8") as handle:
+                json.dump({"inbounds": [{"listen_port": port}]}, handle)
+            manager = RailwayManager(
+                port=0, mixed_port=0, start_singbox=True, auto_refresh=False,
+                fetch_on_start=False, admin_token="t0ken-0123456789abcdef",
+                singbox_bin="fake-singbox",
+                config_path=config_path,
+                nodes_path=os.path.join(tmpdir, "nodes.json"),
+                state_path=os.path.join(tmpdir, "state.json"),
+                settings_path=None)
+            real_popen = subprocess.Popen
+
+            def _popen(argv, **kwargs):
+                return real_popen([sys.executable, script] + list(argv[1:]),
+                                  **kwargs)
+
+            old = real_popen([sys.executable, script, "run", "-c", config_path],
+                             stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+            try:
+                self._wait_bound(marker, 1)
+                manager._singbox_proc = old
+                with mock.patch("subprocess.Popen", side_effect=_popen):
+                    manager._restart_singbox()
+                self._wait_bound(marker, 2)
+                new = manager._singbox_proc
+                self.assertIsNotNone(new)
+                self.assertIsNone(new.poll())
+                self.assertIsNotNone(old.poll(),
+                                     "the old process must be reaped first")
+                with open(marker, encoding="utf-8") as handle:
+                    self.assertNotIn("BIND-FAILED", handle.read())
+                # A serving process that just died is a failed attempt, never
+                # "no verifier": callers must not fall back to stale evidence.
+                new.terminate()
+                new.wait(timeout=5)
+                ok, _exit_ip, _ms, attempted = manager._verify_served(budget=0.2)
+                self.assertFalse(ok)
+                self.assertTrue(attempted)
+            finally:
+                manager.stop()
+                if old.poll() is None:
+                    old.kill()
+
+
+class RestartMergeTests(unittest.TestCase):
+    """R2-1-01: concurrent restart callers must not reap the fresh process."""
+
+    @staticmethod
+    def _wait_for(predicate, timeout: float = 10.0) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return
+            time.sleep(0.01)
+        raise AssertionError("condition not reached in time")
+
+    def test_restart_callers_merge_and_the_last_process_loads_the_new_config(self) -> None:
+        import railway_manager as manager_mod
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            port = _free_port()
+            marker = os.path.join(tmpdir, "starts.log")
+            script = os.path.join(tmpdir, "fake_singbox.py")
+            with open(script, "w", encoding="utf-8") as handle:
+                handle.write(
+                    "import json, os, socket, sys, time\n"
+                    "cfg = sys.argv[sys.argv.index('-c') + 1]\n"
+                    "with open(cfg) as src: data = json.load(src)\n"
+                    f"marker = {marker!r}\n"
+                    "open(marker, 'a').write('START %d %s\\n' % "
+                    "(os.getpid(), data.get('marker', '')))\n"
+                    "sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
+                    "try:\n"
+                    "    sock.bind(('127.0.0.1', data['inbounds'][0]['listen_port']))\n"
+                    "    sock.listen(8)\n"
+                    "except OSError:\n"
+                    "    open(marker, 'a').write('BIND-FAILED\\n')\n"
+                    "    sys.exit(3)\n"
+                    "while True: time.sleep(1)\n")
+            config_path = os.path.join(tmpdir, "singbox.json")
+            with open(config_path, "w", encoding="utf-8") as handle:
+                json.dump({"marker": "v1",
+                           "inbounds": [{"listen_port": port}]}, handle)
+            manager = RailwayManager(
+                port=0, mixed_port=0, start_singbox=True, auto_refresh=False,
+                fetch_on_start=False, admin_token="t0ken-0123456789abcdef",
+                singbox_bin="fake-singbox", config_path=config_path,
+                nodes_path=os.path.join(tmpdir, "nodes.json"),
+                state_path=os.path.join(tmpdir, "state.json"),
+                settings_path=None)
+            real_popen = subprocess.Popen
+            real_reap = manager_mod._reap_process
+            reaping = threading.Event()
+            allow_reap = threading.Event()
+
+            def fake_popen(argv, **kwargs):
+                return real_popen([sys.executable, script] + list(argv[1:]),
+                                  **kwargs)
+
+            def slow_reap(proc, handle=None):
+                reaping.set()
+                allow_reap.wait(10)
+                real_reap(proc, handle)
+
+            def starts() -> list[str]:
+                try:
+                    with open(marker, encoding="utf-8") as handle:
+                        return handle.read().splitlines()
+                except OSError:
+                    return []
+
+            old = real_popen([sys.executable, script, "run", "-c", config_path],
+                             stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+            try:
+                self._wait_for(lambda: any(line.startswith("START")
+                                           for line in starts()))
+                manager._singbox_proc = old
+                with mock.patch.object(manager_mod.subprocess, "Popen",
+                                       side_effect=fake_popen), \
+                     mock.patch.object(manager_mod, "_reap_process",
+                                       side_effect=slow_reap):
+                    first = threading.Thread(target=manager._restart_singbox)
+                    second = threading.Thread(target=manager._restart_singbox)
+                    supervisor = threading.Thread(target=manager._supervise_once)
+                    first.start()
+                    self.assertTrue(reaping.wait(10))
+                    # Mid-restart the process is detached on purpose: it must
+                    # read as "unknown", never as proof of death.
+                    self.assertTrue(manager._singbox_starting)
+                    self.assertFalse(manager._singbox_definitely_dead())
+                    second.start()
+                    supervisor.start()
+                    allow_reap.set()
+                    first.join(20)
+                    second.join(20)
+                    supervisor.join(20)
+                lines = starts()
+                self.assertFalse(first.is_alive() or second.is_alive()
+                                 or supervisor.is_alive())
+                self.assertEqual(2, len([line for line in lines
+                                         if line.startswith("START")]),
+                                 "old process + exactly one replacement")
+                self.assertNotIn("BIND-FAILED", lines)
+                self.assertIsNotNone(manager._singbox_proc)
+                self.assertIsNone(manager._singbox_proc.poll())
+                self.assertEqual(manager._singbox_config_serial,
+                                 manager._singbox_start_serial)
+                self.assertEqual("v1", lines[-1].split()[-1])
+
+                # A newer config must not be suppressed by the merge guard:
+                # the final process has to be the one that loaded it.
+                with open(config_path, "w", encoding="utf-8") as handle:
+                    json.dump({"marker": "v2",
+                               "inbounds": [{"listen_port": port}]}, handle)
+                with manager._lock:
+                    manager._singbox_config_serial += 1
+                with mock.patch.object(manager_mod.subprocess, "Popen",
+                                       side_effect=fake_popen):
+                    self.assertTrue(manager._restart_singbox())
+                self._wait_for(lambda: len([line for line in starts()
+                                            if line.startswith("START")]) == 3)
+                self.assertEqual("v2", starts()[-1].split()[-1])
+                self.assertIsNone(manager._singbox_proc.poll())
+            finally:
+                manager.stop()
+                if old.poll() is None:
+                    old.kill()
+
+
+class RotateSwitchTests(unittest.TestCase):
+    def _manager(self, **kwargs) -> RailwayManager:
+        stem = os.path.join(os.getcwd(), f".resi-switch-{id(self)}")
+        self._stem = stem
+        params = dict(port=0, mixed_port=0, start_singbox=False,
+                      auto_refresh=False, fetch_on_start=False,
+                      admin_token="t0ken-0123456789abcdef",
+                      vless_uuid=VLESS, resi=None, resi_rotate=True,
+                      config_path=f"{stem}.json", nodes_path=f"{stem}-nodes.json",
+                      state_path=f"{stem}-state.json", settings_path=None)
+        params.update(kwargs)
+        return RailwayManager(**params)
+
+    def tearDown(self) -> None:
+        stem = getattr(self, "_stem", None)
+        if not stem:
+            return
+        for path in (f"{stem}.json", f"{stem}-nodes.json", f"{stem}-state.json",
+                     f"{stem}.json.last-good"):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+    def test_rotate_mode_rejects_a_manual_unpin(self) -> None:
+        manager = self._manager()
+        try:
+            manager._nodes = [{"real_latency_ms": 10,
+                               "endpoint": _endpoint("vpngate-a")}]
+            with manager._lock:
+                manager.preferred_tag = "vpngate-a"
+                manager.status["preferred_tag"] = "vpngate-a"
+            with mock.patch.object(manager, "_apply_config") as apply_config:
+                ok, reason = manager.switch(tag=None)
+            self.assertFalse(ok)
+            self.assertEqual("rotate mode requires a pin", reason)
+            apply_config.assert_not_called()
+            self.assertEqual("vpngate-a", manager.preferred_tag)
+        finally:
+            manager.stop()
+
+    def test_the_api_rejects_an_empty_switch_in_rotate_mode(self) -> None:
+        manager = self._manager(resi_port=_free_port())
+        manager._nodes = [{"server": "203.0.113.10", "server_port": 443,
+                           "real_latency_ms": 10,
+                           "endpoint": _endpoint("vpngate-a")}]
+        with manager._lock:
+            manager.preferred_tag = "vpngate-a"
+            manager.status["preferred_tag"] = "vpngate-a"
+        port = manager.start()
+        try:
+            sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+            with sock:
+                sock.sendall(b"POST /api/switch HTTP/1.1\r\nHost: x\r\n"
+                             b"Authorization: Bearer t0ken-0123456789abcdef\r\n"
+                             b"Content-Length: 0\r\nConnection: close\r\n\r\n")
+                response = b""
+                while True:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    response += chunk
+        finally:
+            manager.stop()
+        self.assertIn(b"400", response)
+        self.assertIn(b"rotate mode requires a pin", response)
+        self.assertEqual("vpngate-a", manager.preferred_tag)
+        self.assertEqual("vpngate-a", manager.status["preferred_tag"])
+
+    def test_a_refresh_during_the_switch_is_a_conflict(self) -> None:
+        manager = self._manager()
+        try:
+            manager._nodes = [{"server": "203.0.113.10", "server_port": 443,
+                               "real_latency_ms": 10,
+                               "endpoint": _endpoint("vpngate-a")}]
+
+            def _apply(**kwargs):
+                # A manual switch writes the pin into the config itself; the
+                # restart must not replay the previous hot pin over it.
+                self.assertIs(False, kwargs.get("reapply_pin"))
+                # A refresh commits a new node set between the switch's
+                # snapshot and its commit.
+                manager._nodes_rev += 1
+                return True
+
+            with mock.patch.object(manager, "_apply_config",
+                                   side_effect=_apply):
+                ok, reason = manager.switch(tag="vpngate-a")
+            self.assertFalse(ok)
+            self.assertEqual("node set changed during switch", reason)
+            self.assertIsNone(manager.preferred_tag)
+            self.assertIsNone(manager.status["preferred_tag"])
+        finally:
+            manager.stop()
+
+    def test_the_api_maps_a_switch_conflict_to_409(self) -> None:
+        manager = self._manager(resi_port=_free_port())
+        port = manager.start()
+        try:
+            with mock.patch.object(manager, "switch",
+                                   return_value=(False, "node set changed during switch")):
+                sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+                with sock:
+                    body = b"{}"
+                    sock.sendall(
+                        b"POST /api/switch HTTP/1.1\r\nHost: x\r\n"
+                        b"Authorization: Bearer t0ken-0123456789abcdef\r\n"
+                        b"Content-Length: " + str(len(body)).encode() +
+                        b"\r\nConnection: close\r\n\r\n" + body)
+                    response = b""
+                    while True:
+                        chunk = sock.recv(4096)
+                        if not chunk:
+                            break
+                        response += chunk
+            self.assertIn(b"409 Conflict", response)
+        finally:
+            manager.stop()
+
+
+class ResiProbeLoopTests(unittest.TestCase):
+    def test_the_periodic_probe_takes_three_samples(self) -> None:
+        stem = os.path.join(os.getcwd(), f".resi-loop-{id(self)}")
+        manager = RailwayManager(
+            port=0, mixed_port=0, start_singbox=False, auto_refresh=False,
+            fetch_on_start=False, admin_token="t0ken-0123456789abcdef",
+            vless_uuid=VLESS, resi=None, resi_rotate=True,
+            config_path=f"{stem}.json", nodes_path=f"{stem}-nodes.json",
+            state_path=f"{stem}-state.json", settings_path=None)
+        calls = []
+        waits = [False, True]
+        try:
+            with mock.patch.object(manager._stop_event, "wait",
+                                   side_effect=lambda _t: waits.pop(0)
+                                   if waits else True), \
+                 mock.patch.object(manager, "_start_resi_probe",
+                                   side_effect=lambda count=3:
+                                   calls.append(count) or True):
+                manager._resi_probe_loop()
+        finally:
+            manager.stop()
+            for path in (f"{stem}.json", f"{stem}-nodes.json",
+                         f"{stem}-state.json", f"{stem}.json.last-good"):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+        self.assertEqual([3], calls)
+
+
+class RotatePortBudgetTests(unittest.TestCase):
+    """The raw RESI_PORT path shares the rotation mux budget (R2-08)."""
+
+    def test_raw_resi_port_uses_the_rotation_slot_budget(self) -> None:
+        stem = os.path.join(os.getcwd(), f".resi-budget-{id(self)}")
+        manager = RailwayManager(
+            port=0, mixed_port=0, start_singbox=False, auto_refresh=False,
+            fetch_on_start=False, admin_token="t0ken-0123456789abcdef",
+            vless_uuid=VLESS, resi=None, resi_rotate=True,
+            resi_port=_free_port(), max_mux_connections=5,
+            config_path=f"{stem}.json", nodes_path=f"{stem}-nodes.json",
+            state_path=f"{stem}-state.json", settings_path=None)
+        thread = threading.Thread(target=manager._resi_accept_loop,
+                                  daemon=True)
+        try:
+            thread.start()
+            deadline = time.monotonic() + 3.0
+            while manager._resi_listener is None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertIsNotNone(manager._resi_listener)
+            for _ in range(manager._resi_mux_cap):
+                self.assertTrue(manager._resi_mux_slots.acquire(blocking=False))
+            client = socket.create_connection(("127.0.0.1", manager.resi_port),
+                                              timeout=3)
+            try:
+                deadline = time.monotonic() + 3.0
+                while (manager.status["resi"].get("throttled", 0) < 1
+                       and time.monotonic() < deadline):
+                    time.sleep(0.01)
+                throttled = manager.status["resi"].get("throttled", 0)
+            finally:
+                client.close()
+        finally:
+            manager.stop()
+            thread.join(3)
+            for _ in range(manager._resi_mux_cap):
+                try:
+                    manager._resi_mux_slots.release()
+                except ValueError:
+                    break
+            for path in (f"{stem}.json", f"{stem}-nodes.json",
+                         f"{stem}-state.json", f"{stem}.json.last-good"):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+        self.assertGreaterEqual(throttled, 1)
+
+
+class ResiAcceptThreadTests(unittest.TestCase):
+    """R2-1-05: a failed Thread.start() must not leak the slot/client."""
+
+    def test_thread_start_failure_releases_the_slot_and_closes_the_client(self) -> None:
+        stem = os.path.join(os.getcwd(), f".resi-thread-{id(self)}")
+        manager = RailwayManager(
+            port=0, mixed_port=0, start_singbox=False, auto_refresh=False,
+            fetch_on_start=False, admin_token="t0ken-0123456789abcdef",
+            vless_uuid=VLESS, resi=None, resi_rotate=True,
+            resi_port=_free_port(), max_mux_connections=5,
+            config_path=f"{stem}.json", nodes_path=f"{stem}-nodes.json",
+            state_path=f"{stem}-state.json", settings_path=None)
+        thread = threading.Thread(target=manager._resi_accept_loop,
+                                  daemon=True)
+        client = None
+        try:
+            thread.start()
+            deadline = time.monotonic() + 3.0
+            while manager._resi_listener is None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertIsNotNone(manager._resi_listener)
+            with mock.patch("railway_manager.threading.Thread",
+                            side_effect=RuntimeError("can't start new thread")):
+                client = socket.create_connection(
+                    ("127.0.0.1", manager.resi_port), timeout=3)
+                deadline = time.monotonic() + 3.0
+                acquired = 0
+                while acquired < manager._resi_mux_cap and time.monotonic() < deadline:
+                    if manager._resi_mux_slots.acquire(blocking=False):
+                        acquired += 1
+                    else:
+                        time.sleep(0.01)
+                self.assertEqual(manager._resi_mux_cap, acquired,
+                                 "a failed Thread.start leaked the mux slot")
+                for _ in range(acquired):
+                    manager._resi_mux_slots.release()
+                client.settimeout(3)
+                try:
+                    self.assertEqual(b"", client.recv(1))
+                except (ConnectionResetError, ConnectionAbortedError):
+                    pass
+        finally:
+            if client is not None:
+                client.close()
+            manager.stop()
+            thread.join(3)
+            for path in (f"{stem}.json", f"{stem}-nodes.json",
+                         f"{stem}-state.json", f"{stem}.json.last-good"):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+
+
+class ResiPumpParamTests(unittest.TestCase):
+    """R2-6-06: the production call site must pass the first-byte budget."""
+
+    def test_handle_resi_client_passes_the_first_byte_budget(self) -> None:
+        import railway_manager as manager_mod
+
+        stem = os.path.join(os.getcwd(), f".resi-pump-{id(self)}")
+        manager = RailwayManager(
+            port=0, mixed_port=0, start_singbox=False, auto_refresh=False,
+            fetch_on_start=False, admin_token="t0ken-0123456789abcdef",
+            vless_uuid=VLESS, resi=None, resi_rotate=True,
+            config_path=f"{stem}.json", nodes_path=f"{stem}-nodes.json",
+            state_path=f"{stem}-state.json", settings_path=None)
+        client = mock.Mock()
+        backend = mock.Mock()
+        backend.sendall = mock.Mock()
+        backend.settimeout = mock.Mock()
+        backend.close = mock.Mock()
+        client.settimeout = mock.Mock()
+        client.close = mock.Mock()
+        stats = {"up": 0, "down": 0, "elapsed": 0.1, "upstream_first": True,
+                 "timed_out": [False, False], "first_byte_stalled": False}
+        try:
+            manager._set_resi_routes([("vpngate-a", RESI_ROTATE_BASE)])
+            with mock.patch("railway_manager.socket.create_connection",
+                            return_value=backend), \
+                 mock.patch("railway_manager._pump_pair",
+                            return_value=stats) as pump:
+                manager._handle_resi_client(client, hold_slot=False)
+        finally:
+            manager.stop()
+            for path in (f"{stem}.json", f"{stem}-nodes.json",
+                         f"{stem}-state.json", f"{stem}.json.last-good"):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+        self.assertEqual(manager_mod.RESI_FIRST_BYTE_TIMEOUT,
+                         pump.call_args.kwargs.get("first_byte_timeout"))
+
+
+class VerifyServedWaitDeathTests(unittest.TestCase):
+    """R2-6-15: the process dying *during* the wait is a failed attempt."""
+
+    def test_a_process_that_dies_while_waiting_for_mixed_is_attempted(self) -> None:
+        stem = os.path.join(os.getcwd(), f".resi-verify-wait-{id(self)}")
+        manager = RailwayManager(
+            port=0, mixed_port=_free_port(), start_singbox=True,
+            auto_refresh=False, fetch_on_start=False,
+            admin_token="t0ken-0123456789abcdef", vless_uuid=VLESS,
+            resi=None, resi_rotate=True,
+            config_path=f"{stem}.json", nodes_path=f"{stem}-nodes.json",
+            state_path=f"{stem}-state.json", settings_path=None)
+        proc = mock.Mock()
+        proc.pid = 424242
+        proc.poll = mock.Mock(side_effect=[None, None, 1, 1, 1, 1])
+        try:
+            manager._singbox_proc = proc
+            ok, _exit_ip, _ms, attempted = manager._verify_served(budget=2.0)
+        finally:
+            manager.stop()
+            for path in (f"{stem}.json", f"{stem}-nodes.json",
+                         f"{stem}-state.json", f"{stem}.json.last-good"):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+        self.assertFalse(ok)
+        self.assertTrue(attempted)
+
+
+class ApplyConfigSingleFlightTests(unittest.TestCase):
+    """R2-14: settings changes coalesce; republish waits for a pin switch."""
+
+    def _manager(self) -> RailwayManager:
+        stem = os.path.join(os.getcwd(), f".resi-bg-{id(self)}")
+        self._stem = stem
+        return RailwayManager(
+            port=0, mixed_port=0, start_singbox=False, auto_refresh=False,
+            fetch_on_start=False, admin_token="t0ken-0123456789abcdef",
+            vless_uuid=VLESS, resi=None, resi_rotate=True,
+            config_path=f"{stem}.json", nodes_path=f"{stem}-nodes.json",
+            state_path=f"{stem}-state.json", settings_path=None)
+
+    def tearDown(self) -> None:
+        stem = getattr(self, "_stem", None)
+        if not stem:
+            return
+        for path in (f"{stem}.json", f"{stem}-nodes.json",
+                     f"{stem}-state.json", f"{stem}.json.last-good"):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+    def test_two_settings_changes_share_one_apply_worker(self) -> None:
+        manager = self._manager()
+        started = threading.Event()
+        release = threading.Event()
+        calls: list[dict] = []
+
+        def _apply(**kwargs):
+            calls.append(kwargs)
+            started.set()
+            release.wait()
+            return True
+
+        try:
+            with mock.patch.object(manager, "_apply_config", side_effect=_apply):
+                manager._apply_config_bg()
+                self.assertTrue(started.wait(10))
+                manager._apply_config_bg()
+                manager._apply_config_bg()
+                release.set()
+                deadline = time.monotonic() + 10.0
+                while (manager._apply_config_thread is not None
+                       and time.monotonic() < deadline):
+                    time.sleep(0.01)
+        finally:
+            release.set()
+            manager.stop()
+        self.assertEqual(2, len(calls),
+                         "the pending changes must coalesce into one extra pass")
+
+    def test_republish_waits_for_the_pin_transaction(self) -> None:
+        manager = self._manager()
+        applied = threading.Event()
+        release = threading.Event()
+        held = threading.Event()
+
+        class _ObservedLock:
+            """Signal the acquire attempt, then block on the real lock."""
+
+            def __init__(self, lock) -> None:
+                self._lock = lock
+                self.attempted = threading.Event()
+
+            def __enter__(self):
+                self.attempted.set()
+                self._lock.acquire()
+                return self
+
+            def __exit__(self, *exc) -> None:
+                self._lock.release()
+
+        def holder() -> None:
+            with real_lock:
+                held.set()
+                release.wait()
+
+        real_lock = manager._pin_switch_lock
+        observed = _ObservedLock(real_lock)
+        thread = threading.Thread(target=holder, daemon=True)
+        worker = threading.Thread(target=manager._republish_config, daemon=True)
+        try:
+            with mock.patch.object(manager, "_pin_switch_lock", observed), \
+                 mock.patch.object(manager, "_apply_config",
+                                   side_effect=lambda **kw: applied.set() or True):
+                thread.start()
+                self.assertTrue(held.wait(10))
+                worker.start()
+                self.assertTrue(observed.attempted.wait(10))
+                self.assertFalse(applied.is_set(),
+                                 "republish must wait for the pin-switch lock")
+                release.set()
+                deadline = time.monotonic() + 10.0
+                while (not applied.is_set()
+                       and time.monotonic() < deadline):
+                    time.sleep(0.01)
+                worker.join(max(0.0, deadline - time.monotonic()))
+            self.assertTrue(applied.is_set())
+        finally:
+            release.set()
+            thread.join(3)
+            manager.stop()
 
 
 if __name__ == "__main__":

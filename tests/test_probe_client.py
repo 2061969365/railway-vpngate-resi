@@ -261,5 +261,76 @@ class ProbeClientTests(unittest.TestCase):
         self.assertEqual(self.client.delays(None), {})
 
 
+class _RedirectHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.0"
+
+    def do_GET(self) -> None:  # noqa: N802 - stdlib hook
+        target = self.server.target_url
+        self.send_response(302)
+        self.send_header("Location", target)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, *args) -> None:  # noqa: D401 - silence test server
+        return
+
+
+class RedirectServer:
+    def __init__(self, target_url: str) -> None:
+        self.target_url = target_url
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), _RedirectHandler)
+        self.httpd.daemon_threads = True
+        self.httpd.target_url = target_url
+        self.thread = threading.Thread(
+            target=lambda: self.httpd.serve_forever(poll_interval=0.02),
+            daemon=True,
+        )
+        self.thread.start()
+
+    @property
+    def url(self) -> str:
+        host, port = self.httpd.server_address[:2]
+        return "http://%s:%d" % (host, port)
+
+    def close(self) -> None:
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.thread.join(timeout=2)
+
+
+class ProbeClientHardeningTests(unittest.TestCase):
+    def test_redirect_is_not_followed_and_token_is_not_forwarded(self) -> None:
+        target = FakeProbeServer()
+        target.state.token = "SECRET-TOKEN"
+        redirect = RedirectServer(target.url + "/v1/health")
+        client = ProbeClient(redirect.url, token="SECRET-TOKEN", timeout=1.0)
+        try:
+            self.assertIsNone(client.health())
+        finally:
+            redirect.close()
+            target.close()
+        self.assertEqual([], target.state.requests)
+
+    def test_non_http_scheme_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            ProbeClient("ftp://127.0.0.1:21")
+
+    def test_environment_proxy_is_ignored(self) -> None:
+        server = FakeProbeServer()
+        try:
+            with mock.patch.dict(
+                os.environ,
+                {"HTTP_PROXY": "http://127.0.0.1:1",
+                 "HTTPS_PROXY": "http://127.0.0.1:1",
+                 "http_proxy": "http://127.0.0.1:1",
+                 "https_proxy": "http://127.0.0.1:1"},
+                clear=False,
+            ):
+                client = ProbeClient(server.url, timeout=1.0)
+                self.assertTrue(client.health()["ok"])
+        finally:
+            server.close()
+
+
 if __name__ == "__main__":
     unittest.main()

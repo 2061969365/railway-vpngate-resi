@@ -6,8 +6,6 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title id="pageTitle">三体 · 地球往事 深度解读站</title>
 <meta name="description" content="三体第一部《三体》深度解读 - 红岸基地、智子锁死、三体游戏、古筝行动与叶文洁的疯狂年代">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@400;700;900&family=Noto+Sans+SC:wght@300;400;500&family=JetBrains+Mono:wght@400&family=Cinzel:wght@400&display=swap" rel="stylesheet">
 <style>
 :root{
   --bg:#0a0508;
@@ -22,6 +20,7 @@
 }
 *{margin:0;padding:0;box-sizing:border-box}
 html{scroll-behavior:smooth}
+.visually-hidden{position:absolute!important;width:1px!important;height:1px!important;padding:0!important;margin:-1px!important;overflow:hidden!important;clip:rect(0 0 0 0)!important;white-space:nowrap!important;border:0!important}
 .skip-link{position:absolute;left:-9999px;top:8px;z-index:100;padding:8px 14px;background:var(--red);color:#fff;border-radius:999px;font-size:12px}
 .skip-link:focus{left:12px}
 a:focus-visible,button:focus-visible{outline:2px solid var(--red);outline-offset:2px}
@@ -94,6 +93,7 @@ nav{
 /* hero */
 .hero{
   min-height:100vh;
+  min-height:100svh;
   display:grid;grid-template-columns:1fr 1fr;
   align-items:center;
   padding:110px 40px 60px;
@@ -213,6 +213,11 @@ section{padding:84px 40px;max-width:1280px;margin:0 auto}
 }
 .reveal{opacity:0;transform:translateY(20px);transition:opacity .7s cubic-bezier(.16,1,.3,1),transform .7s cubic-bezier(.16,1,.3,1)}
 .reveal.in{opacity:1;transform:none}
+@media (prefers-reduced-motion: reduce){
+  html{scroll-behavior:auto}
+  *,*::before,*::after{animation-duration:.001ms!important;animation-iteration-count:1!important;transition-duration:.001ms!important;scroll-behavior:auto!important}
+  .reveal{opacity:1;transform:none}
+}
 @media(max-width:640px){
   nav{backdrop-filter:blur(8px) saturate(1.1)}
   .card,.meta-card,.sim-panel,.mobile-menu,.era-badge,.float-tag{backdrop-filter:blur(6px)}
@@ -411,7 +416,8 @@ footer a:hover{color:var(--text)}
 #realPage button { color: white; border: none; padding: 11px 14px; border-radius: 12px; cursor: pointer; font-size: 13px; font-weight: 600; transition: transform .12s ease, filter .15s ease; }
 #realPage button:hover { filter: brightness(1.12); }
 #realPage button:active { transform: scale(.98); }
-#realPage .btn-copy { width: 100%; background: linear-gradient(92deg,#0284c7,#0ea5e9); font-size: 13px; font-weight: bold; padding: 11px; border: none; border-radius: 12px; color: white; cursor: pointer; box-shadow: 0 6px 22px rgba(2,132,199,.4);}
+#realPage .btn-apply { background: #0ea5e9; color: #06121f; font-weight: 700; }
+#realPage .btn-copy { width: 100%; background: linear-gradient(92deg,#075985,#0369a1); font-size: 13px; font-weight: bold; padding: 11px; border: none; border-radius: 12px; color: white; cursor: pointer; box-shadow: 0 6px 22px rgba(2,132,199,.4);}
 #realPage .ip-tag { background: rgba(56,189,248,.1); border: 1px solid rgba(56,189,248,.35); padding: 5px 12px; border-radius: 99px; font-size: 12px; font-family: monospace; color: #38bdf8; cursor: pointer; }
 #realPage .ip-tag:hover { background: #38bdf8; color: #0f172a; box-shadow: 0 0 16px rgba(56,189,248,.5); }
 #realPage .pool-error { font-size: 12px; color: #fca5a5; }
@@ -424,19 +430,20 @@ footer a:hover{color:var(--text)}
 #realPage .card-direct { border-left: 3px solid #38bdf8; }
 #realPage .card-chain { border-left: 3px solid #34d399; }
 #realPage .route-hint { font-size: 12px; color: #8b91a5; margin-bottom: 10px; }
-#realPage .btn-copy-chain { width: 100%; background: linear-gradient(92deg,#059669,#10b981); font-size: 13px; font-weight: bold; padding: 11px; border: none; border-radius: 12px; color: white; cursor: pointer; box-shadow: 0 6px 22px rgba(5,150,105,.4);}
+#realPage .btn-copy-chain { width: 100%; background: linear-gradient(92deg,#065f46,#047857); font-size: 13px; font-weight: bold; padding: 11px; border: none; border-radius: 12px; color: white; cursor: pointer; box-shadow: 0 6px 22px rgba(5,150,105,.4);}
 #realPage .btn-copy-gray { width: 100%; background: rgba(255,255,255,.1); border: 1px solid rgba(255,255,255,.16); font-size: 13px; font-weight: bold; padding: 11px; border-radius: 12px; color: #e5e7eb; cursor: pointer;}
-#realPage #btn-copy-both { width: 100%; background: linear-gradient(92deg,#6366f1,#0ea5e9); font-size: 14px; font-weight: bold; padding: 13px; border: none; border-radius: 14px; color: white; cursor: pointer; margin-bottom: 18px; box-shadow: 0 8px 26px rgba(99,102,241,.45);}
+#realPage #btn-copy-both { width: 100%; background: linear-gradient(92deg,#4338ca,#0369a1); font-size: 14px; font-weight: bold; padding: 13px; border: none; border-radius: 14px; color: white; cursor: pointer; margin-bottom: 18px; box-shadow: 0 8px 26px rgba(67,56,202,.45);}
 #real-toast { position: fixed; right: 22px; bottom: 22px; z-index: 100; display: flex; flex-direction: column; gap: 10px; }
 #real-toast .toast-msg { background: rgba(16,20,36,.94); border: 1px solid rgba(110,231,183,.45); color: #d1fae5; border-radius: 14px; padding: 12px 18px; font-size: 13px; max-width: 360px; box-shadow: 0 10px 30px rgba(0,0,0,.5); }
 </style>
+<noscript><style>.reveal{opacity:1;transform:none}</style></noscript>
 </head>
 <body>
 <div id="fakePage">
 <a href="#main" class="skip-link">跳至主内容</a>
 <div class="stars" aria-hidden="true"></div>
 
-<input type="checkbox" id="navToggle" hidden>
+<input type="checkbox" id="navToggle" class="visually-hidden">
 <nav aria-label="主导航">
   <div class="nav-left">
     <div class="logo">三</div>
@@ -446,9 +453,9 @@ footer a:hover{color:var(--text)}
     <a href="#intro">导语</a><a href="#dual">双线</a><a href="#plot">脉络</a><a href="#concepts">设定</a><a href="#chars">人物</a><a href="#insights">解读</a><a href="#quotes">语录</a><a href="#reading">重读</a>
   </div>
   <a class="nav-cta" href="#insights">直达独特解读</a>
-  <label for="navToggle" class="hamburger" aria-label="打开菜单"><span></span></label>
+  <label for="navToggle" class="hamburger" role="button" tabindex="0" aria-expanded="false" aria-controls="mobileMenu" aria-label="打开菜单"><span></span></label>
 </nav>
-<div class="mobile-menu" role="navigation" aria-label="移动端导航">
+<div class="mobile-menu" id="mobileMenu" role="navigation" aria-label="移动端导航">
   <a href="#intro">导语</a><a href="#dual">双线</a><a href="#plot">脉络</a><a href="#concepts">设定</a><a href="#chars">人物</a><a href="#insights">解读</a><a href="#quotes">语录</a><a href="#reading">重读</a>
 </div>
 
@@ -471,7 +478,7 @@ footer a:hover{color:var(--text)}
   </div>
 
   <div class="sim-panel">
-    <canvas id="sim"></canvas>
+    <canvas id="sim" aria-hidden="true"></canvas>
     <div class="sim-hud"><span>THREE-BODY SIMULATION · N=3</span><b>第 <span id="epoch">1</span> 号文明</b></div>
     <div class="era-badge" id="era">ERA · 恒纪元</div>
     <button class="sim-btn" id="perturb" type="button">扰动重启 ↻ 初始条件微扰 +ε</button>
@@ -807,17 +814,25 @@ footer a:hover{color:var(--text)}
   <div style="text-align:right">
     <div style="font-family:'JetBrains Mono',monospace;letter-spacing:0.12em">BUILT FOR READERS · 2026</div>
     <div style="margin-top:6px"><a href="#top">返回顶部</a> · <a href="#dual">双线结构</a> · <a href="#concepts">核心设定</a></div>
-    <div style="margin-top:8px;color:var(--dim)">Design: Red Coast Edition · No trackers · No ads</div>
+    <div style="margin-top:8px;color:var(--dim)">Design: Red Coast Edition · No ads</div>
   </div>
 </footer>
 <script>
 // reveal on scroll
-const obs = new IntersectionObserver(es=>{
-  es.forEach(e=>{ if(e.isIntersecting) e.target.classList.add('in') })
-},{threshold:0.12});
-document.querySelectorAll('.reveal').forEach(el=>obs.observe(el));
+(function(){
+  const reveals = document.querySelectorAll('.reveal');
+  const showAll = () => reveals.forEach(el => el.classList.add('in'));
+  if(!('IntersectionObserver' in window)){ showAll(); return; }
+  try{
+    const obs = new IntersectionObserver(es=>{
+      es.forEach(e=>{ if(e.isIntersecting) e.target.classList.add('in') })
+    },{threshold:0.12});
+    reveals.forEach(el=>obs.observe(el));
+  }catch(e){ showAll(); }
+})();
 
 /* ===== three-body simulation ===== */
+try{
 (function(){
   const cv = document.getElementById('sim');
   if(!cv) return;
@@ -953,45 +968,69 @@ document.querySelectorAll('.reveal').forEach(el=>obs.observe(el));
   }
 
   fit();
-  window.addEventListener('resize', ()=>{fit(); newEpoch(0); epoch=1; epochEl.textContent=1;});
   newEpoch(0);
 
   const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
   let rafId=null;
+  let running=false;
+  const fakePageEl = document.getElementById('fakePage');
+  const pageHidden = () => document.hidden || !!(fakePageEl && fakePageEl.style.display === 'none');
+
+  function loop(){
+    if(!running) return;
+    frame++;
+    step();
+    draw();
+    if(frame%24===0) updateEra();
+    if(escaped() || frame>4200){ frame=0; newEpoch(6); updateEra(); }
+    rafId=requestAnimationFrame(loop);
+  }
+  function start(){
+    if(reduced || running || pageHidden()) return;
+    running=true;
+    rafId=requestAnimationFrame(loop);
+  }
+  function stop(){
+    running=false;
+    if(rafId!==null){ cancelAnimationFrame(rafId); rafId=null; }
+  }
+  window.__threeBody = { start: start, stop: stop };
+
   if(reduced){
     for(let i=0;i<1200;i++){ step(); if(i%12===0) draw(); }
   } else {
-    (function loop(){
-      frame++;
-      step();
-      draw();
-      if(frame%24===0) updateEra();
-      if(escaped() || frame>4200){ frame=0; newEpoch(6); updateEra(); }
-      rafId=requestAnimationFrame(loop);
-    })();
+    start();
   }
 
-  document.getElementById('perturb').addEventListener('click', ()=>{
-    frame=0; newEpoch(14); updateEra();
-  });
-  // allow cleanup if page becomes hidden/spa unload
-  document.addEventListener('visibilitychange', ()=>{ if(document.hidden && rafId) cancelAnimationFrame(rafId); });
+  window.addEventListener('resize', ()=>{ if(pageHidden()) return; fit(); newEpoch(0); epoch=1; epochEl.textContent=1; });
+  const perturbBtn = document.getElementById('perturb');
+  if(perturbBtn) perturbBtn.addEventListener('click', ()=>{ frame=0; newEpoch(14); updateEra(); start(); });
+  document.addEventListener('visibilitychange', ()=>{ if(document.hidden) stop(); else start(); });
 })();
+}catch(e){ console.warn('three-body init failed', e); }
 
 /* ===== sophon countdown ticker ===== */
+try{
 (function(){
   const el=document.getElementById('cd'); if(!el) return;
   let h=1153,m=47,s=32;
   let timer=setInterval(tick,1000);
   function tick(){
     if(document.hidden) return;
+    if(h===0&&m===0&&s===0) return;
     s--; if(s<0){s=59;m--;} if(m<0){m=59;h--;}
-    el.textContent = h+':'+String(m).padStart(2,'0')+':'+String(s).padStart(2,'0');
+    h=Math.max(0,h); m=Math.max(0,m); s=Math.max(0,s);
+    el.textContent = (h===0&&m===0&&s===0) ? '已开始' : h+':'+String(m).padStart(2,'0')+':'+String(s).padStart(2,'0');
   }
-  document.addEventListener('visibilitychange', ()=>{ if(document.hidden) clearInterval(timer); else timer=setInterval(tick,1000); });
+  document.addEventListener('visibilitychange', ()=>{
+    if(document.hidden){ clearInterval(timer); timer=null; }
+    else if(!timer){ timer=setInterval(tick,1000); }
+  });
 })();
+}catch(e){ console.warn('countdown init failed', e); }
 
 /* subtle parallax — rAF-throttled, disabled on coarse pointers */
+try{
 const simPanel = document.querySelector('.sim-panel');
 if(simPanel && !window.matchMedia('(prefers-reduced-motion: reduce)').matches && !window.matchMedia('(pointer: coarse)').matches){
   let ticking=false;
@@ -1007,6 +1046,33 @@ if(simPanel && !window.matchMedia('(prefers-reduced-motion: reduce)').matches &&
     });
   });
 }
+}catch(e){ console.warn('parallax init failed', e); }
+
+/* ===== mobile menu keyboard support ===== */
+try{
+(function(){
+  const toggle = document.getElementById('navToggle');
+  const hamburger = document.querySelector('.hamburger');
+  const menu = document.getElementById('mobileMenu');
+  if(!toggle || !hamburger) return;
+  const sync = () => hamburger.setAttribute('aria-expanded', toggle.checked ? 'true' : 'false');
+  hamburger.addEventListener('keydown', e=>{
+    if(e.key === 'Enter' || e.key === ' ' || e.key === 'Spacebar'){
+      e.preventDefault();
+      toggle.checked = !toggle.checked;
+      sync();
+    }
+  });
+  toggle.addEventListener('change', sync);
+  if(menu){
+    menu.querySelectorAll('a').forEach(a=>a.addEventListener('click', ()=>{ toggle.checked = false; sync(); }));
+  }
+  document.addEventListener('keydown', e=>{
+    if(e.key === 'Escape' && toggle.checked){ toggle.checked = false; sync(); }
+  });
+  sync();
+})();
+}catch(e){ console.warn('mobile menu init failed', e); }
 </script>
 </div>
 
@@ -1017,77 +1083,110 @@ if(simPanel && !window.matchMedia('(prefers-reduced-motion: reduce)').matches &&
                 <span class="badge">安全防扫描激活</span>
             </div>
 
-            <div class="card glass-card">
-                <div class="label">⚡ 全网最新官方优选 IP 推荐 (全自动动态捞取)</div>
-                <div style="font-size:12px; color:#8b91a5; margin-bottom:10px;">点击下方优质物理加速点，可一键自动重组下方的节点链接：</div>
+            <div class="card glass-card" id="ipPoolCard">
+                <div class="label">⚡ 优选 IP 池（按需获取）</div>
+                <div style="font-size:12px; color:#8b91a5; margin-bottom:10px;">不会自动请求第三方资源；点击按钮从公网拉取优选 IP，或手动填入接入点。</div>
                 <div id="ipPool" style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:15px;">
-                    <span style="font-size:13px; color:#64748b;">正在顺着星际网络打捞新鲜 IP 池...</span>
+                    <button type="button" class="btn-retry" onclick="fetchOptimizedIPs()">获取优选 IP</button>
                 </div>
-                <div class="label" style="font-size:12px; color:#38bdf8;">手动覆盖接入点 IP 或优选域名:</div>
+                <label class="label" for="cfIpInput" style="font-size:12px; color:#38bdf8;">手动覆盖接入点 IP 或优选域名:</label>
                 <div class="input-group">
                     <input type="text" id="cfIpInput" placeholder="例如: 104.16.88.9 或 cf.aliyun.com">
-                    <button onclick="applyCustomIp()">强制套用接入点</button>
+                    <button type="button" id="applyIpBtn" class="btn-apply" onclick="applyCustomIp()">强制套用接入点</button>
                 </div>
             </div>
 
-            <div class="card card-direct glass-card">
-                <div class="label" style="color:#38bdf8;">🪐 VLESS 直连节点<span class="path-pill path-direct">/ws-node</span></div>
+            <div class="card card-direct glass-card" id="directCard">
+                <div class="label" style="color:#38bdf8;">🪐 VLESS 直连节点<span class="path-pill path-direct">VLESS_DIRECT_PATH_PLACEHOLDER</span></div>
                 <div class="route-hint">出口 = Railway 本地 IP · 低延迟优先</div>
                 <div class="value" id="nodeLink" style="height:50px;">生成中...</div>
                 <button class="btn-copy" onclick="copyText('nodeLink', this)">📋 一键复制直连节点链接</button>
             </div>
 
-            <div class="card card-chain glass-card">
-                <div class="label" style="color:#34d399;">🔗 VLESS 链式节点<span class="path-pill path-chain">/ws-chain</span></div>
+            <div class="card card-chain glass-card" id="chainCard">
+                <div class="label" style="color:#34d399;">🔗 VLESS 链式节点<span class="path-pill path-chain">VLESS_CHAIN_PATH_PLACEHOLDER</span></div>
                 <div class="route-hint">出口 = VPNGate 落地 IP · 换出口优先</div>
                 <div class="value" id="nodeLinkChain" style="height:50px;">生成中...</div>
                 <button class="btn-copy-chain" onclick="copyText('nodeLinkChain', this)">📋 一键复制链式节点链接</button>
             </div>
 
             <div class="card card-chain glass-card" id="resiCard" style="display:none;">
-                <div class="label" style="color:#a78bfa;">🏠 VLESS 轮换出口<span class="path-pill path-chain">/ws-resi</span></div>
+                <div class="label" style="color:#a78bfa;">🏠 VLESS 轮换出口<span class="path-pill path-chain">RESI_PATH_PLACEHOLDER</span></div>
                 <div class="route-hint">出口 = VPNGate 节点 IP · 每条新连接换一个（客户端须关闭 mux）</div>
                 <div class="value" id="nodeLinkResi" style="height:50px;">生成中...</div>
                 <button class="btn-copy-chain" onclick="copyText('nodeLinkResi', this)">📋 一键复制第三出口链接</button>
             </div>
 
-            <button id="btn-copy-both" onclick="copyBoth(this)">📋 一键复制两个链接（直连 + 链式）</button>
-
-            <div class="card glass-card">
-                <div class="label">📦 Base64 订阅内容（直连 + 链式，共两行）</div>
-                <div class="value" id="subContent" style="height:50px;">生成中...</div>
-                <button class="btn-copy-gray" onclick="copyText('subContent', this)">📋 一键复制通用订阅内容</button>
+            <div class="card glass-card" id="vlessDisabled" style="display:none;">
+                <div class="label" style="color:#f59e0b;">⚠️ VLESS 未启用</div>
+                <div class="route-hint">服务端未设置 VLESS_UUID（或显式留空），直连、链式与轮换链接均不可用。</div>
             </div>
 
-            <div class="footer">Powered by Xray-core & Cloudflare Tunnel (QUIC Mode)</div>
-            <div id="real-toast"></div>
+            <button id="btn-copy-both" onclick="copyBoth(this)">📋 一键复制两个链接（直连 + 链式）</button>
+
+            <div class="card glass-card" id="subCard">
+                <div class="label">📦 Base64 订阅内容（直连 + 链式，共两行）</div>
+                <div class="value" id="subContent" style="height:50px;">生成中...</div>
+                <button class="btn-copy-gray" onclick="copyRaw('subContent', this)">📋 一键复制通用订阅内容</button>
+            </div>
+
+            <div class="footer">Powered by sing-box & Cloudflare Tunnel (QUIC Mode)</div>
+            <div id="real-toast" role="status" aria-live="polite"></div>
         </div>
     </div>
 
 <script>
 
         const uuid = "UUID_PLACEHOLDER";
-        const wsPath = "/ws-node";
-        const wsChainPath = "/ws-chain";
+        const vlessEnabled = ("VLESS_ENABLED_PLACEHOLDER" === "true");
+        const wsPath = "VLESS_DIRECT_PATH_PLACEHOLDER";
+        const wsChainPath = "VLESS_CHAIN_PATH_PLACEHOLDER";
         const wsResiPath = "RESI_PATH_PLACEHOLDER";
         const nodeRemark = "NODE_REMARK_PLACEHOLDER";
         const chainRemark = nodeRemark + "-chain";
         const resiRemark = nodeRemark + "-resi";
-        const currentHost = window.location.host;
+        const hostName = window.location.hostname.replace(/^\[|\]$/g, '');
+        const uriHost = hostName.indexOf(':') !== -1 ? '[' + hostName + ']' : hostName;
 
         // mirror handling lives in the single IIFE at the end of body.
 
+        function setVlessDisabled() {
+            ['directCard', 'chainCard', 'resiCard', 'subCard', 'btn-copy-both', 'ipPoolCard'].forEach((id) => {
+                const el = document.getElementById(id);
+                if (el) el.style.display = 'none';
+            });
+            ['nodeLink', 'nodeLinkChain', 'nodeLinkResi', 'subContent'].forEach((id) => {
+                const el = document.getElementById(id);
+                if (el) el.innerText = '';
+            });
+            ['applyIpBtn', 'cfIpInput'].forEach((id) => {
+                const el = document.getElementById(id);
+                if (el) el.disabled = true;
+            });
+            const notice = document.getElementById('vlessDisabled');
+            if (notice) notice.style.display = '';
+        }
+
         function generateLinks(connectAddress) {
-            const vlessLink = `vless://${uuid}@${connectAddress}:443?encryption=none&security=tls&type=ws&host=${currentHost}&sni=${currentHost}&path=${encodeURIComponent(wsPath)}#${nodeRemark}`;
-            const chainLink = `vless://${uuid}@${connectAddress}:443?encryption=none&security=tls&type=ws&host=${currentHost}&sni=${currentHost}&path=${encodeURIComponent(wsChainPath)}#${chainRemark}`;
+            // R2-4-18: with VLESS_UUID empty there is no valid link.  Hide the
+            // cards instead of producing dead links with an empty user.
+            if (!vlessEnabled) {
+                setVlessDisabled();
+                return;
+            }
+            const address = connectAddress || uriHost;
+            const authority = address.indexOf(':') !== -1 && address.charAt(0) !== '[' ? '[' + address + ']' : address;
+            const vlessLink = `vless://${uuid}@${authority}:443?encryption=none&security=tls&type=ws&host=${hostName}&sni=${hostName}&path=${encodeURIComponent(wsPath)}#${nodeRemark}`;
+            const chainLink = `vless://${uuid}@${authority}:443?encryption=none&security=tls&type=ws&host=${hostName}&sni=${hostName}&path=${encodeURIComponent(wsChainPath)}#${chainRemark}`;
             document.getElementById('nodeLink').innerText = vlessLink;
             document.getElementById('nodeLinkChain').innerText = chainLink;
             // The residential path only exists when RESI_PATH_PLACEHOLDER was
-            // replaced at boot (start.sh); an unreplaced placeholder must not
-            // leave a dead link on the page.
+            // replaced at boot (inject_page.py); an unreplaced placeholder
+            // must not leave a dead link on the page.  The path itself was
+            // already validated server-side.
             let resiLink = "";
-            if (/^\/[\w\/-]+$/.test(wsResiPath) && wsResiPath.indexOf("PLACEHOLDER") === -1) {
-                resiLink = `vless://${uuid}@${connectAddress}:443?encryption=none&security=tls&type=ws&host=${currentHost}&sni=${currentHost}&path=${encodeURIComponent(wsResiPath)}#${resiRemark}`;
+            if (wsResiPath.charAt(0) === "/" && wsResiPath.indexOf("PLACEHOLDER") === -1) {
+                resiLink = `vless://${uuid}@${authority}:443?encryption=none&security=tls&type=ws&host=${hostName}&sni=${hostName}&path=${encodeURIComponent(wsResiPath)}#${resiRemark}`;
                 document.getElementById('nodeLinkResi').innerText = resiLink;
                 document.getElementById('resiCard').style.display = "";
             }
@@ -1124,11 +1223,21 @@ if(simPanel && !window.matchMedia('(prefers-reduced-motion: reduce)').matches &&
         function isValidIPv4(ip) {
             const parts = ip.split('.');
             if (parts.length !== 4) return false;
-            return parts.every(o => /^\d{1,3}$/.test(o) && +o >= 0 && +o <= 255);
+            return parts.every(o => /^(0|[1-9]\d{0,2})$/.test(o) && +o <= 255);
+        }
+
+        function isValidIPv6(h) {
+            if (h.indexOf(':') === -1) return false;
+            try { new URL('http://[' + h + ']'); return true; } catch (e) { return false; }
         }
 
         function isValidHost(h) {
-            return isValidIPv4(h) || /^([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}$/.test(h);
+            if (!h) return false;
+            if (h === 'localhost') return true;
+            if (/^\d{1,3}(\.\d{1,3}){3}$/.test(h)) return isValidIPv4(h);
+            if (isValidIPv6(h)) return true;
+            if (!/^[A-Za-z0-9.-]+$/.test(h) || h.indexOf('..') !== -1) return false;
+            try { new URL('http://' + h); return true; } catch (e) { return false; }
         }
 
         function flashButton(btn, doneText) {
@@ -1140,12 +1249,17 @@ if(simPanel && !window.matchMedia('(prefers-reduced-motion: reduce)').matches &&
         }
 
         function applyCustomIp() {
-            const inputVal = document.getElementById('cfIpInput').value.trim();
+            if (!vlessEnabled) {
+                realToast('VLESS 未启用');
+                return;
+            }
+            const input = document.getElementById('cfIpInput');
+            const inputVal = input ? input.value.trim() : '';
             if (inputVal && !isValidHost(inputVal)) {
                 realToast('格式错误：请输入合法 IP 或域名');
                 return;
             }
-            generateLinks(inputVal ? inputVal : currentHost);
+            generateLinks(inputVal || uriHost);
             realToast(inputVal ? `已成功套用接入点: ${inputVal}` : '已恢复默认隧道域名解析');
         }
 
@@ -1156,28 +1270,47 @@ if(simPanel && !window.matchMedia('(prefers-reduced-motion: reduce)').matches &&
 
         function renderPool(ips) {
             const poolDiv = document.getElementById('ipPool');
+            if (!poolDiv) return;
             poolDiv.innerHTML = '';
             ips.forEach(ip => {
-                const span = document.createElement('span');
-                span.className = 'ip-tag';
-                span.innerText = ip;
-                span.onclick = () => {
+                const tag = document.createElement('button');
+                tag.type = 'button';
+                tag.className = 'ip-tag';
+                tag.innerText = ip;
+                tag.onclick = () => {
                     document.getElementById('cfIpInput').value = ip;
                     generateLinks(ip);
                     realToast(`✨ 已成功切换到该优选 IP: ${ip}`);
                 };
-                poolDiv.appendChild(span);
+                poolDiv.appendChild(tag);
             });
         }
 
         function poolFailed() {
-            document.getElementById('ipPool').innerHTML = '<span class="pool-error">公网资源池打捞失败。</span><button class="btn-retry" onclick="fetchOptimizedIPs()">重试</button>';
+            const poolDiv = document.getElementById('ipPool');
+            if (!poolDiv) return;
+            poolDiv.innerHTML = '<span class="pool-error">公网资源池打捞失败。</span><button type="button" class="btn-retry" onclick="fetchOptimizedIPs()">重试</button>';
+        }
+
+        function fetchPoolText(url, signal) {
+            return fetch(url, { signal: signal, referrerPolicy: 'no-referrer' }).then(res => {
+                if (!res.ok) throw new Error('pool ' + res.status);
+                return res.text();
+            });
         }
 
         function fetchOptimizedIPs() {
-            fetch('https://raw.githubusercontent.com/joname1/BestCFip/refs/heads/main/ipv4.txt')
-                .then(res => { if (!res.ok) throw new Error('primary ' + res.status); return res.text(); })
-                .catch(() => fetch('https://cdn.jsdelivr.net/gh/joname1/BestCFip@main/ipv4.txt').then(res => { if (!res.ok) throw new Error('backup ' + res.status); return res.text(); }))
+            if (!vlessEnabled) {
+                realToast('VLESS 未启用');
+                return;
+            }
+            const poolDiv = document.getElementById('ipPool');
+            if (poolDiv) poolDiv.innerHTML = '<span style="font-size:13px;color:#64748b;">正在获取优选 IP...</span>';
+            const controller = typeof AbortController === 'function' ? new AbortController() : null;
+            const signal = controller ? controller.signal : undefined;
+            const timer = controller ? setTimeout(() => controller.abort(), 6000) : null;
+            fetchPoolText('https://raw.githubusercontent.com/joname1/BestCFip/refs/heads/main/ipv4.txt', signal)
+                .catch(() => fetchPoolText('https://cdn.jsdelivr.net/gh/joname1/BestCFip@main/ipv4.txt', signal))
                 .then(text => {
                     const ips = [];
                     for (const line of text.split('\n')) {
@@ -1187,27 +1320,50 @@ if(simPanel && !window.matchMedia('(prefers-reduced-motion: reduce)').matches &&
                     }
                     if (!ips.length) throw new Error('empty pool');
                     renderPool(ips);
-                }).catch(poolFailed);
+                })
+                .catch(poolFailed)
+                .then(() => { if (timer) clearTimeout(timer); });
+        }
+
+        function copyWithFallback(text) {
+            const clipboard = navigator.clipboard;
+            if (clipboard && typeof clipboard.writeText === 'function') {
+                return clipboard.writeText(text).then(() => true, () => fallbackCopy(text));
+            }
+            return Promise.resolve(fallbackCopy(text));
         }
 
         function copyText(elementId, btn) {
-            const text = document.getElementById(elementId).innerText.trim();
+            const el = document.getElementById(elementId);
+            const text = el ? el.innerText.trim() : '';
             if (!text || !text.startsWith('vless://')) {
                 realToast('链接还没生成好，请稍后再试');
                 return;
             }
-            navigator.clipboard.writeText(text).then(() => {
-                flashButton(btn);
-                realToast('已成功复制到剪贴板！');
-            }).catch(() => {
-                if (fallbackCopy(text)) { flashButton(btn); realToast('已成功复制到剪贴板！'); }
+            copyWithFallback(text).then(ok => {
+                if (ok) { flashButton(btn); realToast('已成功复制到剪贴板！'); }
+                else realToast('复制失败，请手动选择复制');
+            });
+        }
+
+        function copyRaw(elementId, btn) {
+            const el = document.getElementById(elementId);
+            const text = el ? el.innerText.trim() : '';
+            if (!text) {
+                realToast('内容还没生成好，请稍后再试');
+                return;
+            }
+            copyWithFallback(text).then(ok => {
+                if (ok) { flashButton(btn); realToast('已成功复制到剪贴板！'); }
                 else realToast('复制失败，请手动选择复制');
             });
         }
 
         function copyBoth(btn) {
-            const direct = document.getElementById('nodeLink').innerText.trim();
-            const chain = document.getElementById('nodeLinkChain').innerText.trim();
+            const directEl = document.getElementById('nodeLink');
+            const chainEl = document.getElementById('nodeLinkChain');
+            const direct = directEl ? directEl.innerText.trim() : '';
+            const chain = chainEl ? chainEl.innerText.trim() : '';
             if (!direct.startsWith('vless://') || !chain.startsWith('vless://')) {
                 realToast('链接还没生成好，请稍后再试');
                 return;
@@ -1216,13 +1372,13 @@ if(simPanel && !window.matchMedia('(prefers-reduced-motion: reduce)').matches &&
             const resiEl = document.getElementById('nodeLinkResi');
             const resi = (resiCard && resiCard.style.display !== 'none' && resiEl)
                 ? resiEl.innerText.trim() : "";
-            const all = [direct, chain, resi].filter((l) => l && l.startsWith('vless://')).join(String.fromCharCode(10));
-            const label = resi ? '直连 + 链式 + 住宅三个链接已复制！' : '直连 + 链式两个链接已复制！';
-            navigator.clipboard.writeText(all).then(() => {
-                flashButton(btn, '✓ 已复制');
-                realToast(label);
-            }).catch(() => {
-                if (fallbackCopy(all)) { flashButton(btn, '✓ 已复制'); realToast(label); }
+            const lines = [direct, chain, resi].filter((l) => l && l.startsWith('vless://'));
+            const all = lines.join(String.fromCharCode(10));
+            const label = lines.length === 3
+                ? '直连 + 链式 + 轮换出口三个链接已复制！'
+                : '直连 + 链式两个链接已复制！';
+            copyWithFallback(all).then(ok => {
+                if (ok) { flashButton(btn, '✓ 已复制'); realToast(label); }
                 else realToast('复制失败，请手动选择复制');
             });
         }
@@ -1235,6 +1391,7 @@ if(simPanel && !window.matchMedia('(prefers-reduced-motion: reduce)').matches &&
   if(!params.has('mirror')) return;
   const fake=document.getElementById('fakePage');
   if(fake) fake.style.display='none';
+  if(window.__threeBody) window.__threeBody.stop();
   const real=document.getElementById('realPage');
   if(real){ real.style.display='block'; real.classList.remove('hidden-panel'); }
   const titleEl=document.getElementById('pageTitle');
@@ -1244,8 +1401,7 @@ if(simPanel && !window.matchMedia('(prefers-reduced-motion: reduce)').matches &&
   document.body.style.justifyContent='center';
   document.body.style.padding='30px 15px';
   document.body.style.textAlign='left';
-  try { generateLinks(window.location.host); } catch (e) {}
-  try { fetchOptimizedIPs(); } catch (e) {}
+  try { generateLinks(uriHost); } catch (e) {}
 })();
 </script>
 </body>

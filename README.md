@@ -13,9 +13,11 @@ CC Switch / 伪装页 / 哪吒探针从 `railway-proxy-combined` 全量搬运
 | `:8082` `/ws-chain` | `vless-chain` → `chain`/`auto` → openvpn endpoint | VPNGate 节点出口 |
 | `:8084` `/ws-resi` | 管理器轮换监听 → 每个有效节点一条 loopback `resi-rot-i` 入站 | **轮换出口**：每条新连接换一个有效 VPNGate 节点（默认开启；配了 `RESI_GATEWAY` 则改为住宅网关） |
 
-三个入站共用同一个 `UUID`（`VLESS_UUID`，默认与 combined 一致：
-`a29738e5-bee1-c0fc-b484-ae7c49cbc828`）。`route.rules` 按 inbound tag 分流，
-三条路互不串扰。`VLESS_UUID` 为空时第③路不生成；有 `VLESS_UUID` 就默认开启
+三个入站共用同一个 `UUID`（`VLESS_UUID`）。未设置 `VLESS_UUID` 时启动会随机生成，
+日志只打印前 8 位指纹；**每次容器重启/重新部署都会换新 UUID**，已有客户端订阅会全部
+失效，生产请显式设置固定 `VLESS_UUID`。显式设置 `VLESS_UUID=`（空值）表示禁用
+VLESS 与节点轮换（伪装页会隐藏三张 VLESS 卡并显示“未启用”）。
+`route.rules` 按 inbound tag 分流，三条路互不串扰。有 `VLESS_UUID` 时默认开启
 「节点轮换」（面板第三张卡显示节点数与当前游标）。
 
 公网侧默认由 Go `vpngate-edge` 接 `$PORT` 并分流到上述 loopback 入站；没有 edge 时由管理器
@@ -26,6 +28,10 @@ CC Switch / 伪装页 / 哪吒探针从 `railway-proxy-combined` 全量搬运
 - `railway_manager.py` 是控制面：生成/重写 sing-box 配置、管理 `chain`/`auto` pin、节点
   轮换、Clash API 热切换与 `/api/status`，并继续提供 `/ui`、`/api`、`/healthz` 与伪装页
   （由 edge 反代）。edge 模式下它只绑 `127.0.0.1:ADMIN_PORT`，不再直接监听公网。
+  `MANAGER_IMPL` 只是文档预留（默认/唯一实现是 `py`）：`start.sh` 始终运行
+  `railway_manager.py`，镜像不构建 `vpngate-manager`，Go manager 的 stage 3-6
+  未实现，设置 `MANAGER_IMPL=go` 不会生效，见
+  [`docs/go-manager.md`](docs/go-manager.md)。
 - `vpngate-edge`（`cmd/vpngate-edge`，纯标准库 Go，`CGO_ENABLED=0` 静态编译）是公网数据面：
   拥有 `$PORT`，把 `/ws-node`、`/ws-chain` 原样 TCP 转发到 `127.0.0.1:8080/8082`（并统计
   字节/连接），`/ws-resi` 原样转给 Python 管理端（由 Python 计数），其余请求反代给管理端。
@@ -112,15 +118,18 @@ hijack + 每连接两个 goroutine，减少了 Python 线程模型的 header、�
      - `PROXY_USER`（默认 `u`）/ `PROXY_PASS`（可选；不填则每次启动自动生成随机 `PROXY_PASS`，
        `PROXY_USER` 保持 `u`。走 VLESS+tunnel 时用不到；只有直连 SOCKS5 调试时才需要。
        显式填写的话 `PROXY_PASS` 须 ≥ 16 位，否则拒绝启动）
-     - `ADMIN_TOKEN`（可选；不填则默认为 `vpn`，`/ui` 登录门输入 `vpn` 即可进入；
-       若显式填写且长度 < 16 位，会被静默替换为随机值并在日志打印）
+     - `ADMIN_TOKEN`（未设置时随机生成并在启动日志打印一次；显式设置为 `vpn`
+       或长度 < 16 位会拒绝启动，只有 `ALLOW_INSECURE_ADMIN=1` 才放行。
+       `/ui` 登录门输入该 token）
    - `TUNNEL_TOKEN`（Cloudflare tunnel token；缺失则 tunnel 软跳过，
      代理本身照常工作，`status["tunnel"] == "no-token"`）
-     - 可选：`VLESS_UUID`（默认与 combined 一致；`VLESS_UUID` 为空则不注册 VLESS 入站，
-       直接 `python railway_manager.py` 会无 VLESS）、`NEZHA_SERVER`/`NEZHA_KEY`、
+     - 可选：`VLESS_UUID`（未设置则随机生成并打印前 8 位指纹；显式空值则禁用
+       VLESS/轮换，直接 `python railway_manager.py` 会无 VLESS）、
+       `NEZHA_SERVER`/`NEZHA_KEY`/`NEZHA_AGENT_SHA256`（三者齐全才下载并校验 agent；
+       `NEZHA_SERVER`/`NEZHA_KEY`/`NEZHA_TLS` 写 YAML 前做字符集校验，换行/空白/引号会被拒绝）、
        `LIMIT`（默认 100，0=全量、上限 100）、`REAL_TOPK`（默认 30，真拨 TopK）、
        `DIAL_WORKERS`（默认 2，真测并发；1GB 内存够用，OOM 就往小调）、`FULL_PROBE_WORKERS`（默认 3，
-       全量真测并发；和 DIAL_WORKERS 叠加受全局 dial gate 上限 10 约束）、`REFRESH_SECONDS`（默认 3600，每小时拉新快照并补测新/被踢节点）、`PROBE_WORKERS`（默认 15，握手并发）、`DIAL_TIMEOUT`（默认 15，真拨超时秒）、`AUTO_REPIN`（默认开，每小时自动重 pin 最优）、`AUTO_RESCUE`（默认开，手动 pin 挂了自动救最优）、`HEALTH_CHECK_INTERVAL`（默认 20s，无 probe sidecar 时的全量探活；有 sidecar 时改用 `FAST_HEALTH_INTERVAL` 默认 5s 快探 + `DEEP_HEALTH_INTERVAL` 默认 30s 真出口深探，固定节拍、检查超时不补跑；快探超时由 `FAST_DELAY_TIMEOUT_MS` 控制，默认 2500ms、钳制 500..5000）、`CHAIN_SETTLE_GRACE`（默认 20s，新 pin 预热宽限，钳制 5..120）、`OPENVPN_PERSIST_PINNED`（默认 1，preferred/backup 端点空闲也保持 OpenVPN 会话；0 恢复按需释放）、`MAX_MUX_CONNECTIONS`（默认 100）、`NEZHA_URL`（可选）、`SNAPSHOT_URLS`（可选，逗号分隔的快照镜像，主源失败自动顺延）
+       全量真测并发；和 DIAL_WORKERS 叠加受全局 dial gate 上限 10 约束）、`REFRESH_SECONDS`（默认 3600，每小时拉新快照并补测新/被踢节点）、`PROBE_WORKERS`（默认 15，握手并发）、`DIAL_TIMEOUT`（默认 15，真拨超时秒）、`AUTO_REPIN`（默认开，每小时自动重 pin 最优）、`AUTO_RESCUE`（默认开，手动 pin 挂了自动救最优）、`HEALTH_CHECK_INTERVAL`（默认 20s，无 probe sidecar 时的全量探活；有 sidecar 时改用 `FAST_HEALTH_INTERVAL` 默认 5s 快探 + `DEEP_HEALTH_INTERVAL` 默认 30s 真出口深探，固定节拍、检查超时不补跑；快探超时由 `FAST_DELAY_TIMEOUT_MS` 控制，默认 2500ms、钳制 500..5000）、`CHAIN_SETTLE_GRACE`（默认 20s，新 pin 预热宽限，钳制 5..120）、`OPENVPN_PERSIST_PINNED`（默认 1，preferred/backup 端点空闲也保持 OpenVPN 会话；0 恢复按需释放）、`MAX_MUX_CONNECTIONS`（默认 100）、`NEZHA_URL`（可选；自定义地址仍需配合 `NEZHA_AGENT_SHA256`）、`SNAPSHOT_URLS`（可选，逗号分隔的快照镜像，主源失败自动顺延）
      - 第三出口（默认开启、节点轮换、零配置；只有要接外部住宅网关才需要下面这些）：
        `RESI_GATEWAY`（`host:port`，固定 backconnect 网关，**永远只连这个地址**；填了就切到住宅模式）、
        `RESI_USER`、`RESI_PASS`、
@@ -131,12 +140,55 @@ hijack + 每连接两个 goroutine，减少了 Python 线程模型的 header、�
 3. 健康检查：`/` 路径填 `/healthz`（部署时需 200，冷启动靠 last-good 秒回）。
 4. 另加一个 TCP Proxy 指向内部 `3000` 端口（可选，给 SOCKS5 用）。
 5. 持久化（强烈建议）：service → Volumes → Add Volume，加完即可，
-   无需配任何变量。代码会自动用 Railway 注入的
-   `RAILWAY_VOLUME_MOUNT_PATH` 存 sing-box 配置/节点存档/last-good
-   （`DATA_DIR` 显式设置会优先）。不挂卷的话每次重部署全量握手发现后冷启动（last-good 先顶住健康检查）。
+   无需配任何变量，也**不需要手动改卷属主**。容器入口 `entrypoint.sh` 以 root
+   启动，自动 `mkdir -p` 并对 `DATA_DIR`（`DATA_DIR` → `RAILWAY_VOLUME_MOUNT_PATH`
+   → `/app`）执行 `chown -R app:app`，随后立即 setuid 到 UID 10001 运行
+   `start.sh`，运行期没有 root 进程。代码用该目录存 sing-box 配置/节点存档/last-good。
+   不挂卷的话每次重部署全量握手发现后冷启动（last-good 先顶住健康检查）。
 
 > 合规警告：Railway AUP 明文禁止 proxy/anonymization 服务，
 > 长期运行有封号风险，仅适合临时演示/调试。
+
+## 从旧版本升级（破坏性变更）
+
+从 `79de9fe` 之前的部署直接升级时，逐项确认（否则会出现“客户端全失效 / 管理端 401 /
+探针不启动 / 容器重启循环”）：
+
+1. **`VLESS_UUID`**：旧版本有固定默认 UUID；现在未设置时每次容器重启/重新部署都会生成
+   新的随机 UUID，客户端订阅随之失效。升级前显式设置一个固定的 `VLESS_UUID`（合法
+   UUID）；确实要关闭 VLESS 才设空值。
+2. **`ADMIN_TOKEN`**：未设置时随机生成并只在启动日志打印一次；显式 `vpn` 或短于 16 位
+   会拒绝启动。升级后设置 ≥16 位的随机 token，并更新 `/ui` 登录与所有 Bearer 调用。
+3. **Nezha**：现在必须同时提供 `NEZHA_SERVER` + `NEZHA_KEY` + `NEZHA_AGENT_SHA256`
+   才会下载/启动 agent；只有前两个变量时 agent 会被跳过。`NEZHA_TLS` 只接受
+   `true|false`，三个值都会做字符集校验。
+4. **非 root / 卷属主**：镜像不再以 `USER app` 启动，而是 root 入口 `entrypoint.sh`
+   对 `DATA_DIR` 自动 `mkdir -p` + `chown -R app:app`，再 setuid 到 UID 10001 运行。
+   Railway 卷不需要手动改属主；自定义 `DATA_DIR` 时确认该路径在容器内可写。
+5. **`PORT`**：默认 3000。`8080/8081/8082/8084/4096/40000`（以及 `MIXED_PORT`/
+   `RESI_PORT`/VLESS/Clash/probe 端口）会拒绝启动；其它非 3000 值会告警（Cloudflare
+   tunnel 与 TCP Proxy 规则仍指向 3000）。小于 1024 的端口在非 root 下明确报错。
+6. **订阅**：升级后在伪装页重新复制三路链接（若启用 VLESS），并确认
+   `/ws-node`、`/ws-chain`、`/ws-resi` 的实际出口符合预期。
+
+### 供应链与访问控制
+
+- 镜像包含未审计的 `cc-switch-server`（模块 `github.com/2061969365/zen-direct`，
+  `+dirty` 构建）。Dockerfile 只做 SHA256 固定，来源、哈希与风险见
+  [`docs/supply-chain.md`](docs/supply-chain.md)；建议后续从源码重建或移除。
+- 基础镜像固定到 digest；`sing-box`/`cloudflared` 下载带 `--fail` 和 SHA256
+  校验；Nezha agent 仅在 `NEZHA_SERVER` + `NEZHA_KEY` + `NEZHA_AGENT_SHA256`
+  三条件齐全时下载并校验。
+- 容器入口以 root 启动，对 `DATA_DIR`（卷）执行 `mkdir -p` + `chown -R app:app`
+  后立即 `setuid(10001)` 运行 `start.sh`；业务进程以非 root `app` 运行，只写
+  `DATA_DIR` 与 `/tmp`，运行期没有常驻 root 进程。
+- `cc-switch-server`（未审计）通过 `env -i` 以最小环境启动，只拿
+  `PATH`/`HOME`/`TMPDIR`/`LANG`/`PORT`/`HOST`（可选 `ZEN_TABLE_URL`），不再继承
+  `ADMIN_TOKEN`/`TUNNEL_TOKEN`/`NEZHA_KEY`/`RESI_PASS`/`PROXY_PASS`。
+  `CC_SWITCH_INHERIT_ENV=1` 是仅用于排障的逃生开关，见
+  [`docs/supply-chain.md`](docs/supply-chain.md)。
+- 强烈建议在 Cloudflare 侧对 `/ui`、`/api/*` 加 Access 策略（或至少 WAF +
+  速率限制），不要只依赖 `ADMIN_TOKEN`。
 
 ## Cloudflare Tunnel 路由（Dashboard 配置）
 
@@ -163,8 +215,9 @@ ingress 规则在 Cloudflare Dashboard 的 tunnel 配置里加。
 没命中的路径落到 3000 再由 edge（回退模式下是管理器）反代给管理端。管理端剥离 query 后
 路由：`/ui` 进控制台登录门，
 `/api/*` 为数据接口（需 Bearer token），`/` 直接 serve 伪装页文件
-（`start.sh` 注入 UUID 后经 `DISGUISE_PATH` 接线，`start.sh` 幂等，
-容器重启不会残留旧值），其余路径 404 或 401。
+（`start.sh` 每次启动都从只读模板 `www/index.template.html` 重新渲染
+UUID/remark/路径后经 `DISGUISE_PATH` 接线，同容器重启不会残留旧值），
+其余路径 404 或 401。
 
 > 如果第三路连不上而前两路正常：先确认 ingress 里有 `/ws-resi` 的规则**或**一条
 > `/*` → `http://localhost:3000` 的兜底规则。用
@@ -332,7 +385,6 @@ docker build -t combined:test .
 docker run -d --name combined -p 3000:3000 -p 8080:8080 -p 8082:8082 -p 8084:8084 \
   -e PORT=3000 -e PROXY_USER=u -e PROXY_PASS=0123456789abcdef \
   -e ADMIN_TOKEN=local-admin-token-0123456789 \
-  -e VLESS_UUID=a29738e5-bee1-c0fc-b484-ae7c49cbc828 \
   -e LIMIT=12 -e REAL_TOPK=2 \
   combined:test
 curl http://127.0.0.1:3000/healthz   # ok
@@ -407,9 +459,23 @@ Python 回退。sing-box 运行时**绝不再起临时客户端去拨第二个�
 
 ## CI
 
-`.github/workflows/publish-image.yml`：在 `main` 上构建仓库 `Dockerfile` 并把镜像推到
-GHCR（`ghcr.io/<owner>/<repo>`），支持 `workflow_dispatch` 手动触发。流水线里不再跑测试，
-所有验证都在本地完成：
+仓库共有 4 个 workflow，所有 action 都固定到 commit SHA：
+
+- `publish-image.yml`：`main` push / `workflow_dispatch`；先跑 `pytest tests -q`
+  与 `go test ./...`，通过后先构建 `--platform linux/amd64` 镜像并做入口冒烟
+  （`bash -n start.sh` + `sh -n entrypoint.sh` + `import railway_manager` +
+  `ENTRYPOINT_DRY_RUN=1` 输出 `10001`），只有冒烟通过才推 GHCR
+  （`ghcr.io/<owner>/<repo>`），同时推不可变 `sha-<commit>` 与 `latest`
+  （`latest` 仅默认分支）、启用 provenance/SBOM；同一 ref 的发布串行执行。
+- `unit-tests.yml`：push/PR 上跑 Python 3.12/3.13 × 3 次，并用真实 sing-box
+  校验生成配置；PR 还会 `docker build`（不推送）并执行同样的入口冒烟。
+- 两个 workflow 都用固定版本的 `requirements-test.txt`（当前 `pytest==9.0.3`），
+  不再在 CI 里安装浮动最新版。
+- `test-combined.yml`：push/PR 上跑 `go test ./...` + `go vet ./...`。
+- `test-chain-acceptance.yml`：仅手动触发，真实 VPNGate 冷启动/自愈验收
+  （约 25–45 分钟）。
+
+本地等价验证：
 
 ```bash
 go test ./...                                     # 边车单测

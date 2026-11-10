@@ -1,0 +1,50 @@
+{
+  "name": "ovpn-multi-remote",
+  "kind": "ovpn",
+  "ovpn": "client\ndev tun\nproto tcp-client\nremote 203.0.113.3 443 tcp\nremote 203.0.113.4 8443 tcp\ncipher AES-128-CBC\nauth SHA1\nauth-user-pass\n<ca>\n-----BEGIN CERTIFICATE-----\nQ0E=\n-----END CERTIFICATE-----\n</ca>\n<cert>\n-----BEGIN CERTIFICATE-----\nQ0VSVA==\n-----END CERTIFICATE-----\n</cert>\n<key>\n-----BEGIN PRIVATE KEY-----\nS0VZ\n-----END PRIVATE KEY-----\n</key>\n",
+  "parse": {
+    "tag": "vpngate-0",
+    "username": "vpn",
+    "password": "vpn",
+    "on_demand": true,
+    "allow_private_remotes": true
+  },
+  "expected": {
+    "type": "openvpn-client",
+    "tag": "vpngate-0",
+    "servers": [
+      {
+        "server": "203.0.113.3",
+        "server_port": 443,
+        "network": "tcp"
+      },
+      {
+        "server": "203.0.113.4",
+        "server_port": 8443,
+        "network": "tcp"
+      }
+    ],
+    "network": "tcp",
+    "username": "vpn",
+    "password": "vpn",
+    "tls": {
+      "certificate": "-----BEGIN CERTIFICATE-----\nQ0E=\n-----END CERTIFICATE-----",
+      "certificate_profile": "legacy",
+      "client_certificate": "-----BEGIN CERTIFICATE-----\nQ0VSVA==\n-----END CERTIFICATE-----",
+      "client_key": "-----BEGIN PRIVATE KEY-----\nS0VZ\n-----END PRIVATE KEY-----"
+    },
+    "data_ciphers": [
+      "AES-128-CBC",
+      "AES-256-CBC",
+      "BF-CBC"
+    ],
+    "data_ciphers_fallback": "AES-128-CBC",
+    "auth": "SHA1",
+    "auth_retry": "nointeract",
+    "on_demand": true,
+    "ping_interval": "10s",
+    "ping_restart": "60s",
+    "system": false,
+    "redirect_gateway": true
+  }
+}

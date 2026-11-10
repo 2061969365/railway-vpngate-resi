@@ -4,9 +4,12 @@ from __future__ import annotations
 import argparse
 import builtins
 import base64
+import concurrent.futures
 import csv
 import io
+import ipaddress
 import json
+import os
 import re
 import socket
 import ssl
@@ -29,10 +32,23 @@ DEFAULT_AUTH = "SHA1"
 # username the gateway sees, never of a real home IP we could reach.
 DEFAULT_RESI_PORT = 8084
 DEFAULT_RESI_PATH = "/ws-resi"
-RESI_IN_PORT = 40001
+
+
+def _env_int(name: str, default: int) -> int:
+    """Read a bounded integer from the environment, falling back on garbage."""
+    try:
+        value = int(os.environ.get(name, "").strip())
+    except (TypeError, ValueError):
+        return default
+    return value if 1 <= value <= 65535 else default
+
+
+# Both ports are env-configurable so a deployment can move them out of the
+# Linux ephemeral range (32768-60999) without editing the library.
+RESI_IN_PORT = _env_int("RESI_IN_PORT", 40001)
 # Rotating third path: one loopback VLESS+WS inbound per serving endpoint,
 # so the manager can pick the next node for every new connection.
-RESI_ROTATE_BASE = 41000
+RESI_ROTATE_BASE = _env_int("RESI_ROTATE_BASE", 41000)
 RESI_TEMPLATE_PLACEHOLDERS = ("user", "session", "ttl")
 # Cap concurrent throwaway sing-box dials: refresh (dial_workers) +
 # full_probe + single_probe + verify can otherwise stack ~13 processes
@@ -40,17 +56,43 @@ RESI_TEMPLATE_PLACEHOLDERS = ("user", "session", "ttl")
 MAX_CONCURRENT_DIALS = 10
 _DIAL_GATE = threading.BoundedSemaphore(MAX_CONCURRENT_DIALS)
 
-_BLOCK_RE = re.compile(r"<(ca|cert|key|tls-auth|tls-crypt)>(.*?)</\1>", re.IGNORECASE | re.DOTALL)
-_REMOTE_RE = re.compile(r"^\s*remote\s+(\S+)\s+(\d+)(?:\s+(\S+))?\s*$", re.IGNORECASE | re.MULTILINE)
-_PROTO_RE = re.compile(r"^\s*proto\s+(\S+)\s*$", re.IGNORECASE | re.MULTILINE)
-_AUTH_RE = re.compile(r"^\s*auth\s+(\S+)\s*$", re.IGNORECASE | re.MULTILINE)
-_CIPHER_RE = re.compile(r"^\s*cipher\s+(\S+)\s*$", re.IGNORECASE | re.MULTILINE)
-_REMOTE_RANDOM_RE = re.compile(r"^\s*remote-random\s*$", re.IGNORECASE | re.MULTILINE)
-_KEY_DIRECTION_RE = re.compile(r"^\s*key-direction\s+(\d+)\s*$", re.IGNORECASE | re.MULTILINE)
-_KEEPALIVE_RE = re.compile(r"^\s*keepalive\s+(\d+)\s+(\d+)\s*$", re.IGNORECASE | re.MULTILINE)
-_PING_RE = re.compile(r"^\s*ping\s+(\d+)\s*$", re.IGNORECASE | re.MULTILINE)
-_PING_RESTART_RE = re.compile(r"^\s*ping-restart\s+(\d+)\s*$", re.IGNORECASE | re.MULTILINE)
-_RENEG_SEC_RE = re.compile(r"^\s*reneg-sec\s+(\d+)\s*$", re.IGNORECASE | re.MULTILINE)
+# Hard bounds for untrusted third-party input (a VPNGate snapshot is just a
+# CSV anyone can publish). Every parser below enforces these before it does
+# any meaningful work.
+MAX_CONFIG_BYTES = 256 * 1024
+MAX_CONFIG_LINE_BYTES = 4 * 1024
+MAX_BLOCK_BYTES = 128 * 1024
+MAX_TCP_REMOTES = 8
+MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024
+MAX_SNAPSHOT_ROWS = 5000
+DEFAULT_RESOLVE_TIMEOUT = 3.0
+
+SUPPORTED_AUTH = frozenset({"SHA1", "SHA256", "SHA512", "MD5"})
+SUPPORTED_CIPHERS = frozenset(
+    {cipher.upper() for cipher in DEFAULT_DATA_CIPHERS}
+    | {"AES-256-GCM", "AES-128-GCM", "CHACHA20-POLY1305"}
+)
+_BLOCK_TAGS = ("ca", "cert", "key", "tls-auth", "tls-crypt")
+_PEM_BODY_RE = re.compile(r"^[A-Za-z0-9+/=_\-.\s]+$")
+
+# Reserved outbound/tag names owned by build_singbox_config() itself; an
+# endpoint must never take one or the generated config becomes ambiguous.
+RESERVED_ENDPOINT_TAGS = frozenset(
+    {"proxy", "auto", "direct", "chain", "mixed-in", "resi-in", "dial-probe", "resi"}
+)
+_RESERVED_TAG_PREFIXES = ("vless-",)
+
+_REMOTE_RE = re.compile(r"^[ \t]*remote[ \t]+(\S+)[ \t]+(\d+)(?:[ \t]+(\S+))?[ \t]*$", re.IGNORECASE | re.MULTILINE)
+_PROTO_RE = re.compile(r"^[ \t]*proto[ \t]+(\S+)[ \t]*$", re.IGNORECASE | re.MULTILINE)
+_AUTH_RE = re.compile(r"^[ \t]*auth[ \t]+(\S+)[ \t]*$", re.IGNORECASE | re.MULTILINE)
+_CIPHER_RE = re.compile(r"^[ \t]*cipher[ \t]+(\S+)[ \t]*$", re.IGNORECASE | re.MULTILINE)
+_REMOTE_RANDOM_RE = re.compile(r"^[ \t]*remote-random[ \t]*$", re.IGNORECASE | re.MULTILINE)
+_KEY_DIRECTION_RE = re.compile(r"^[ \t]*key-direction[ \t]+(\d+)[ \t]*$", re.IGNORECASE | re.MULTILINE)
+_KEEPALIVE_RE = re.compile(r"^[ \t]*keepalive[ \t]+(\d+)[ \t]+(\d+)[ \t]*$", re.IGNORECASE | re.MULTILINE)
+_PING_RE = re.compile(r"^[ \t]*ping[ \t]+(\d+)[ \t]*$", re.IGNORECASE | re.MULTILINE)
+_PING_RESTART_RE = re.compile(r"^[ \t]*ping-restart[ \t]+(\d+)[ \t]*$", re.IGNORECASE | re.MULTILINE)
+_RENEG_SEC_RE = re.compile(r"^[ \t]*reneg-sec[ \t]+(\d+)[ \t]*$", re.IGNORECASE | re.MULTILINE)
+_SNAPSHOT_LINE_BREAK_RE = re.compile(r"\r\n|[\n\r\v\f\x1c-\x1e\x85\u2028\u2029]")
 
 
 def _keepalive_fields(config_text: str) -> dict:
@@ -65,6 +107,7 @@ def _keepalive_fields(config_text: str) -> dict:
     """
     fields: dict = {}
     try:
+        config_text = _normalize_config_text(config_text)
         ka = _KEEPALIVE_RE.search(config_text)
         if ka:
             iv, to = int(ka.group(1)), int(ka.group(2))
@@ -99,23 +142,335 @@ def _is_tcp_proto(proto: str) -> bool:
     return proto.lower().startswith("tcp")
 
 
+def _allow_private_remotes() -> bool:
+    return os.environ.get("ALLOW_PRIVATE_REMOTES", "").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+
+
+# Explicit dangerous ranges. TEST-NET-1/2/3 are deliberately allowed: they
+# are documentation fixtures used throughout the test-suite and cannot reach
+# an internal service. Everything else is denied unless ``is_global`` says it
+# is public; that turns the old blacklist into a default-deny policy.
+_FORBIDDEN_NETWORKS = tuple(ipaddress.ip_network(net) for net in (
+    "0.0.0.0/8",
+    "10.0.0.0/8",
+    "100.64.0.0/10",
+    "127.0.0.0/8",
+    "169.254.0.0/16",
+    "172.16.0.0/12",
+    "192.0.0.0/24",
+    "192.88.99.0/24",
+    "192.168.0.0/16",
+    "198.18.0.0/15",
+    "224.0.0.0/4",
+    "240.0.0.0/4",
+    "255.255.255.255/32",
+    "::/128",
+    "::1/128",
+    "64:ff9b::/96",
+    "64:ff9b:1::/48",
+    "fc00::/7",
+    "fe80::/10",
+    "ff00::/8",
+    # 6to4 and Teredo can embed a private IPv4 address; treat the whole
+    # transition range as non-public to avoid reaching an internal host.
+    "2002::/16",
+    "2001::/32",
+))
+
+# Documentation-only fixtures. They are not globally routable, but tests use
+# them to avoid touching arbitrary Internet hosts.
+_FIXTURE_NETWORKS = tuple(ipaddress.ip_network(net) for net in (
+    "192.0.2.0/24",
+    "198.51.100.0/24",
+    "203.0.113.0/24",
+))
+
+_SKIPPED_REMOTE_LOCK = threading.Lock()
+_SKIPPED_REMOTE_COUNT = 0
+_SKIPPED_REMOTE_LOG_LIMIT = 20
+_OVERSIZED_CONFIG_LINE_COUNT = 0
+_OVERSIZED_CONFIG_LINE_LOCK = threading.Lock()
+
+
+def _log_skipped_remote(host: str, port, reason) -> None:
+    """Record why a remote was rejected, with a hard log-flood cap."""
+    global _SKIPPED_REMOTE_COUNT
+    with _SKIPPED_REMOTE_LOCK:
+        if _SKIPPED_REMOTE_COUNT >= _SKIPPED_REMOTE_LOG_LIMIT:
+            return
+        _SKIPPED_REMOTE_COUNT += 1
+    _safe_print(f"skipping remote {host}:{port}: {reason}", flush=True)
+
+
+def _record_oversized_config_line() -> None:
+    """Count rejected overlong lines without growing an unbounded log."""
+    global _OVERSIZED_CONFIG_LINE_COUNT
+    with _OVERSIZED_CONFIG_LINE_LOCK:
+        _OVERSIZED_CONFIG_LINE_COUNT += 1
+
+
+def _strip_host_brackets(host: str) -> str:
+    text = str(host or "").strip()
+    if text.startswith("[") and text.endswith("]"):
+        return text[1:-1]
+    return text
+
+
+def _ip_is_forbidden(ip) -> bool:
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None:
+        ip = mapped
+    if any(net.version == ip.version and ip in net for net in _FORBIDDEN_NETWORKS):
+        return True
+    if any(net.version == ip.version and ip in net for net in _FIXTURE_NETWORKS):
+        return False
+    # Explicit default-deny: anything Python does not classify as globally
+    # routable (CGNAT, documentation, benchmarking, reserved, ...) is rejected.
+    return not ip.is_global
+
+
+def _resolve_with_timeout(host: str, timeout: float = DEFAULT_RESOLVE_TIMEOUT,
+                          deadline: float | None = None) -> list[str]:
+    """Resolve a host with a hard timeout and an optional absolute deadline.
+
+    ``socket.getaddrinfo`` has no timeout of its own; one slow search-domain
+    lookup can otherwise hold a refresh/health worker for many seconds. The
+    future is abandoned on timeout (the resolver thread may finish later, but
+    the caller never blocks past its budget).
+    """
+    host_text = _strip_host_brackets(host)
+    if not host_text:
+        raise ValueError("empty remote host")
+    try:
+        return [str(ipaddress.ip_address(host_text))]
+    except ValueError:
+        pass
+    try:
+        budget = float(timeout)
+    except (TypeError, ValueError):
+        budget = DEFAULT_RESOLVE_TIMEOUT
+    budget = max(0.05, budget)
+    if deadline is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("dns deadline exceeded")
+        budget = min(budget, remaining)
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vpngate-dns")
+    future = executor.submit(
+        socket.getaddrinfo, host_text, 0, type=socket.SOCK_STREAM)
+    try:
+        infos = future.result(timeout=budget)
+    except concurrent.futures.TimeoutError:
+        future.cancel()
+        raise TimeoutError(f"dns lookup for {host_text!r} exceeded {budget:.2f}s") from None
+    except OSError as exc:
+        raise ValueError(f"cannot resolve remote host: {exc}") from None
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+    if not infos:
+        raise ValueError("remote host did not resolve")
+    addresses: list[str] = []
+    for info in infos:
+        address = str(info[4][0]).split("%", 1)[0]
+        try:
+            ipaddress.ip_address(address)
+        except ValueError:
+            raise ValueError(f"unparsable resolved address {address!r}") from None
+        if address not in addresses:
+            addresses.append(address)
+    if not addresses:
+        raise ValueError("remote host did not resolve")
+    return addresses
+
+
+def _local_service_ports(extra_ports=None) -> set[int]:
+    """Ports this process owns locally; the manager health probe uses them.
+
+    probe_tcp_latency() is also the manager's own readiness check against
+    127.0.0.1:$MIXED_PORT, so a blanket loopback ban would make every
+    deployment look dead. Only known local ports are exempt. Callers that
+    know their own ports (RailwayManager passes its constructor values) can
+    extend the set explicitly instead of relying on environment variables.
+    """
+    ports = {DEFAULT_RESI_PORT, RESI_IN_PORT, 40000, 8080, 8082}
+    ports.update(range(RESI_ROTATE_BASE, RESI_ROTATE_BASE + 128))
+    for name in ("MIXED_PORT", "PORT"):
+        try:
+            ports.add(int(os.environ.get(name, "").strip()))
+        except (TypeError, ValueError):
+            pass
+    if extra_ports is not None:
+        if isinstance(extra_ports, (str, bytes, int)):
+            extra_ports = [extra_ports]
+        for value in extra_ports:
+            try:
+                ports.add(int(value))
+            except (TypeError, ValueError):
+                pass
+    return ports
+
+
+def _validate_remote(host: str, port) -> tuple[str, int]:
+    """Validate one remote address and return its pinned literal IP and port.
+
+    Remote values come from untrusted VPNGate/OVPN snapshots. Parsing accepts
+    literal IPs only: resolving a snapshot-controlled hostname here would
+    create an unbounded DNS cost and a second lookup at connect time (DNS
+    rebinding). Operator endpoints use ``_resolve_with_timeout`` explicitly.
+    ALLOW_PRIVATE_REMOTES=1 disables the address policy (tests / controlled
+    local labs) but still requires a literal IP; the port range is always
+    enforced.
+    """
+    if isinstance(port, bool):
+        raise ValueError("invalid port (bool)")
+    try:
+        port_i = int(port)
+    except (TypeError, ValueError):
+        raise ValueError(f"invalid port {port!r}") from None
+    if not 1 <= port_i <= 65535:
+        raise ValueError(f"port {port_i} outside 1..65535")
+    host_text = _strip_host_brackets(host)
+    if not host_text:
+        raise ValueError("empty remote host")
+    try:
+        ip = ipaddress.ip_address(host_text)
+    except ValueError:
+        raise ValueError(f"remote {host_text!r} is not a literal IP") from None
+    if not _allow_private_remotes() and _ip_is_forbidden(ip):
+        raise ValueError(f"forbidden remote address {ip}")
+    return (str(ip), port_i)
+
+
+def _normalize_config_text(config_text: str) -> str:
+    """Normalize CRLF/CR before line-anchored regexes.
+
+    The regexes deliberately use ``[ \\t]`` instead of ``\\s`` to stay linear;
+    normalizing first keeps CRLF configs (common from Windows editors) working
+    without reintroducing a whitespace class that can match newlines.
+    """
+    return config_text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _check_config_size(config_text: str) -> None:
+    if not isinstance(config_text, str):
+        raise ValueError("openvpn config must be text")
+    if len(config_text.encode("utf-8", "replace")) > MAX_CONFIG_BYTES:
+        raise ValueError(
+            f"openvpn config exceeds {MAX_CONFIG_BYTES} bytes")
+    for line in config_text.splitlines():
+        if len(line.encode("utf-8", "replace")) > MAX_CONFIG_LINE_BYTES:
+            _record_oversized_config_line()
+            raise ValueError(
+                f"openvpn config line exceeds {MAX_CONFIG_LINE_BYTES} bytes")
+
+
+def _parse_inline_blocks(config_text: str) -> dict[str, str]:
+    """Linear-time parse of <ca>/<cert>/<key>/<tls-auth>/<tls-crypt> blocks.
+
+    The old regex was O(n^2) on a repeated unterminated <ca> tag. This walks
+    lines once, raises ValueError on an unterminated block, and enforces the
+    per-block byte cap while accumulating.
+    """
+    _check_config_size(config_text)
+    blocks: dict[str, str] = {}
+    current: str | None = None
+    content: list[str] = []
+    block_bytes = 0
+    for line in config_text.splitlines():
+        stripped = line.strip()
+        lowered = stripped.lower()
+        if current is None:
+            matched = False
+            for tag in _BLOCK_TAGS:
+                opener = f"<{tag}>"
+                closer = f"</{tag}>"
+                if lowered == opener:
+                    current = tag
+                    content = []
+                    block_bytes = 0
+                    matched = True
+                    break
+                if lowered.startswith(opener) and lowered.endswith(closer):
+                    inner = stripped[len(opener):len(stripped) - len(closer)].strip()
+                    if len(inner.encode("utf-8", "replace")) > MAX_BLOCK_BYTES:
+                        raise ValueError(f"<{tag}> block exceeds {MAX_BLOCK_BYTES} bytes")
+                    if inner and not _PEM_BODY_RE.fullmatch(inner):
+                        raise ValueError(f"<{tag}> block contains non-PEM characters")
+                    blocks[tag] = inner
+                    matched = True
+                    break
+            if matched:
+                continue
+            continue
+        if lowered == f"</{current}>":
+            body = "\n".join(content).strip()
+            if len(body.encode("utf-8", "replace")) > MAX_BLOCK_BYTES:
+                raise ValueError(f"<{current}> block exceeds {MAX_BLOCK_BYTES} bytes")
+            if body and not _PEM_BODY_RE.fullmatch(body):
+                raise ValueError(f"<{current}> block contains non-PEM characters")
+            blocks[current] = body
+            current = None
+            content = []
+            block_bytes = 0
+            continue
+        content.append(line)
+        block_bytes += len(line.encode("utf-8", "replace")) + 1
+        if block_bytes > MAX_BLOCK_BYTES:
+            raise ValueError(f"<{current}> block exceeds {MAX_BLOCK_BYTES} bytes")
+    if current is not None:
+        raise ValueError(f"unterminated <{current}> block")
+    return blocks
+
+
 def _all_tcp_remotes(config_text: str) -> list[tuple[str, int]]:
-    """Return every TCP remote in order (explicit proto first, then global)."""
+    """Every usable TCP remote in original order, deduped and bounded.
+
+    Explicit TCP remotes and remotes inheriting a global ``proto tcp*`` are
+    merged (the old code dropped the inherited ones whenever any explicit
+    remote existed). Explicit UDP remotes stay excluded.
+    """
+    _check_config_size(config_text)
+    config_text = _normalize_config_text(config_text)
     global_protos = [m.group(1) for m in _PROTO_RE.finditer(config_text)]
     global_tcp = any(_is_tcp_proto(p) for p in global_protos)
-    remotes = [(m.group(1), int(m.group(2)), (m.group(3) or "")) for m in _REMOTE_RE.finditer(config_text)]
+    remotes: list[tuple[str, int, str]] = []
+    for match in _REMOTE_RE.finditer(config_text):
+        try:
+            parsed_port = int(match.group(2))
+        except ValueError:
+            _log_skipped_remote(match.group(1), match.group(2), "invalid port")
+            continue
+        remotes.append((match.group(1), parsed_port, (match.group(3) or "")))
     if not remotes:
         raise ValueError("no remote directive found")
-    explicit = [(host, port) for host, port, proto in remotes
-                if proto and _is_tcp_proto(proto)]
-    if explicit:
-        return explicit
-    if global_tcp:
-        fallback = [(host, port) for host, port, proto in remotes
-                    if not proto or not proto.lower().startswith("udp")]
-        if fallback:
-            return fallback
-    raise ValueError("no TCP remote found (only UDP available)")
+    tcp: list[tuple[str, int]] = []
+    seen: set[tuple[str, int]] = set()
+    for host, port, proto in remotes:
+        if proto and not _is_tcp_proto(proto):
+            continue
+        if not proto and not global_tcp:
+            continue
+        key = (host, port)
+        if key in seen:
+            continue
+        seen.add(key)
+        tcp.append(key)
+    if not tcp:
+        raise ValueError("no TCP remote found (only UDP available)")
+    if len(tcp) > MAX_TCP_REMOTES:
+        raise ValueError(
+            f"too many TCP remotes ({len(tcp)} > {MAX_TCP_REMOTES})")
+    usable: list[tuple[str, int]] = []
+    for host, port in tcp:
+        try:
+            usable.append(_validate_remote(host, port))
+        except ValueError as exc:
+            _log_skipped_remote(host, port, exc)
+    if not usable:
+        raise ValueError("no usable TCP remote (all rejected)")
+    return usable
 
 
 def _pick_tcp_remote(config_text: str) -> tuple[str, int]:
@@ -150,11 +505,34 @@ def endpoint_remotes(endpoint: dict) -> list[tuple[str, int]]:
 
 
 def probe_endpoint_latency(endpoint: dict, timeout: int = 5, probe_fn=None) -> int:
-    """Handshake latency of the first working remote, 0 when every one is dead."""
-    probe = probe_fn or (lambda host, port: probe_tcp_latency(host, port, timeout))
-    for host, port in endpoint_remotes(endpoint):
+    """Handshake latency of the first working remote, 0 when every one is dead.
+
+    One endpoint gets a total budget of ``timeout * 2`` seconds, no matter how
+    many failover remotes it declares: a hostile row cannot fan out into an
+    unbounded serial probe chain.
+    """
+    try:
+        budget = float(timeout)
+    except (TypeError, ValueError):
+        budget = 5.0
+    budget = max(0.1, budget) * 2
+    deadline = time.monotonic() + budget
+    remotes = endpoint_remotes(endpoint)
+    for host, port in remotes:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return 0
         try:
-            ms = probe(host, port)
+            pinned_host, pinned_port = _validate_remote(host, port)
+        except ValueError as exc:
+            _log_skipped_remote(host, port, exc)
+            continue
+        try:
+            if probe_fn is None:
+                ms = probe_tcp_latency(pinned_host, pinned_port,
+                                       max(0.1, remaining))
+            else:
+                ms = probe_fn(pinned_host, pinned_port)
         except Exception:
             ms = 0
         if ms and ms > 0:
@@ -176,14 +554,25 @@ def render_resi_username(user: str, template: str | None, ttl: int,
     ValueError without echoing the rendered string, since it may contain the
     account (and in some vendors' schemes the password-equivalent) material.
     """
-    if ttl <= 0:
-        return user
-    text = (template or "").strip()
-    if "{session}" not in text:
-        return user
     try:
-        return text.format(user=user, session=session_id, ttl=ttl)
-    except (KeyError, IndexError, ValueError) as exc:
+        ttl_value = int(ttl)
+    except (TypeError, ValueError):
+        raise ValueError("RESI_SESSION_TTL must be an integer") from None
+    if isinstance(ttl, bool):
+        raise ValueError("RESI_SESSION_TTL must be an integer")
+    try:
+        user_text = str(user)
+        template_text = "" if template is None else str(template)
+    except Exception:
+        raise ValueError("RESI_USER_TEMPLATE must be text") from None
+    if ttl_value <= 0:
+        return user_text
+    text = template_text.strip()
+    if "{session}" not in text:
+        return user_text
+    try:
+        return text.format(user=user_text, session=str(session_id), ttl=ttl_value)
+    except (KeyError, IndexError, ValueError, AttributeError, TypeError) as exc:
         name = exc.args[0] if isinstance(exc, KeyError) and exc.args else exc
         raise ValueError(
             f"RESI_USER_TEMPLATE uses an unsupported placeholder {{{name}}}; "
@@ -201,21 +590,24 @@ def ovpn_to_endpoint(
     """Convert one OpenVPN client config (TCP) to a sing-box openvpn-client endpoint."""
     if not config_text or not config_text.strip():
         raise ValueError("empty openvpn config")
+    _check_config_size(config_text)
+    config_text = _normalize_config_text(config_text)
     tcp_remotes = _all_tcp_remotes(config_text)
-
-    blocks: dict[str, str] = {}
-    for m in _BLOCK_RE.finditer(config_text):
-        blocks[m.group(1).lower()] = m.group(2).strip()
+    blocks = _parse_inline_blocks(config_text)
     if "ca" not in blocks or not blocks["ca"]:
         raise ValueError("missing <ca> block")
 
     auth_m = _AUTH_RE.search(config_text)
     auth = auth_m.group(1).upper() if auth_m else DEFAULT_AUTH
+    if auth not in SUPPORTED_AUTH:
+        raise ValueError(f"unsupported auth {auth!r}")
     cipher_m = _CIPHER_RE.search(config_text)
     data_ciphers = list(DEFAULT_DATA_CIPHERS)
     if cipher_m:
-        cipher = cipher_m.group(1)
-        data_ciphers = [cipher] + [c for c in data_ciphers if c.lower() != cipher.lower()]
+        cipher = cipher_m.group(1).upper()
+        if cipher not in SUPPORTED_CIPHERS:
+            raise ValueError(f"unsupported cipher {cipher!r}")
+        data_ciphers = [cipher] + [c for c in data_ciphers if c.upper() != cipher]
 
     if blocks.get("cert") and not blocks.get("key"):
         raise ValueError("client <cert> without <key> (must be both or neither)")
@@ -300,7 +692,13 @@ def _server_fields(tcp_remotes: list[tuple[str, int]]) -> dict:
 
     sing-box requires exactly one of server / servers (they conflict),
     so multi-remote configs move to servers[] for in-order failover.
+    Callers may only supply the bounded remote list (MAX_TCP_REMOTES).
     """
+    if not tcp_remotes:
+        raise ValueError("no TCP remote to emit")
+    if len(tcp_remotes) > MAX_TCP_REMOTES:
+        raise ValueError(
+            f"too many TCP remotes ({len(tcp_remotes)} > {MAX_TCP_REMOTES})")
     if len(tcp_remotes) == 1:
         host, port = tcp_remotes[0]
         return {"server": host, "server_port": port}
@@ -310,21 +708,45 @@ def _server_fields(tcp_remotes: list[tuple[str, int]]) -> dict:
     ]}
 
 
-def probe_tcp_latency(host: str, port: int, timeout: int = 5) -> int:
+def probe_tcp_latency(host: str, port: int, timeout: float = 5,
+                      allow_loopback_ports=None) -> int:
     """Measure TCP handshake latency in ms; return 0 when unreachable.
 
     This is a real-connection pre-filter: VPNGate advertises Speed values
     that say nothing about whether the node accepts connections right now.
+    Destinations are validated like every other remote (loopback is only
+    allowed for this process's own service ports, which the manager probes).
+    ``allow_loopback_ports`` lets the manager pass its constructor ports
+    instead of relying only on MIXED_PORT/PORT environment variables.
     """
-    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    try:
+        port_i = int(port)
+    except (TypeError, ValueError):
+        return 0
+    try:
+        pinned_host, pinned_port = _validate_remote(host, port_i)
+    except ValueError as exc:
+        ip = None
+        try:
+            ip = ipaddress.ip_address(_strip_host_brackets(host))
+        except ValueError:
+            pass
+        if ip is None or not ip.is_loopback:
+            _log_skipped_remote(host, port, exc)
+            return 0
+        if port_i not in _local_service_ports(allow_loopback_ports):
+            _log_skipped_remote(host, port, exc)
+            return 0
+        pinned_host, pinned_port = str(ip), port_i
+    family = socket.AF_INET6 if ":" in pinned_host else socket.AF_INET
     sock = None
     start = time.monotonic()
     try:
         sock = socket.socket(family, socket.SOCK_STREAM)
         sock.settimeout(timeout)
-        sock.connect((host, port))
+        sock.connect((pinned_host, pinned_port))
         return max(1, int((time.monotonic() - start) * 1000))
-    except OSError:
+    except (OSError, ValueError, OverflowError):
         return 0
     finally:
         if sock is not None:
@@ -334,9 +756,22 @@ def probe_tcp_latency(host: str, port: int, timeout: int = 5) -> int:
                 pass
 
 
-def _recv_exact(sock: socket.socket, size: int) -> bytes:
+def _recv_exact(sock: socket.socket, size: int,
+                deadline: float | None = None) -> bytes:
+    """Read exactly ``size`` bytes, optionally under one absolute deadline.
+
+    A per-recv socket timeout only bounds one syscall; a peer that trickles
+    one byte just under that timeout can hold the read loop (and the dial
+    gate) for hours. Every caller that reads from an untrusted tunnel passes
+    ``deadline`` so the whole read shares one budget.
+    """
     data = b""
     while len(data) < size:
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise socket.timeout("read deadline exceeded")
+            sock.settimeout(max(0.05, remaining))
         chunk = sock.recv(size - len(data))
         if not chunk:
             raise OSError("eof")
@@ -357,12 +792,13 @@ def _socks5_get_latency_ms(proxy_host: str, proxy_port: int,
     """
     family = socket.AF_INET6 if ":" in proxy_host else socket.AF_INET
     sock = None
+    deadline = time.monotonic() + max(0.05, float(timeout))
     try:
         sock = socket.socket(family, socket.SOCK_STREAM)
         sock.settimeout(timeout)
         sock.connect((proxy_host, proxy_port))
         sock.sendall(b"\x05\x01\x00")
-        if _recv_exact(sock, 2) != b"\x05\x00":
+        if _recv_exact(sock, 2, deadline) != b"\x05\x00":
             return None
         try:
             addr = socket.inet_aton(target_host)
@@ -374,18 +810,22 @@ def _socks5_get_latency_ms(proxy_host: str, proxy_port: int,
             request = (b"\x05\x01\x00\x03" + bytes([len(encoded)]) + encoded
                        + target_port.to_bytes(2, "big"))
         sock.sendall(request)
-        reply = _recv_exact(sock, 4)
+        reply = _recv_exact(sock, 4, deadline)
         if reply[1] != 0:
             return None
         atyp = reply[3]
         if atyp == 1:
-            _recv_exact(sock, 6)
+            _recv_exact(sock, 6, deadline)
         elif atyp == 3:
-            _recv_exact(sock, _recv_exact(sock, 1)[0] + 2)
+            _recv_exact(sock, _recv_exact(sock, 1, deadline)[0] + 2, deadline)
         elif atyp == 4:
-            _recv_exact(sock, 18)
+            _recv_exact(sock, 18, deadline)
         else:
             return None
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        sock.settimeout(max(0.05, remaining))
         try:
             context = (ssl.create_default_context(cafile=cafile) if cafile
                        else ssl.create_default_context())
@@ -397,7 +837,14 @@ def _socks5_get_latency_ms(proxy_host: str, proxy_port: int,
                      f"Connection: close\r\n\r\n".encode())
         head = b""
         while b"\r\n" not in head:
-            chunk = sock.recv(4096)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            sock.settimeout(max(0.05, remaining))
+            try:
+                chunk = sock.recv(4096)
+            except OSError:
+                return None
             if not chunk:
                 return None
             head += chunk
@@ -432,12 +879,13 @@ def _socks5_get_text(proxy_host: str, proxy_port: int,
     """
     family = socket.AF_INET6 if ":" in proxy_host else socket.AF_INET
     sock = None
+    deadline = time.monotonic() + max(0.05, float(timeout))
     try:
         sock = socket.socket(family, socket.SOCK_STREAM)
         sock.settimeout(timeout)
         sock.connect((proxy_host, proxy_port))
         sock.sendall(b"\x05\x01\x00")
-        if _recv_exact(sock, 2) != b"\x05\x00":
+        if _recv_exact(sock, 2, deadline) != b"\x05\x00":
             return None
         try:
             addr = socket.inet_aton(target_host)
@@ -449,18 +897,22 @@ def _socks5_get_text(proxy_host: str, proxy_port: int,
             request = (b"\x05\x01\x00\x03" + bytes([len(encoded)]) + encoded
                        + target_port.to_bytes(2, "big"))
         sock.sendall(request)
-        reply = _recv_exact(sock, 4)
+        reply = _recv_exact(sock, 4, deadline)
         if reply[1] != 0:
             return None
         atyp = reply[3]
         if atyp == 1:
-            _recv_exact(sock, 6)
+            _recv_exact(sock, 6, deadline)
         elif atyp == 3:
-            _recv_exact(sock, _recv_exact(sock, 1)[0] + 2)
+            _recv_exact(sock, _recv_exact(sock, 1, deadline)[0] + 2, deadline)
         elif atyp == 4:
-            _recv_exact(sock, 18)
+            _recv_exact(sock, 18, deadline)
         else:
             return None
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        sock.settimeout(max(0.05, remaining))
         try:
             sock = ssl.create_default_context().wrap_socket(
                 sock, server_hostname=target_host)
@@ -471,6 +923,10 @@ def _socks5_get_text(proxy_host: str, proxy_port: int,
                      f"Connection: close\r\n\r\n".encode())
         raw = b""
         while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            sock.settimeout(max(0.05, remaining))
             try:
                 chunk = sock.recv(4096)
             except OSError:
@@ -578,6 +1034,7 @@ def _mixed_connect_get_text(proxy_host: str, proxy_port: int,
     family = socket.AF_INET6 if ":" in proxy_host else socket.AF_INET
     authority = f"{target_host}:{target_port}"
     sock = None
+    deadline = time.monotonic() + max(0.05, float(timeout))
     try:
         sock = socket.socket(family, socket.SOCK_STREAM)
         sock.settimeout(timeout)
@@ -590,7 +1047,14 @@ def _mixed_connect_get_text(proxy_host: str, proxy_port: int,
         )
         head = b""
         while b"\r\n\r\n" not in head:
-            chunk = sock.recv(4096)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            sock.settimeout(max(0.05, remaining))
+            try:
+                chunk = sock.recv(4096)
+            except OSError:
+                return None
             if not chunk:
                 return None
             head += chunk
@@ -602,6 +1066,10 @@ def _mixed_connect_get_text(proxy_host: str, proxy_port: int,
             return None
         if code != 200:
             return None
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        sock.settimeout(max(0.05, remaining))
         try:
             sock = _exit_ip_tls_context().wrap_socket(
                 sock, server_hostname=target_host)
@@ -612,6 +1080,10 @@ def _mixed_connect_get_text(proxy_host: str, proxy_port: int,
                      f"Connection: close\r\n\r\n".encode())
         raw = b""
         while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            sock.settimeout(max(0.05, remaining))
             try:
                 chunk = sock.recv(4096)
             except OSError:
@@ -652,6 +1124,25 @@ def measure_mixed_exit_ip(proxy_host: str, proxy_port: int, username: str,
         budget = float(timeout)
     except (TypeError, ValueError):
         budget = 8.0
+    try:
+        proxy_port_i = int(proxy_port)
+    except (TypeError, ValueError):
+        return (None, None)
+    if not 1 <= proxy_port_i <= 65535:
+        return (None, None)
+    try:
+        loopback = ipaddress.ip_address(
+            _strip_host_brackets(proxy_host)).is_loopback
+    except ValueError:
+        loopback = False
+    if not loopback:
+        try:
+            proxy_host, proxy_port_i = _validate_remote(proxy_host, proxy_port_i)
+        except ValueError as exc:
+            _log_skipped_remote(proxy_host, proxy_port, exc)
+            return (None, None)
+    else:
+        proxy_host = _strip_host_brackets(proxy_host)
     proxy_auth = "Basic " + base64.b64encode(
         f"{username}:{password}".encode("utf-8")).decode("ascii")
     deadline = time.monotonic() + max(0.05, budget)
@@ -670,13 +1161,36 @@ def measure_mixed_exit_ip(proxy_host: str, proxy_port: int, username: str,
     return (None, None)
 
 
+_FREE_PORT_LOCK = threading.Lock()
+_FREE_PORT_RECENT: dict[int, float] = {}
+_FREE_PORT_COOLDOWN = 30.0
+
+
 def _free_port() -> int:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-    finally:
-        sock.close()
+    """Pick a loopback port without immediately handing the same one out.
+
+    The old implementation bound port 0, closed the socket and returned the
+    number; two concurrent callers could receive the same port, and the OS
+    could reuse it before sing-box bound it. We cannot keep the socket open
+    (the child must bind it), but a process-wide cooldown at least removes
+    the "close then reuse instantly" window between our own callers.
+    """
+    with _FREE_PORT_LOCK:
+        now = time.monotonic()
+        for port, seen in list(_FREE_PORT_RECENT.items()):
+            if seen <= now - _FREE_PORT_COOLDOWN:
+                del _FREE_PORT_RECENT[port]
+        for _ in range(64):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                sock.bind(("127.0.0.1", 0))
+                port = sock.getsockname()[1]
+            finally:
+                sock.close()
+            if port not in _FREE_PORT_RECENT:
+                _FREE_PORT_RECENT[port] = now
+                return port
+    raise OSError("could not find a free loopback port")
 
 
 def _safe_print(text: str, flush: bool = True) -> None:
@@ -740,17 +1254,96 @@ def _dial_probe_config(endpoint: dict, port: int) -> dict:
     return config
 
 
+def _pinned_endpoint_remotes(endpoint: dict,
+                             deadline: float | None = None
+                             ) -> list[tuple[str, int]] | None:
+    """Pinned (IP, port) remotes for an endpoint, or None when one is denied.
+
+    Snapshot endpoints must already carry literal IPs (ovpn_to_endpoint pins
+    them). This function still revalidates and returns the pinned form so
+    call sites can never validate one address and dial another.
+    """
+    try:
+        remotes = endpoint_remotes(endpoint)
+    except (TypeError, ValueError):
+        return None
+    if not remotes:
+        return None
+    pinned: list[tuple[str, int]] = []
+    for host, port in remotes:
+        if deadline is not None and time.monotonic() >= deadline:
+            return None
+        try:
+            pinned.append(_validate_remote(host, port))
+        except ValueError as exc:
+            _log_skipped_remote(host, port, exc)
+            return None
+    return pinned
+
+
+def _endpoint_remotes_allowed(endpoint: dict,
+                              deadline: float | None = None) -> bool:
+    """Every remote of an endpoint must pass the SSRF policy before dialing."""
+    return _pinned_endpoint_remotes(endpoint, deadline) is not None
+
+
+def _pin_endpoint(endpoint: dict, deadline: float | None = None) -> dict | None:
+    """Copy an endpoint with its remotes replaced by validated literal IPs."""
+    pinned = _pinned_endpoint_remotes(endpoint, deadline)
+    if pinned is None:
+        return None
+    out = {key: value for key, value in endpoint.items()
+           if key not in {"server", "server_port", "servers"}}
+    if len(pinned) == 1:
+        out["server"], out["server_port"] = pinned[0]
+    else:
+        out["servers"] = [
+            {"server": host, "server_port": port, "network": "tcp"}
+            for host, port in pinned
+        ]
+    return out
+
+
+def _operation_deadline(timeout, deadline: float | None) -> float:
+    """Absolute end for one operation, shrunk by an optional caller deadline."""
+    try:
+        budget = float(timeout)
+    except (TypeError, ValueError):
+        budget = 20.0
+    end = time.monotonic() + max(0.0, budget)
+    if deadline is not None:
+        end = min(end, deadline)
+    return end
+
+
 def measure_real_latency(endpoint: dict, singbox_bin: str = "sing-box",
                          timeout: int = 20, poll_interval: int = 2,
                          target_host: str = "www.gstatic.com",
                          target_port: int = 443,
-                         path: str = "/generate_204") -> int | None:
+                         path: str = "/generate_204",
+                         deadline: float | None = None) -> int | None:
     """Dial one endpoint with a throwaway sing-box; end-to-end GET ms or None."""
+    end = _operation_deadline(timeout, deadline)
+    if end <= time.monotonic():
+        return None
+    pinned_endpoint = _pin_endpoint(endpoint, end)
+    if pinned_endpoint is None:
+        _safe_print("dial skipped: endpoint has no allowed remote", flush=True)
+        return None
     port = _free_port()
-    config = _dial_probe_config(endpoint, port)
-    tmpdir = tempfile.TemporaryDirectory()
-    _DIAL_GATE.acquire()
+    config = _dial_probe_config(pinned_endpoint, port)
+    gate_timeout = 30.0
+    if deadline is not None:
+        gate_timeout = min(30.0, max(0.0, deadline - time.monotonic()))
+    if not _DIAL_GATE.acquire(timeout=gate_timeout):
+        _safe_print("dial skipped: dial gate queue timeout", flush=True)
+        return None
+    if time.monotonic() >= end:
+        _DIAL_GATE.release()
+        return None
+    tmpdir = None
     try:
+        tmpdir = tempfile.TemporaryDirectory()
         cfg_path = str(Path(tmpdir.name) / "dial.json")
         Path(cfg_path).write_text(json.dumps(config), encoding="utf-8")
         err_path = str(Path(tmpdir.name) / "dial-stderr.log")
@@ -773,9 +1366,8 @@ def measure_real_latency(endpoint: dict, singbox_bin: str = "sing-box",
                   f"cannot start {singbox_bin}", flush=True)
             return None
         try:
-            deadline = time.monotonic() + timeout
-            while time.monotonic() < deadline:
-                remaining = deadline - time.monotonic()
+            while time.monotonic() < end:
+                remaining = end - time.monotonic()
                 first = _socks5_get_latency_ms(
                     "127.0.0.1", port, target_host, target_port, path,
                     timeout=min(10, max(1, remaining)))
@@ -787,7 +1379,10 @@ def measure_real_latency(endpoint: dict, singbox_bin: str = "sing-box",
                     return first
                 if proc.poll() is not None:
                     break  # sing-box died; the tunnel will never come up
-                time.sleep(poll_interval)
+                pause = min(max(0.0, float(poll_interval)),
+                            max(0.0, end - time.monotonic()))
+                if pause:
+                    time.sleep(pause)
             if err_handle is not None:
                 try:
                     err_handle.close()
@@ -815,22 +1410,40 @@ def measure_real_latency(endpoint: dict, singbox_bin: str = "sing-box",
                     pass
     finally:
         _DIAL_GATE.release()
-        tmpdir.cleanup()
+        if tmpdir is not None:
+            tmpdir.cleanup()
 
 
 def measure_exit_ip(endpoint: dict, singbox_bin: str = "sing-box",
-                    timeout: int = 20, poll_interval: int = 2) -> tuple:
+                    timeout: int = 20, poll_interval: int = 2,
+                    deadline: float | None = None) -> tuple:
     """Exit IP through one endpoint: (ip, ms) or (None, None).
 
     Same throwaway sing-box dial as measure_real_latency, but fetches
     api.ipify.org so the caller learns the actual exit IP, not just
     the end-to-end latency.
     """
+    end = _operation_deadline(timeout, deadline)
+    if end <= time.monotonic():
+        return (None, None)
+    pinned_endpoint = _pin_endpoint(endpoint, end)
+    if pinned_endpoint is None:
+        _safe_print("verify skipped: endpoint has no allowed remote", flush=True)
+        return (None, None)
     port = _free_port()
-    config = _dial_probe_config(endpoint, port)
-    tmpdir = tempfile.TemporaryDirectory()
-    _DIAL_GATE.acquire()
+    config = _dial_probe_config(pinned_endpoint, port)
+    gate_timeout = 30.0
+    if deadline is not None:
+        gate_timeout = min(30.0, max(0.0, deadline - time.monotonic()))
+    if not _DIAL_GATE.acquire(timeout=gate_timeout):
+        _safe_print("verify skipped: dial gate queue timeout", flush=True)
+        return (None, None)
+    if time.monotonic() >= end:
+        _DIAL_GATE.release()
+        return (None, None)
+    tmpdir = None
     try:
+        tmpdir = tempfile.TemporaryDirectory()
         cfg_path = str(Path(tmpdir.name) / "dial.json")
         Path(cfg_path).write_text(json.dumps(config), encoding="utf-8")
         err_path = str(Path(tmpdir.name) / "dial-stderr.log")
@@ -853,9 +1466,8 @@ def measure_exit_ip(endpoint: dict, singbox_bin: str = "sing-box",
                   f"cannot start {singbox_bin}", flush=True)
             return (None, None)
         try:
-            deadline = time.monotonic() + timeout
-            while time.monotonic() < deadline:
-                remaining = deadline - time.monotonic()
+            while time.monotonic() < end:
+                remaining = end - time.monotonic()
                 fetched = _fetch_exit_ip("127.0.0.1", port,
                                          timeout=min(10, max(1, remaining)))
                 if (fetched is not None and fetched[0] == 200
@@ -863,7 +1475,10 @@ def measure_exit_ip(endpoint: dict, singbox_bin: str = "sing-box",
                     return (fetched[1].decode("ascii").strip(), fetched[2])
                 if proc.poll() is not None:
                     break  # sing-box died; the tunnel will never come up
-                time.sleep(poll_interval)
+                pause = min(max(0.0, float(poll_interval)),
+                            max(0.0, end - time.monotonic()))
+                if pause:
+                    time.sleep(pause)
             if err_handle is not None:
                 try:
                     err_handle.close()
@@ -891,7 +1506,8 @@ def measure_exit_ip(endpoint: dict, singbox_bin: str = "sing-box",
                     pass
     finally:
         _DIAL_GATE.release()
-        tmpdir.cleanup()
+        if tmpdir is not None:
+            tmpdir.cleanup()
 
 
 def _resi_probe_config(resi: dict, port: int) -> dict:
@@ -915,8 +1531,26 @@ def _resi_probe_config(resi: dict, port: int) -> dict:
     }
 
 
+def _operator_remote_pin(host: str, deadline: float | None = None) -> str:
+    """Pin an operator-configured gateway to one address, with bounded DNS.
+
+    RESI_GATEWAY is trusted operator configuration rather than snapshot data,
+    so private/loopback addresses are allowed here. Only the lookup itself is
+    bounded; this is deliberately not the snapshot SSRF policy.
+    """
+    host_text = _strip_host_brackets(host)
+    if not host_text:
+        raise ValueError("empty operator remote host")
+    try:
+        return str(ipaddress.ip_address(host_text))
+    except ValueError:
+        return _resolve_with_timeout(
+            host_text, DEFAULT_RESOLVE_TIMEOUT, deadline)[0]
+
+
 def _resi_probe_run(resi: dict, count: int, singbox_bin: str, timeout: int,
-                    poll_interval: int, gate_timeout: float) -> dict | None:
+                    poll_interval: int, gate_timeout: float,
+                    deadline: float | None = None) -> dict | None:
     """Start one throwaway sing-box and collect up to `count` exit IPs.
 
     Every sample opens a fresh SOCKS5 connection through the local mixed
@@ -925,10 +1559,21 @@ def _resi_probe_run(resi: dict, count: int, singbox_bin: str, timeout: int,
     samples keeps a 1 GB box from spawning N binaries.
     """
     count = max(1, int(count))
+    if deadline is not None and time.monotonic() >= deadline:
+        return None
+    try:
+        pinned_server = _operator_remote_pin(resi.get("server", ""), deadline)
+        resi = {**resi, "server": pinned_server}
+    except (ValueError, TimeoutError, OSError) as exc:
+        _safe_print(f"resi probe skipped: {exc}", flush=True)
+        return None
     port = _free_port()
     config = _resi_probe_config(resi, port)
     tmpdir = tempfile.TemporaryDirectory()
-    if not _DIAL_GATE.acquire(timeout=gate_timeout):
+    wait = gate_timeout
+    if deadline is not None:
+        wait = min(wait, max(0.0, deadline - time.monotonic()))
+    if not _DIAL_GATE.acquire(timeout=wait):
         tmpdir.cleanup()
         return None
     proc = None
@@ -949,12 +1594,12 @@ def _resi_probe_run(resi: dict, count: int, singbox_bin: str, timeout: int,
         except OSError:
             _safe_print(f"resi probe failed: cannot start {singbox_bin}", flush=True)
             return None
-        deadline = time.monotonic() + timeout
+        end = _operation_deadline(timeout, deadline)
         ips: list[str] = []
         stamps: list[int] = []
         errors: list[str] = []
-        while time.monotonic() < deadline and not ips:
-            remaining = deadline - time.monotonic()
+        while time.monotonic() < end and not ips:
+            remaining = end - time.monotonic()
             fetched = _fetch_exit_ip("127.0.0.1", port,
                                      timeout=min(10, max(1, remaining)))
             if (fetched is not None and fetched[0] == 200
@@ -965,10 +1610,20 @@ def _resi_probe_run(resi: dict, count: int, singbox_bin: str, timeout: int,
             if proc.poll() is not None:
                 errors.append("probe sing-box exited")
                 break
-            time.sleep(poll_interval)
-        total_deadline = deadline + (count - 1) * 15
+            pause = min(max(0.0, float(poll_interval)),
+                        max(0.0, end - time.monotonic()))
+            if pause:
+                time.sleep(pause)
+        total_deadline = end + (count - 1) * 15
+        if deadline is not None:
+            total_deadline = min(total_deadline, deadline)
         while ips and len(ips) < count and time.monotonic() < total_deadline:
-            fetched = _fetch_exit_ip("127.0.0.1", port, timeout=15)
+            remaining = total_deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            fetched = _fetch_exit_ip(
+                "127.0.0.1", port,
+                timeout=int(min(15, max(1, remaining))))
             if (fetched is not None and fetched[0] == 200
                     and _looks_like_ipv4(fetched[1])):
                 ips.append(fetched[1].decode("ascii").strip())
@@ -1011,16 +1666,19 @@ def _resi_probe_run(resi: dict, count: int, singbox_bin: str, timeout: int,
 
 
 def measure_resi_exit_ip(resi: dict, singbox_bin: str = "sing-box",
-                         timeout: int = 20, poll_interval: int = 2) -> tuple:
+                         timeout: int = 20, poll_interval: int = 2,
+                         deadline: float | None = None) -> tuple:
     """Exit IP through the residential gateway: (ip, ms) or (None, None)."""
-    result = _resi_probe_run(resi, 1, singbox_bin, timeout, poll_interval, 30.0)
+    result = _resi_probe_run(resi, 1, singbox_bin, timeout, poll_interval,
+                             30.0, deadline=deadline)
     if not result:
         return (None, None)
     return (result["ips"][0], result["first_ms"])
 
 
 def measure_resi_rotation(resi: dict, count: int = 3, singbox_bin: str = "sing-box",
-                          timeout: int = 20, poll_interval: int = 2) -> dict | None:
+                          timeout: int = 20, poll_interval: int = 2,
+                          deadline: float | None = None) -> dict | None:
     """Collect `count` sequential exit IPs through the gateway.
 
     Returns {"ips", "ms", "count", "distinct", "errors", ...} or None when the
@@ -1028,7 +1686,8 @@ def measure_resi_rotation(resi: dict, count: int = 3, singbox_bin: str = "sing-b
     rotation is healthy when it is >= 2 (a residential pool may legitimately
     hand out the same node twice in a row).
     """
-    return _resi_probe_run(resi, count, singbox_bin, timeout, poll_interval, 30.0)
+    return _resi_probe_run(resi, count, singbox_bin, timeout, poll_interval,
+                           30.0, deadline=deadline)
 
 
 def _resi_rotate_probe_config(vless_uuid: str, port: int, path: str,
@@ -1083,18 +1742,32 @@ def _collect_rotate_samples(fetch, count: int, deadline: float
 
 def measure_resi_rotate(vless_uuid: str, port: int, path: str, count: int = 3,
                         singbox_bin: str = "sing-box", timeout: int = 20,
-                        poll_interval: int = 2) -> dict | None:
+                        poll_interval: int = 2,
+                        deadline: float | None = None) -> dict | None:
     """Sample `count` exit IPs through the rotating third path.
 
     Returns {"ips", "ms", "count", "distinct", "errors", ...} or None when the
     listener never answered. A residential-side rotation can legitimately hand
     out the same node twice, so health is judged by the caller (distinct >= 2).
+    ``deadline`` is an absolute ``time.monotonic()`` value; the dial gate and
+    every poll are cut to the remaining budget.
     """
     count = max(1, int(count))
+    if deadline is not None and time.monotonic() >= deadline:
+        return None
+    end = _operation_deadline(timeout, deadline)
     listen_port = _free_port()
     config = _resi_rotate_probe_config(vless_uuid, port, path, listen_port)
     tmpdir = tempfile.TemporaryDirectory()
-    if not _DIAL_GATE.acquire(timeout=30.0):
+    if deadline is None:
+        gate_wait = 30.0
+    else:
+        gate_wait = min(30.0, max(0.0, deadline - time.monotonic()))
+    if not _DIAL_GATE.acquire(timeout=gate_wait):
+        tmpdir.cleanup()
+        return None
+    if time.monotonic() >= end:
+        _DIAL_GATE.release()
         tmpdir.cleanup()
         return None
     proc = None
@@ -1115,12 +1788,11 @@ def measure_resi_rotate(vless_uuid: str, port: int, path: str, count: int = 3,
         except OSError:
             _safe_print(f"resi rotate probe failed: cannot start {singbox_bin}", flush=True)
             return None
-        deadline = time.monotonic() + timeout
         ips: list[str] = []
         stamps: list[int] = []
         errors: list[str] = []
-        while time.monotonic() < deadline and not ips:
-            remaining = deadline - time.monotonic()
+        while time.monotonic() < end and not ips:
+            remaining = end - time.monotonic()
             fetched = _fetch_exit_ip("127.0.0.1", listen_port,
                                      timeout=min(10, max(1, remaining)))
             if (fetched is not None and fetched[0] == 200
@@ -1131,10 +1803,15 @@ def measure_resi_rotate(vless_uuid: str, port: int, path: str, count: int = 3,
             if proc.poll() is not None:
                 errors.append("probe sing-box exited")
                 break
-            time.sleep(poll_interval)
+            pause = min(max(0.0, float(poll_interval)),
+                        max(0.0, end - time.monotonic()))
+            if pause:
+                time.sleep(pause)
         # Give the remaining samples a budget of one dial each: failures are
         # expected (dead nodes in the pool) and are walked past, not fatal.
-        total_deadline = deadline + count * 15
+        total_deadline = end + count * 15
+        if deadline is not None:
+            total_deadline = min(total_deadline, deadline)
         def _fetch():
             remaining = total_deadline - time.monotonic()
             return _fetch_exit_ip("127.0.0.1", listen_port,
@@ -1186,8 +1863,43 @@ def _safe_dial(dial_fn, node: dict) -> int | None:
     return result if isinstance(result, int) and result > 0 else None
 
 
-def _iter_tcp_candidates(csv_text, username=DEFAULT_USERNAME, password=DEFAULT_PASSWORD):
-    """Yield (speed, country, country_short, untagged-endpoint) for TCP rows."""
+def _check_snapshot_limits(csv_text: str) -> None:
+    """Reject oversized snapshots before splitlines()/CSV parsing allocates.
+
+    Line counting follows ``str.splitlines()`` exactly (including ``\\v``,
+    ``\\f``, ``\\x1c``-``\\x1e``, ``\\x85``, ``\\u2028`` and ``\\u2029``), but
+    stops as soon as the limit is crossed instead of materializing millions of
+    empty strings.
+    """
+    if not isinstance(csv_text, str):
+        raise ValueError("snapshot must be text")
+    if len(csv_text.encode("utf-8", "replace")) > MAX_SNAPSHOT_BYTES:
+        raise ValueError(f"snapshot exceeds {MAX_SNAPSHOT_BYTES} bytes")
+    if not csv_text:
+        return
+    lines = 0
+    last_end = 0
+    for match in _SNAPSHOT_LINE_BREAK_RE.finditer(csv_text):
+        lines += 1
+        last_end = match.end()
+        if lines > MAX_SNAPSHOT_ROWS:
+            raise ValueError(f"snapshot exceeds {MAX_SNAPSHOT_ROWS} rows")
+    if last_end < len(csv_text):
+        lines += 1
+    if lines > MAX_SNAPSHOT_ROWS:
+        raise ValueError(f"snapshot exceeds {MAX_SNAPSHOT_ROWS} rows")
+
+
+def _iter_tcp_candidates(csv_text, username=DEFAULT_USERNAME, password=DEFAULT_PASSWORD,
+                         limit: int | None = None):
+    """Yield (speed, country, country_short, untagged-endpoint) for TCP rows.
+
+    ``limit`` is an explicit row budget: every CSV data row consumes one slot,
+    including rows whose config is broken, unsafe or UDP-only. snapshot_to_nodes
+    passes ``None`` so the hard 8 MiB / 5000-row limits remain the only decode
+    bound; the caller's output ``limit`` is applied after ranking.
+    """
+    _check_snapshot_limits(csv_text)
     lines = [ln for ln in csv_text.splitlines() if ln and not ln.startswith("*")]
     if not lines:
         raise ValueError("empty snapshot")
@@ -1198,12 +1910,24 @@ def _iter_tcp_candidates(csv_text, username=DEFAULT_USERNAME, password=DEFAULT_P
         raise ValueError("snapshot columns are incomplete")
 
     found = False
+    rows_seen = 0
+    max_encoded = (MAX_CONFIG_BYTES * 4 // 3) + 8
     for row in reader:
+        if limit is not None and rows_seen >= limit:
+            break
+        rows_seen += 1
         encoded = (row.get("OpenVPN_ConfigData_Base64") or "").strip()
         if not encoded:
             continue
+        if len(encoded) > max_encoded:
+            _log_skipped_remote("<snapshot>", row.get("IP", "?"),
+                                "base64 config too large")
+            continue
         try:
-            config_text = base64.b64decode(encoded, validate=True).decode("utf-8")
+            raw = base64.b64decode(encoded, validate=True)
+            if len(raw) > MAX_CONFIG_BYTES:
+                raise ValueError("decoded config too large")
+            config_text = raw.decode("utf-8")
             endpoint = ovpn_to_endpoint(config_text, tag="", username=username, password=password)
         except (ValueError, UnicodeError):
             continue  # UDP-only / broken / unsafe rows are skipped
@@ -1259,8 +1983,13 @@ def snapshot_to_nodes(
         raise ValueError(f"probe_pool must be >= 0, got {probe_pool}")
     if limit is not None and limit < 0:
         raise ValueError(f"limit must be >= 0, got {limit}")
+    _check_snapshot_limits(csv_text)
     skip_dial = skip_dial_keys or set()
-    candidates = list(_iter_tcp_candidates(csv_text, username, password))
+    # Decode every row that fits the hard 8 MiB / 5000-row snapshot budget.
+    # ``limit`` is an OUTPUT cap: ranking/probing happens on the full set so a
+    # caller asking for Top-N never gets "first N rows of the CSV".
+    candidates = list(_iter_tcp_candidates(csv_text, username, password,
+                                           limit=None))
     check = probe_fn if probe_fn is not None else (
         lambda host, port: probe_tcp_latency(host, port, probe_timeout))
 
@@ -1340,26 +2069,51 @@ def snapshot_to_nodes(
     return nodes
 
 
+def _tag_is_reserved(tag: str) -> bool:
+    lowered = tag.lower()
+    return lowered in RESERVED_ENDPOINT_TAGS or any(
+        lowered.startswith(prefix) for prefix in _RESERVED_TAG_PREFIXES)
+
+
 def nodes_to_endpoints(nodes: list[dict], tag_prefix: str = "vpngate") -> list[dict]:
     """Assign tags and return clean sing-box endpoint dicts (no metadata keys).
 
-    Endpoints that already carry a tag (stable refresh mapping) keep it;
-    only untagged endpoints take the next free ``tag_prefix-N`` slot.
+    Endpoints that already carry a usable, unique tag (stable refresh
+    mapping) keep it; untagged, duplicate or reserved tags (proxy/auto/direct/
+    chain/mixed-in/resi-in/vless-*) are re-allocated as ``tag_prefix-N`` so
+    two endpoints can never collide in the generated config.
     """
-    used = {str(n.get("endpoint", {}).get("tag") or "")
-            for n in nodes} - {""}
+    prefix = str(tag_prefix or "vpngate")
+    if _tag_is_reserved(prefix) or _tag_is_reserved(f"{prefix}-0"):
+        prefix = "vpngate"
+    # Reserve every usable explicit tag before allocating anything. A
+    # preceding untagged node must not steal the stable tag of a later node:
+    # callers use tags for pin/route identity across refreshes.
+    explicit: set[str] = set()
+    used: set[str] = set()
+    for node in nodes:
+        endpoint = node["endpoint"]
+        tag = str(endpoint.get("tag") or "")
+        if tag and tag not in explicit and not _tag_is_reserved(tag):
+            explicit.add(tag)
     next_index = 0
     endpoints = []
     for node in nodes:
         endpoint = dict(node["endpoint"])
-        if not endpoint.get("tag"):
-            while f"{tag_prefix}-{next_index}" in used:
+        tag = str(endpoint.get("tag") or "")
+        if not tag or tag in used or _tag_is_reserved(tag):
+            while True:
+                candidate = f"{prefix}-{next_index}"
                 next_index += 1
-            endpoint["tag"] = f"{tag_prefix}-{next_index}"
-            used.add(endpoint["tag"])
-            next_index += 1
+                if (candidate not in used and candidate not in explicit
+                        and not _tag_is_reserved(candidate)):
+                    tag = candidate
+                    break
+            endpoint["tag"] = tag
+        used.add(tag)
         node["endpoint"] = endpoint
         endpoints.append(endpoint)
+    assert len({ep["tag"] for ep in endpoints}) == len(endpoints)
     return endpoints
 
 
@@ -1489,6 +2243,8 @@ def build_singbox_config(
             for endpoint in endpoints
         ]
     tags = [ep["tag"] for ep in endpoints]
+    if len(tags) != len(set(tags)):
+        raise ValueError("duplicate endpoint tags in sing-box config")
     if preferred is not None and preferred not in tags:
         preferred = None
     if backup is not None and (backup not in tags or backup == preferred):
@@ -1605,6 +2361,15 @@ def build_singbox_config(
     return config
 
 
+def _write_output(path: str, text: str) -> None:
+    """Write the generated config and force owner-only permissions."""
+    Path(path).write_text(text, encoding="utf-8")
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Convert VPNGate .ovpn (TCP) to sing-box config")
     group = parser.add_mutually_exclusive_group(required=True)
@@ -1636,18 +2401,18 @@ def main(argv: list[str] | None = None) -> int:
             username=args.username, password=args.password,
             probe=not args.no_probe, real_topk=args.real_topk,
         )
-        Path(args.output).write_text(
+        _write_output(
+            args.output,
             json.dumps(build_singbox_config(endpoints, mixed_listen, mixed_port), indent=2) + "\n",
-            encoding="utf-8",
         )
         _safe_print(f"wrote {args.output} with {len(endpoints)} endpoints")
         return 0
 
     config_text = Path(args.input).read_text(encoding="utf-8")
     endpoint = ovpn_to_endpoint(config_text, tag=args.tag, username=args.username, password=args.password)
-    Path(args.output).write_text(
+    _write_output(
+        args.output,
         json.dumps(build_singbox_config([endpoint], mixed_listen, mixed_port), indent=2) + "\n",
-        encoding="utf-8",
     )
     host, port = primary_server(endpoint)
     _safe_print(f"wrote {args.output} with 1 endpoint ({host}:{port})")
