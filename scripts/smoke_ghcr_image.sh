@@ -53,18 +53,28 @@ docker run -d --name "$NAME" --publish 127.0.0.1:3000:3000 \
 
 ready=0
 for _ in $(seq 1 60); do
-  if curl -fsS --max-time 2 http://127.0.0.1:3000/healthz >/dev/null 2>&1; then
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 http://127.0.0.1:3000/ui || true)"
+  if [ "$code" = "200" ]; then
     ready=1
     break
   fi
   if [ "$(docker inspect -f '{{.State.Running}}' "$NAME")" != "true" ]; then
-    echo "container exited before healthz"
+    echo "container exited before /ui became ready"
     exit 1
   fi
   sleep 2
 done
-test "$ready" = "1" || { echo "healthz not ready after 120s"; exit 1; }
-echo "healthz OK"
+test "$ready" = "1" || { echo "/ui not ready after 120s"; exit 1; }
+echo "/ui is reachable"
+
+# No VPNGate snapshot is loaded on purpose (SNAPSHOT_URL points at a closed
+# local port), so /healthz is expected to be 503 "not ready" rather than 200.
+health_code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:3000/healthz)"
+case "$health_code" in
+  200) echo "healthz OK (nodes loaded)" ;;
+  503) echo "healthz 503 as expected without VPNGate nodes" ;;
+  *) echo "healthz returned $health_code"; exit 1 ;;
+esac
 
 echo "== HTTP/API checks through the Go edge =="
 curl -fsS --max-time 5 -H "Authorization: Bearer $TOKEN" \
